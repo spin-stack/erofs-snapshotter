@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -33,6 +34,7 @@ import (
 	"github.com/containerd/log"
 	"github.com/urfave/cli/v2"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/grpclog"
 
 	differ "github.com/aledbf/nexuserofs/internal/differ"
 	snapshotter "github.com/aledbf/nexuserofs/internal/snapshotter"
@@ -130,12 +132,13 @@ func run(cliCtx *cli.Context) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Set up logging
-	logLevel, err := parseLogLevel(cliCtx.String("log-level"))
-	if err != nil {
+	// Discard grpc logs so that they don't mess with our stdio
+	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, io.Discard))
+
+	// Set up logging using containerd's log package
+	if err := log.SetLevel(cliCtx.String("log-level")); err != nil {
 		return err
 	}
-	log.G(ctx).Logger.SetLevel(logLevel)
 
 	address := cliCtx.String("address")
 	root := cliCtx.String("root")
@@ -245,19 +248,4 @@ func run(cliCtx *cli.Context) error {
 
 	log.G(ctx).Info("Shutting down")
 	return nil
-}
-
-func parseLogLevel(level string) (log.Level, error) {
-	switch level {
-	case "debug":
-		return log.DebugLevel, nil
-	case "info":
-		return log.InfoLevel, nil
-	case "warn", "warning":
-		return log.WarnLevel, nil
-	case "error":
-		return log.ErrorLevel, nil
-	default:
-		return log.InfoLevel, fmt.Errorf("unknown log level %q: valid values are debug, info, warn, error", level)
-	}
 }
