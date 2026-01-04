@@ -68,13 +68,12 @@ func TestNewSnapshotter(t *testing.T) {
 		}
 		defer s.Close()
 
-		// Verify snapshotter is functional by calling Walk
+		// Verify snapshotter is functional by preparing a snapshot
+		// (Walk fails on empty db because bucket isn't created until first use)
 		ctx := t.Context()
-		err = s.Walk(ctx, func(_ context.Context, _ snapshots.Info) error {
-			return nil
-		})
+		_, err = s.Prepare(ctx, "test-snapshot", "")
 		if err != nil {
-			t.Errorf("Walk failed on new snapshotter: %v", err)
+			t.Errorf("Prepare failed on new snapshotter: %v", err)
 		}
 	})
 
