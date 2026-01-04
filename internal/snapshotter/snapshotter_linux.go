@@ -24,13 +24,13 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/log"
 	"github.com/containerd/plugin"
 	"golang.org/x/sys/unix"
 
-	erofsutils "github.com/aledbf/nexuserofs/pkg/erofs"
-	"github.com/containerd/containerd/v2/core/mount"
+	erofsutils "github.com/aledbf/nexuserofs/internal/erofs"
 )
 
 // defaultWritableSize controls the default writable layer mode.

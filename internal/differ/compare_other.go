@@ -21,11 +21,10 @@ package erofs
 import (
 	"context"
 
-	"github.com/containerd/errdefs"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/errdefs"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // Compare creates a diff between the given mounts and uploads the result

@@ -27,17 +27,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/moby/sys/mountinfo"
 
+	erofsutils "github.com/aledbf/nexuserofs/internal/erofs"
 	"github.com/aledbf/nexuserofs/internal/fsverity"
 	"github.com/aledbf/nexuserofs/internal/stringutil"
-	erofsutils "github.com/aledbf/nexuserofs/pkg/erofs"
-	"github.com/containerd/containerd/v2/core/mount"
-	"github.com/containerd/containerd/v2/core/snapshots"
-	"github.com/containerd/containerd/v2/core/snapshots/storage"
 )
 
 // SnapshotterConfig is used to configure the erofs snapshotter instance

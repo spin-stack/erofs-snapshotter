@@ -26,11 +26,11 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 
 	"github.com/aledbf/nexuserofs/internal/stringutil"
-	"github.com/containerd/containerd/v2/core/mount"
 )
 
 // ConvertTarErofs converts a tar stream to an EROFS image.

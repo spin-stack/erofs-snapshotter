@@ -34,9 +34,9 @@ import (
 	"github.com/urfave/cli/v2"
 	"google.golang.org/grpc"
 
+	differ "github.com/aledbf/nexuserofs/internal/differ"
+	snapshotter "github.com/aledbf/nexuserofs/internal/snapshotter"
 	"github.com/aledbf/nexuserofs/internal/store"
-	differ "github.com/aledbf/nexuserofs/pkg/differ"
-	snapshotter "github.com/aledbf/nexuserofs/pkg/snapshotter"
 )
 
 const (

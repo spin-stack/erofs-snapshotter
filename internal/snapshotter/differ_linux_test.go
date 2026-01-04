@@ -48,9 +48,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aledbf/nexuserofs/internal/mountutils"
-	erofsdiffer "github.com/aledbf/nexuserofs/pkg/differ"
-	erofsutils "github.com/aledbf/nexuserofs/pkg/erofs"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images/imagetest"
 	"github.com/containerd/containerd/v2/core/mount"
@@ -61,6 +58,10 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	bolt "go.etcd.io/bbolt"
+
+	erofsdiffer "github.com/aledbf/nexuserofs/internal/differ"
+	erofsutils "github.com/aledbf/nexuserofs/internal/erofs"
+	"github.com/aledbf/nexuserofs/internal/mountutils"
 )
 
 // Snapshot key constants used across tests

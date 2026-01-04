@@ -49,7 +49,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aledbf/nexuserofs/internal/fsverity"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -59,6 +58,8 @@ import (
 	"github.com/containerd/containerd/v2/pkg/archive/tartest"
 	"github.com/containerd/containerd/v2/pkg/testutil"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/aledbf/nexuserofs/internal/fsverity"
 )
 
 const (

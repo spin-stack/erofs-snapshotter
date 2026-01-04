@@ -38,8 +38,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aledbf/nexuserofs/internal/mountutils"
-	erofsdiffer "github.com/aledbf/nexuserofs/pkg/differ"
 	"github.com/containerd/containerd/v2/core/images/imagetest"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/mount/manager"
@@ -48,6 +46,9 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/testutil"
 	bolt "go.etcd.io/bbolt"
+
+	erofsdiffer "github.com/aledbf/nexuserofs/internal/differ"
+	"github.com/aledbf/nexuserofs/internal/mountutils"
 )
 
 func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
