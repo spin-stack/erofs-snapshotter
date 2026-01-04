@@ -49,7 +49,7 @@ jobs:
       - name: Run tests as root
         run: |
           sudo env "PATH=$PATH" "GOPATH=$GOPATH" "GOCACHE=$GOCACHE" "GOMODCACHE=$GOMODCACHE" \
-            go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+            go test -v -race -coverprofile=coverage.txt -covermode=atomic ./... -test.root
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
