@@ -49,10 +49,6 @@ max_unmerged_layers = 0
 #   -C65536     = Chunk size for inline data
 mkfs_options = ["-zlz4hc,12", "-C65536"]
 
-# Enable tar index mode for faster layer conversion
-# Requires erofs-utils 1.8+
-# Generates tar index instead of full EROFS conversion
-tar_index_mode = false
 
 [logging]
 # Log level: debug, info, warn, error

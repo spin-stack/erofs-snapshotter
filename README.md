@@ -32,7 +32,7 @@ flowchart LR
 ### Runtime
 
 - Linux kernel with EROFS support (5.4+)
-- erofs-utils (mkfs.erofs, fsck.erofs)
+- erofs-utils 1.8+ (mkfs.erofs, fsck.erofs)
 - e2fsprogs (for writable layer block mode)
 - util-linux (mount, losetup)
 - containerd 2.2+
@@ -100,7 +100,6 @@ sudo ./bin/nexuserofs-snapshotter \
   --default-size 0 \
   --enable-fsverity=false \
   --set-immutable \
-  --tar-index-mode=false \
   --mkfs-options="-zlz4hc,12" \
   --mkfs-options="-C65536" \
   --overlay-options="index=off" \
@@ -119,7 +118,6 @@ Available flags:
 | `--default-size` | `0` | Default writable layer size in bytes (0 = directory mode) |
 | `--enable-fsverity` | `false` | Enable fsverity for layer validation |
 | `--set-immutable` | `true` | Set immutable flag on committed layers |
-| `--tar-index-mode` | `false` | Use tar index mode (requires erofs-utils 1.8+) |
 | `--mkfs-options` | | Extra options for mkfs.erofs |
 | `--overlay-options` | | Extra options for overlay mounts |
 
