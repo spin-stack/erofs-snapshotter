@@ -34,6 +34,7 @@ import (
 
 	"github.com/aledbf/nexuserofs/internal/fsverity"
 	"github.com/aledbf/nexuserofs/internal/stringutil"
+	erofsutils "github.com/aledbf/nexuserofs/pkg/erofs"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
@@ -104,42 +105,23 @@ type snapshotter struct {
 	enableFsverity   bool
 	setImmutable     bool
 	defaultWritable  int64
-	blockMode        bool
 	fsMergeThreshold uint
 }
 
-const (
-	// extractLabel is the label key used to mark snapshots for layer extraction.
-	// This is stored in the snapshot metadata for atomic reads within transactions,
-	// avoiding TOCTOU race conditions that would occur with filesystem markers.
-	//
-	// TOCTOU Safety: The label is set atomically within a database transaction
-	// during CreateSnapshot, and all reads occur within transactions. This ensures
-	// no race window exists between checking and using the extract status.
-	extractLabel = "containerd.io/snapshot/erofs.extract"
+// isBlockMode returns true if the snapshotter uses block-based writable layers
+// (ext4 image files) instead of directory-based layers.
+func (s *snapshotter) isBlockMode() bool {
+	return s.defaultWritable > 0
+}
 
-	// erofsLayerMarker is a filesystem marker file that indicates a directory
-	// is managed by the EROFS snapshotter.
-	//
-	// Purpose: The EROFS differ (plugins/diff/erofs) checks for this marker
-	// to validate that mounts are genuine EROFS snapshotter layers before
-	// processing them. Without this marker, the differ returns ErrNotImplemented,
-	// allowing fallback to other differs.
-	//
-	// Creation points: The marker is created via ensureMarkerFile() in multiple
-	// code paths because different operations may create the layer directory:
-	//   - prepareDirectory: Initial snapshot creation (Prepare/View)
-	//   - activeMounts: When returning mounts for an active snapshot
-	//   - diffMounts: When preparing mounts specifically for diff operations
-	//
-	// TOCTOU Safety: ensureMarkerFile() uses O_CREAT|O_EXCL for atomic creation,
-	// eliminating the race window between existence check and file creation.
-	// The function is idempotent - concurrent calls safely succeed without errors.
-	// While the marker file check in the differ can theoretically race with cleanup,
-	// the extractLabel (database-backed) is the authoritative source for extract
-	// status decisions, with the marker serving as a validation hint.
-	erofsLayerMarker = ".erofslayer"
-)
+// extractLabel is the label key used to mark snapshots for layer extraction.
+// This is stored in the snapshot metadata for atomic reads within transactions,
+// avoiding TOCTOU race conditions that would occur with filesystem markers.
+//
+// TOCTOU Safety: The label is set atomically within a database transaction
+// during CreateSnapshot, and all reads occur within transactions. This ensures
+// no race window exists between checking and using the extract status.
+const extractLabel = "containerd.io/snapshot/erofs.extract"
 
 // NewSnapshotter returns a Snapshotter which uses EROFS+OverlayFS. The layers
 // are stored under the provided root. A metadata file is stored under the root.
@@ -152,13 +134,13 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 	}
 
 	if err := os.MkdirAll(root, 0700); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create root directory %q: %w", root, err)
 	}
 
 	if config.defaultSize == 0 {
 		// If not block mode, check root compatibility
 		if err := checkCompatibility(root); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("compatibility check failed for %q: %w", root, err)
 		}
 	}
 
@@ -180,11 +162,11 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 
 	ms, err := storage.NewMetaStore(filepath.Join(root, "metadata.db"))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create metadata store: %w", err)
 	}
 
 	if err := os.Mkdir(filepath.Join(root, "snapshots"), 0700); err != nil && !os.IsExist(err) {
-		return nil, err
+		return nil, fmt.Errorf("failed to create snapshots directory: %w", err)
 	}
 
 	return &snapshotter{
@@ -194,7 +176,6 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		enableFsverity:   config.enableFsverity,
 		setImmutable:     config.setImmutable,
 		defaultWritable:  config.defaultSize,
-		blockMode:        config.defaultSize > 0,
 		fsMergeThreshold: config.fsMergeThreshold,
 	}, nil
 }
@@ -212,7 +193,7 @@ func (s *snapshotter) upperPath(id string) string {
 }
 
 func (s *snapshotter) upperDir(id string) string {
-	if s.blockMode {
+	if s.isBlockMode() {
 		return filepath.Join(s.upperPath(id), "rw", "upper")
 	}
 	return s.upperPath(id)
@@ -264,7 +245,7 @@ func (s *snapshotter) createWritableLayer(ctx context.Context, id string) error 
 
 // A committed layer blob generated by the EROFS differ
 func (s *snapshotter) layerBlobPath(id string) string {
-	return filepath.Join(s.root, "snapshots", id, "layer.erofs")
+	return filepath.Join(s.root, "snapshots", id, erofsutils.LayerBlobFilename)
 }
 
 func (s *snapshotter) fsMetaPath(id string) string {
@@ -290,7 +271,7 @@ func (s *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 		return td, err
 	}
 	if kind == snapshots.KindActive {
-		if !s.blockMode {
+		if !s.isBlockMode() {
 			if err := os.Mkdir(filepath.Join(td, "work"), 0711); err != nil {
 				return td, err
 			}
@@ -298,7 +279,7 @@ func (s *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 		// Create EROFS layer marker at snapshot root (e.g., /snapshots/{id}/.erofslayer).
 		// This is the primary marker location checked by the differ for bind/overlay mounts.
 		// Uses ensureMarkerFile for atomic creation consistent with other code paths.
-		if err := ensureMarkerFile(filepath.Join(td, erofsLayerMarker)); err != nil {
+		if err := ensureMarkerFile(filepath.Join(td, erofsutils.ErofsLayerMarker)); err != nil {
 			return td, err
 		}
 	}
@@ -307,7 +288,7 @@ func (s *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 }
 
 func (s *snapshotter) mountFsMeta(snap storage.Snapshot, id int) (mount.Mount, bool) {
-	if s.blockMode {
+	if s.isBlockMode() {
 		return mount.Mount{}, false
 	}
 
@@ -336,7 +317,7 @@ func (s *snapshotter) mountFsMeta(snap storage.Snapshot, id int) (mount.Mount, b
 // For blockMode active snapshots, it performs actual mounting via activeMounts.
 // For other cases, it returns template-based mount specs for the mount manager.
 func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]mount.Mount, error) {
-	if s.blockMode && snap.Kind == snapshots.KindActive {
+	if s.isBlockMode() && snap.Kind == snapshots.KindActive {
 		if isExtractSnapshot(info) {
 			return s.diffMounts(snap)
 		}
@@ -448,7 +429,7 @@ func (s *snapshotter) singleLayerMounts(snap storage.Snapshot, options []string)
 		roFlag = "ro"
 	}
 
-	if s.blockMode {
+	if s.isBlockMode() {
 		writablePath := s.writablePath(snap.ID)
 
 		// Check if the writable layer was already created by createWritableLayer()
@@ -506,7 +487,7 @@ func (s *snapshotter) singleLayerMounts(snap storage.Snapshot, options []string)
 func (s *snapshotter) activeLayerMounts(snap storage.Snapshot, options []string) ([]mount.Mount, []string) {
 	var mounts []mount.Mount
 
-	if s.blockMode {
+	if s.isBlockMode() {
 		writablePath := s.writablePath(snap.ID)
 
 		// Check if the writable layer was already created by createWritableLayer()
@@ -576,9 +557,12 @@ func ensureMarkerFile(path string) error {
 			// File already exists, which is fine for idempotency
 			return nil
 		}
-		return err
+		return fmt.Errorf("failed to create marker file %q: %w", path, err)
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("failed to close marker file %q: %w", path, err)
+	}
+	return nil
 }
 
 func (s *snapshotter) diffMounts(snap storage.Snapshot) ([]mount.Mount, error) {
@@ -593,7 +577,7 @@ func (s *snapshotter) diffMounts(snap storage.Snapshot) ([]mount.Mount, error) {
 	// This may be redundant with createSnapshotDirectory, but ensureMarkerFile
 	// is idempotent and this guards against edge cases where diff mounts are
 	// requested without a prior Prepare call.
-	if err := ensureMarkerFile(filepath.Join(layerRoot, erofsLayerMarker)); err != nil {
+	if err := ensureMarkerFile(filepath.Join(layerRoot, erofsutils.ErofsLayerMarker)); err != nil {
 		return nil, fmt.Errorf("failed to create erofs marker: %w", err)
 	}
 
@@ -657,7 +641,7 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 
 		if len(snap.ParentIDs) > 0 {
 			if err := upperDirectoryPermission(filepath.Join(td, "fs"), s.upperPath(snap.ParentIDs[0])); err != nil {
-				return err
+				return fmt.Errorf("failed to set upper directory permissions: %w", err)
 			}
 		}
 
@@ -681,7 +665,7 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	// This avoids the need for lazy mkfs/ext4 processing which requires a mount
 	// manager and doesn't work well with VM-based runtimes that need the file
 	// to exist before mounting.
-	if kind == snapshots.KindActive && s.blockMode && !isExtractKey(key) {
+	if kind == snapshots.KindActive && s.isBlockMode() && !isExtractKey(key) {
 		if err := s.createWritableLayer(ctx, snap.ID); err != nil {
 			return nil, fmt.Errorf("failed to create writable layer: %w", err)
 		}
@@ -802,10 +786,10 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 	err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		sid, _, _, err := storage.GetInfo(ctx, key)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to get snapshot info for %q: %w", key, err)
 		}
 		id = sid
-		return err
+		return nil
 	})
 	if err != nil {
 		return err
@@ -844,7 +828,7 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 
 		usage, err := fs.DiskUsage(ctx, layerBlob)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to calculate disk usage for %q: %w", layerBlob, err)
 		}
 		if _, err = storage.CommitActive(ctx, key, name, snapshots.Usage(usage), opts...); err != nil {
 			return fmt.Errorf("failed to commit snapshot %s: %w", key, err)
@@ -880,19 +864,19 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 func (s *snapshotter) getCleanupDirectories(ctx context.Context) ([]string, error) {
 	ids, err := storage.IDMap(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get snapshot ID map: %w", err)
 	}
 
 	snapshotDir := filepath.Join(s.root, "snapshots")
 	fd, err := os.Open(snapshotDir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open snapshots directory: %w", err)
 	}
 	defer fd.Close()
 
 	dirs, err := fd.Readdirnames(0)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read snapshots directory: %w", err)
 	}
 
 	cleanup := []string{}
@@ -918,7 +902,7 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	defer func() {
 		if err == nil {
 			cleanup := cleanupUpper
-			if s.blockMode {
+			if s.isBlockMode() {
 				cleanup = cleanupActiveMounts
 			}
 			if err := cleanup(s.upperPath(id)); err != nil {
@@ -969,13 +953,13 @@ func (s *snapshotter) Cleanup(ctx context.Context) (err error) {
 	}
 
 	cleanup := cleanupUpper
-	if s.blockMode {
+	if s.isBlockMode() {
 		cleanup = cleanupActiveMounts
 	}
 
 	for _, dir := range removals {
 		_ = cleanup(filepath.Join(dir, "fs"))
-		_ = setImmutable(filepath.Join(dir, "layer.erofs"), false)
+		_ = setImmutable(filepath.Join(dir, erofsutils.LayerBlobFilename), false)
 		if err := os.RemoveAll(dir); err != nil {
 			log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to remove directory")
 		}

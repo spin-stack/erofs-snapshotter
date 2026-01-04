@@ -130,7 +130,11 @@ func run(cliCtx *cli.Context) error {
 	defer cancel()
 
 	// Set up logging
-	log.G(ctx).Logger.SetLevel(parseLogLevel(cliCtx.String("log-level")))
+	logLevel, err := parseLogLevel(cliCtx.String("log-level"))
+	if err != nil {
+		return err
+	}
+	log.G(ctx).Logger.SetLevel(logLevel)
 
 	address := cliCtx.String("address")
 	root := cliCtx.String("root")
@@ -239,17 +243,17 @@ func run(cliCtx *cli.Context) error {
 	return nil
 }
 
-func parseLogLevel(level string) log.Level {
+func parseLogLevel(level string) (log.Level, error) {
 	switch level {
 	case "debug":
-		return log.DebugLevel
+		return log.DebugLevel, nil
 	case "info":
-		return log.InfoLevel
+		return log.InfoLevel, nil
 	case "warn", "warning":
-		return log.WarnLevel
+		return log.WarnLevel, nil
 	case "error":
-		return log.ErrorLevel
+		return log.ErrorLevel, nil
 	default:
-		return log.InfoLevel
+		return log.InfoLevel, fmt.Errorf("unknown log level %q: valid values are debug, info, warn, error", level)
 	}
 }

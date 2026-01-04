@@ -132,47 +132,77 @@ func ConvertErofs(ctx context.Context, layerPath string, srcDir string, mkfsExtr
 // If the marker is missing, ErrNotImplemented is returned, allowing the EROFS
 // differ to fall back to other differs (e.g., the walking differ).
 func MountsToLayer(mounts []mount.Mount) (string, error) {
-	var layer string
-
-	// If mount[0].Type is prefixed with "mkfs/", it should be always the snapshot layer
-	if strings.HasPrefix(mounts[0].Type, "mkfs/") {
-		layer = filepath.Dir(mounts[0].Source)
-	} else {
-		// Otherwise, let's check the last mount entry
-		mnt := mounts[len(mounts)-1]
-		mt := strings.Split(mnt.Type, "/")
-
-		switch mt[len(mt)-1] {
-		case "bind", "erofs":
-			layer = filepath.Dir(mnt.Source)
-		case "overlay":
-			var topLower string
-			for _, o := range mnt.Options {
-				if k, v, ok := strings.Cut(o, "="); ok {
-					switch k {
-					case "upperdir":
-						layer = filepath.Dir(v)
-					case "lowerdir":
-						// Use the first mount source for the top lower layer
-						topLower = filepath.Dir(mounts[0].Source)
-					}
-				}
-			}
-			if layer == "" {
-				if topLower == "" {
-					return "", fmt.Errorf("unsupported overlay layer for erofs differ: %w", errdefs.ErrNotImplemented)
-				}
-				layer = topLower
-			}
-		default:
-			return "", fmt.Errorf("invalid filesystem type %q for erofs differ: %w", mnt.Type, errdefs.ErrNotImplemented)
-		}
+	if len(mounts) == 0 {
+		return "", fmt.Errorf("no mounts provided: %w", errdefs.ErrNotImplemented)
 	}
-	// If the layer is not prepared by the EROFS snapshotter, fall back to the next differ
-	if _, err := os.Stat(filepath.Join(layer, ".erofslayer")); err != nil {
+
+	layer, err := extractLayerPath(mounts)
+	if err != nil {
+		return "", err
+	}
+
+	// Validate the layer is prepared by the EROFS snapshotter
+	if _, err := os.Stat(filepath.Join(layer, ErofsLayerMarker)); err != nil {
 		return "", fmt.Errorf("mount layer type must be erofs-layer: %w", errdefs.ErrNotImplemented)
 	}
 	return layer, nil
+}
+
+// extractLayerPath determines the layer directory from mount specifications.
+func extractLayerPath(mounts []mount.Mount) (string, error) {
+	// mkfs/* mounts indicate the snapshot layer directly
+	if strings.HasPrefix(mounts[0].Type, "mkfs/") {
+		return filepath.Dir(mounts[0].Source), nil
+	}
+
+	// For other mount types, examine the last mount entry
+	mnt := mounts[len(mounts)-1]
+	baseType := mountBaseType(mnt.Type)
+
+	switch baseType {
+	case "bind", "erofs":
+		return filepath.Dir(mnt.Source), nil
+	case "overlay":
+		return layerFromOverlay(mounts, mnt)
+	default:
+		return "", fmt.Errorf("unsupported filesystem type %q for erofs differ: %w", mnt.Type, errdefs.ErrNotImplemented)
+	}
+}
+
+// mountBaseType extracts the base type from a potentially compound mount type.
+// For example, "format/mkdir/overlay" returns "overlay".
+func mountBaseType(mountType string) string {
+	parts := strings.Split(mountType, "/")
+	return parts[len(parts)-1]
+}
+
+// layerFromOverlay extracts the layer path from overlay mount options.
+// It prefers upperdir (for read-write layers) and falls back to the first
+// lowerdir (for read-only layers).
+func layerFromOverlay(mounts []mount.Mount, mnt mount.Mount) (string, error) {
+	var upperLayer, lowerLayer string
+
+	for _, opt := range mnt.Options {
+		key, value, ok := strings.Cut(opt, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "upperdir":
+			upperLayer = filepath.Dir(value)
+		case "lowerdir":
+			// For lowerdir, use the first mount source as the top lower layer
+			lowerLayer = filepath.Dir(mounts[0].Source)
+		}
+	}
+
+	if upperLayer != "" {
+		return upperLayer, nil
+	}
+	if lowerLayer != "" {
+		return lowerLayer, nil
+	}
+	return "", fmt.Errorf("overlay mount has no upperdir or lowerdir: %w", errdefs.ErrNotImplemented)
 }
 
 // SupportGenerateFromTar checks if the installed version of mkfs.erofs supports
@@ -187,5 +217,14 @@ func SupportGenerateFromTar() (bool, error) {
 	return bytes.Contains(output, []byte("--tar=")), nil
 }
 
-// ErofsLayerMarker is the marker file name for EROFS layers
-const ErofsLayerMarker = ".erofslayer"
+const (
+	// ErofsLayerMarker is the marker file name for EROFS layers.
+	// This marker is created by the EROFS snapshotter and checked by
+	// the EROFS differ to validate that a directory is a genuine
+	// EROFS snapshotter layer.
+	ErofsLayerMarker = ".erofslayer"
+
+	// LayerBlobFilename is the filename for EROFS layer blobs within
+	// a snapshot directory.
+	LayerBlobFilename = "layer.erofs"
+)

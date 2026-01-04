@@ -103,18 +103,16 @@ func cleanupUpper(upper string) error {
 
 // cleanupActiveMounts unmounts all active mounts under the upper directory.
 // This is a best-effort cleanup that continues to clean up remaining mounts
-// even if individual unmounts fail. Errors are logged and the last error
-// encountered is returned.
+// even if individual unmounts fail. Returns an error describing all failures.
 func cleanupActiveMounts(upper string) error {
-	var lastErr error
+	var errs []error
 
 	merged := filepath.Join(upper, "merged")
 	lower := filepath.Join(upper, "lower")
 	rw := filepath.Join(upper, "rw")
 
 	if err := unmountAll(merged); err != nil {
-		log.L.WithError(err).Warnf("failed to unmount merged directory %s during cleanup", merged)
-		lastErr = err
+		errs = append(errs, fmt.Errorf("merged %s: %w", merged, err))
 	}
 
 	if entries, err := os.ReadDir(lower); err == nil {
@@ -124,39 +122,39 @@ func cleanupActiveMounts(upper string) error {
 			}
 			target := filepath.Join(lower, e.Name())
 			if err := unmountAll(target); err != nil {
-				log.L.WithError(err).Warnf("failed to unmount lower directory %s during cleanup", target)
-				lastErr = err
+				errs = append(errs, fmt.Errorf("lower %s: %w", target, err))
 			}
 		}
 	}
 
 	if err := unmountAll(rw); err != nil {
-		log.L.WithError(err).Warnf("failed to unmount rw directory %s during cleanup", rw)
-		lastErr = err
+		errs = append(errs, fmt.Errorf("rw %s: %w", rw, err))
 	}
 
-	return lastErr
+	if len(errs) > 0 {
+		return fmt.Errorf("cleanup failed: %v", errs)
+	}
+	return nil
 }
 
 // unmountAll attempts to unmount the target. If normal unmount fails (e.g., due
 // to EBUSY), it falls back to lazy unmount (MNT_DETACH) which detaches the mount
 // immediately but may leave the mount lingering until all references are closed.
 //
-// Returns the original error even if lazy unmount succeeds, to make the issue
-// visible. Callers should log this but can continue cleanup since the mount
-// point is at least detached.
+// Returns an error only if both normal and lazy unmount fail. If lazy unmount
+// succeeds, returns nil but wraps context about the fallback for callers who
+// want to log it.
 func unmountAll(target string) error {
 	if err := mount.UnmountAll(target, 0); err != nil {
 		// Normal unmount failed, try lazy unmount as fallback.
 		// This detaches the mount immediately but resources may linger.
 		if derr := mount.UnmountAll(target, unix.MNT_DETACH); derr != nil {
-			// Both normal and lazy unmount failed
-			return err
+			// Both normal and lazy unmount failed - wrap the original error
+			return fmt.Errorf("unmount %s failed (lazy unmount also failed): %w", target, err)
 		}
-		// Lazy unmount succeeded but something was holding the mount open.
-		// Log this as it may indicate a resource leak or cleanup ordering issue.
-		log.L.WithError(err).Warnf("unmount of %s required MNT_DETACH fallback, mount may linger", target)
-		return err
+		// Lazy unmount succeeded - mount is detached but may linger.
+		// Return nil since cleanup succeeded; caller can log if needed.
+		return nil
 	}
 	return nil
 }

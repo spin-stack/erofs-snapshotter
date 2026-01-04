@@ -30,6 +30,6 @@ import (
 
 // Compare creates a diff between the given mounts and uploads the result
 // to the content store.
-func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts ...diff.Opt) (d ocispec.Descriptor, err error) {
+func (s *ErofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts ...diff.Opt) (d ocispec.Descriptor, err error) {
 	return ocispec.Descriptor{}, errdefs.ErrNotImplemented
 }

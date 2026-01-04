@@ -38,18 +38,13 @@ import (
 	"github.com/google/uuid"
 )
 
-type differ interface {
-	diff.Applier
-	diff.Comparer
-}
-
 // MountManagerResolver is a function that resolves the mount manager lazily.
 // This allows the differ to look up the mount manager when it's actually needed,
 // avoiding plugin initialization order issues.
 type MountManagerResolver func() mount.Manager
 
-// erofsDiff does erofs comparison and application
-type erofsDiff struct {
+// ErofsDiff implements diff.Applier and diff.Comparer for EROFS layers.
+type ErofsDiff struct {
 	store         content.Store
 	mkfsExtraOpts []string
 	// enableTarIndex enables generating tar index for tar content
@@ -59,18 +54,18 @@ type erofsDiff struct {
 }
 
 // DifferOpt is an option for configuring the erofs differ
-type DifferOpt func(d *erofsDiff)
+type DifferOpt func(d *ErofsDiff)
 
 // WithMkfsOptions sets extra options for mkfs.erofs
 func WithMkfsOptions(opts []string) DifferOpt {
-	return func(d *erofsDiff) {
+	return func(d *ErofsDiff) {
 		d.mkfsExtraOpts = opts
 	}
 }
 
 // WithTarIndexMode enables tar index mode for EROFS layers
 func WithTarIndexMode() DifferOpt {
-	return func(d *erofsDiff) {
+	return func(d *ErofsDiff) {
 		d.enableTarIndex = true
 	}
 }
@@ -79,7 +74,7 @@ func WithTarIndexMode() DifferOpt {
 // Use this when the mount manager is already available at initialization time.
 // For plugin contexts where initialization order matters, use WithMountManagerResolver.
 func WithMountManager(mm mount.Manager) DifferOpt {
-	return func(d *erofsDiff) {
+	return func(d *ErofsDiff) {
 		d.mmResolver = func() mount.Manager { return mm }
 	}
 }
@@ -89,14 +84,15 @@ func WithMountManager(mm mount.Manager) DifferOpt {
 // allowing the differ to initialize before the mount manager plugin is available.
 // Use this in plugin contexts where initialization order may vary.
 func WithMountManagerResolver(resolver MountManagerResolver) DifferOpt {
-	return func(d *erofsDiff) {
+	return func(d *ErofsDiff) {
 		d.mmResolver = resolver
 	}
 }
 
-// NewErofsDiffer creates a new EROFS differ with the provided options
-func NewErofsDiffer(store content.Store, opts ...DifferOpt) differ {
-	d := &erofsDiff{
+// NewErofsDiffer creates a new EROFS differ with the provided options.
+// The returned *ErofsDiff implements diff.Applier and diff.Comparer.
+func NewErofsDiffer(store content.Store, opts ...DifferOpt) *ErofsDiff {
+	d := &ErofsDiff{
 		store: store,
 	}
 
@@ -129,7 +125,7 @@ func isErofsMediaType(mt string) bool {
 	return strings.HasSuffix(mediaType, ".erofs")
 }
 
-func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []mount.Mount, opts ...diff.ApplyOpt) (d ocispec.Descriptor, err error) {
+func (s *ErofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []mount.Mount, opts ...diff.ApplyOpt) (d ocispec.Descriptor, err error) {
 	t1 := time.Now()
 	defer func() {
 		if err == nil {
@@ -167,7 +163,7 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 	}
 	defer ra.Close()
 
-	layerBlobPath := path.Join(layer, "layer.erofs")
+	layerBlobPath := path.Join(layer, erofsutils.LayerBlobFilename)
 	if native {
 		f, err := os.Create(layerBlobPath)
 		if err != nil {

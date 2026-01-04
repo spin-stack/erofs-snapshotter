@@ -70,7 +70,7 @@ func writeDiffFromMounts(ctx context.Context, w io.Writer, lower, upper []mount.
 
 // mountManager resolves and returns the mount manager.
 // Returns nil if no resolver is configured.
-func (s erofsDiff) mountManager() mount.Manager {
+func (s *ErofsDiff) mountManager() mount.Manager {
 	if s.mmResolver == nil {
 		return nil
 	}
@@ -93,7 +93,7 @@ func (s erofsDiff) mountManager() mount.Manager {
 //   - Empty lower mounts (base layer creation)
 //
 // See also: requiresMountResolution() for the detailed logic.
-func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts ...diff.Opt) (d ocispec.Descriptor, err error) {
+func (s *ErofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts ...diff.Opt) (d ocispec.Descriptor, err error) {
 	var config diff.Config
 	for _, opt := range opts {
 		if err := opt(&config); err != nil {
@@ -134,7 +134,7 @@ func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts
 
 // writeAndCommitDiff handles the common logic for writing a diff to the content store.
 // It manages compression, content writer lifecycle, and label updates.
-func (s erofsDiff) writeAndCommitDiff(ctx context.Context, config diff.Config, writeFn diffWriteFunc) (ocispec.Descriptor, error) {
+func (s *ErofsDiff) writeAndCommitDiff(ctx context.Context, config diff.Config, writeFn diffWriteFunc) (ocispec.Descriptor, error) {
 	var compressionType compression.Compression
 	switch config.MediaType {
 	case ocispec.MediaTypeImageLayer:
