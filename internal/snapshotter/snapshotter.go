@@ -323,6 +323,15 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 		}
 		return s.templateMounts(snap)
 	}
+
+	// For KindView snapshots with multiple layers, mount the layers and return
+	// real paths. This is needed because standard containerd operations like
+	// 'nerdctl commit' don't use a mount manager that understands the template
+	// syntax used by templateMounts().
+	if snap.Kind == snapshots.KindView && len(snap.ParentIDs) > 1 {
+		return s.viewMounts(snap)
+	}
+
 	return s.templateMounts(snap)
 }
 
@@ -586,6 +595,85 @@ func (s *snapshotter) diffMounts(snap storage.Snapshot) ([]mount.Mount, error) {
 			Type:    "bind",
 			Source:  upperRoot,
 			Options: []string{"rw", "rbind"},
+		},
+	}, nil
+}
+
+// viewLowerPath returns the path to the lower directory for View snapshots.
+func (s *snapshotter) viewLowerPath(id string) string {
+	return filepath.Join(s.root, "snapshots", id, "lower")
+}
+
+// viewMounts mounts EROFS layers and returns a standard overlay mount with real paths.
+// This is used for KindView snapshots with multiple layers, allowing standard containerd
+// operations (like 'nerdctl commit') to mount the snapshot without a special mount manager.
+//
+// The EROFS layers are mounted under <snapshot>/lower/<index> and an overlay is created
+// using these as lowerdir. The mounts are cleaned up when the View snapshot is removed.
+func (s *snapshotter) viewMounts(snap storage.Snapshot) ([]mount.Mount, error) {
+	lowerRoot := s.viewLowerPath(snap.ID)
+
+	// Check if we have a merged fsmeta that collapses all layers into one
+	if s.fsMergeThreshold > 0 {
+		if m, ok := s.mountFsMeta(snap, 0); ok {
+			// Single merged EROFS mount - return directly
+			return []mount.Mount{m}, nil
+		}
+	}
+
+	// Mount each EROFS layer and build lowerdir paths
+	var lowerDirs []string
+	for i, parentID := range snap.ParentIDs {
+		layerBlob, err := s.lowerPath(parentID)
+		if err != nil {
+			return nil, err
+		}
+
+		// Mount point for this layer
+		mountPoint := filepath.Join(lowerRoot, fmt.Sprintf("%d", i))
+		if err := os.MkdirAll(mountPoint, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create mount point %s: %w", mountPoint, err)
+		}
+
+		// Check if already mounted (Mounts() may be called multiple times)
+		alreadyMounted, err := mountinfo.Mounted(mountPoint)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check mount status for %s: %w", mountPoint, err)
+		}
+		if !alreadyMounted {
+			// Mount the EROFS layer
+			m := mount.Mount{
+				Source:  layerBlob,
+				Type:    "erofs",
+				Options: []string{"ro", "loop"},
+			}
+			if err := m.Mount(mountPoint); err != nil {
+				// Best-effort cleanup of already mounted layers
+				for j := i - 1; j >= 0; j-- {
+					_ = mount.UnmountAll(filepath.Join(lowerRoot, fmt.Sprintf("%d", j)), 0)
+				}
+				return nil, fmt.Errorf("failed to mount layer %s: %w", layerBlob, err)
+			}
+		}
+
+		lowerDirs = append(lowerDirs, mountPoint)
+	}
+
+	// Build the lowerdir option with real paths (newest first for overlay)
+	// Overlay expects lowerdir in order from top to bottom
+	lowerdir := strings.Join(lowerDirs, ":")
+
+	options := []string{
+		fmt.Sprintf("lowerdir=%s", lowerdir),
+		"ro",
+	}
+	options = append(options, s.ovlOptions...)
+
+	return []mount.Mount{
+		{
+			Type:    "overlay",
+			Source:  "overlay",
+			Options: options,
 		},
 	}, nil
 }
@@ -909,6 +997,11 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 				log.G(ctx).WithError(err).WithField("id", id).Warnf("failed to cleanup upperdir")
 			}
 
+			// Cleanup View snapshot lower mounts (created by viewMounts)
+			if err := cleanupViewMounts(s.viewLowerPath(id)); err != nil {
+				log.G(ctx).WithError(err).WithField("id", id).Warnf("failed to cleanup view lower mounts")
+			}
+
 			for _, dir := range removals {
 				if err := os.RemoveAll(dir); err != nil {
 					log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to remove directory")
@@ -959,6 +1052,7 @@ func (s *snapshotter) Cleanup(ctx context.Context) (err error) {
 
 	for _, dir := range removals {
 		_ = cleanup(filepath.Join(dir, "fs"))
+		_ = cleanupViewMounts(filepath.Join(dir, "lower"))
 		_ = setImmutable(filepath.Join(dir, erofsutils.LayerBlobFilename), false)
 		if err := os.RemoveAll(dir); err != nil {
 			log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to remove directory")

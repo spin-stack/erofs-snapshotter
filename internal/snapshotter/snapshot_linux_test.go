@@ -465,3 +465,344 @@ func TestErofsCleanupRemovesOrphan(t *testing.T) {
 		t.Fatalf("expected not exist error, got: %v", err)
 	}
 }
+
+// TestErofsViewMountsMultiLayer tests that View snapshots with multiple layers
+// return real mountable paths (not templates) that can be used by standard
+// containerd operations like 'nerdctl commit'.
+func TestErofsViewMountsMultiLayer(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	sn := newSnapshotter(t)
+	snapshtr, cleanup, err := sn(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	defer cleanupAllSnapshots(ctx, snapshtr)
+
+	snap, ok := snapshtr.(*snapshotter)
+	if !ok {
+		t.Fatal("failed to cast snapshotter to *snapshotter")
+	}
+
+	// Create 3 layers (multiple parents)
+	var parentKey string
+	for i := range 3 {
+		key := fmt.Sprintf("layer-%d", i)
+		commitKey := fmt.Sprintf("layer-%d-commit", i)
+
+		if _, err := snapshtr.Prepare(ctx, key, parentKey); err != nil {
+			t.Fatalf("failed to prepare layer %d: %v", i, err)
+		}
+
+		id := snapshotID(ctx, t, snap, key)
+		filename := fmt.Sprintf("file-%d.txt", i)
+		if err := os.WriteFile(filepath.Join(snap.upperPath(id), filename), []byte(fmt.Sprintf("content-%d", i)), 0644); err != nil {
+			t.Fatalf("failed to write file in layer %d: %v", i, err)
+		}
+
+		if err := snapshtr.Commit(ctx, commitKey, key); err != nil {
+			t.Fatalf("failed to commit layer %d: %v", i, err)
+		}
+		parentKey = commitKey
+	}
+
+	// Create a View of the multi-layer snapshot
+	viewKey := "multi-layer-view"
+	viewMounts, err := snapshtr.View(ctx, viewKey, parentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("view mounts: %#v", viewMounts)
+
+	// The key assertion: View with multiple layers should NOT have template syntax
+	// because viewMounts() should have mounted the layers and returned real paths
+	if mountsHaveTemplate(viewMounts) {
+		t.Fatalf("expected view mounts without templates (for nerdctl commit compatibility), got: %#v", viewMounts)
+	}
+
+	// Should have a single overlay mount
+	if len(viewMounts) != 1 {
+		t.Fatalf("expected single overlay mount, got %d mounts: %#v", len(viewMounts), viewMounts)
+	}
+
+	if viewMounts[0].Type != "overlay" {
+		t.Fatalf("expected overlay mount type, got: %s", viewMounts[0].Type)
+	}
+
+	// Verify the overlay can be mounted (this is what nerdctl commit would do)
+	viewTarget := t.TempDir()
+	if err := mount.All(viewMounts, viewTarget); err != nil {
+		t.Fatalf("failed to mount view overlay: %v", err)
+	}
+	defer testutil.Unmount(t, viewTarget)
+
+	// Verify all layer files are visible
+	for i := range 3 {
+		filename := fmt.Sprintf("file-%d.txt", i)
+		content, err := os.ReadFile(filepath.Join(viewTarget, filename))
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", filename, err)
+		}
+		expected := fmt.Sprintf("content-%d", i)
+		if string(content) != expected {
+			t.Fatalf("expected %s content %q, got %q", filename, expected, string(content))
+		}
+	}
+
+	// Verify the lower directory was created with mounted layers
+	viewID := snapshotID(ctx, t, snap, viewKey)
+	lowerDir := snap.viewLowerPath(viewID)
+	entries, err := os.ReadDir(lowerDir)
+	if err != nil {
+		t.Fatalf("failed to read lower directory: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 mounted layers in lower directory, got %d", len(entries))
+	}
+}
+
+// TestErofsViewMountsSingleLayer tests that View snapshots with a single layer
+// return an EROFS mount directly (no overlay needed).
+func TestErofsViewMountsSingleLayer(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	sn := newSnapshotter(t)
+	snapshtr, cleanup, err := sn(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	defer cleanupAllSnapshots(ctx, snapshtr)
+
+	snap, ok := snapshtr.(*snapshotter)
+	if !ok {
+		t.Fatal("failed to cast snapshotter to *snapshotter")
+	}
+
+	// Create a single layer
+	key := "single-layer"
+	commitKey := "single-layer-commit"
+
+	if _, err := snapshtr.Prepare(ctx, key, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	id := snapshotID(ctx, t, snap, key)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(id), "test.txt"), []byte("test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := snapshtr.Commit(ctx, commitKey, key); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a View of the single-layer snapshot
+	viewKey := "single-layer-view"
+	viewMounts, err := snapshtr.View(ctx, viewKey, commitKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("single layer view mounts: %#v", viewMounts)
+
+	// Single layer view should return EROFS mount directly (no overlay)
+	if len(viewMounts) != 1 {
+		t.Fatalf("expected single mount, got %d: %#v", len(viewMounts), viewMounts)
+	}
+
+	if viewMounts[0].Type != "erofs" {
+		t.Fatalf("expected erofs mount type for single layer, got: %s", viewMounts[0].Type)
+	}
+
+	// Should not have template syntax
+	if mountsHaveTemplate(viewMounts) {
+		t.Fatalf("single layer view should not have templates: %#v", viewMounts)
+	}
+}
+
+// TestErofsViewMountsCleanupOnRemove tests that View snapshot mounts are properly
+// cleaned up when the snapshot is removed.
+func TestErofsViewMountsCleanupOnRemove(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	sn := newSnapshotter(t)
+	snapshtr, cleanup, err := sn(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	defer cleanupAllSnapshots(ctx, snapshtr)
+
+	snap, ok := snapshtr.(*snapshotter)
+	if !ok {
+		t.Fatal("failed to cast snapshotter to *snapshotter")
+	}
+
+	// Create 2 layers
+	var parentKey string
+	for i := range 2 {
+		key := fmt.Sprintf("layer-%d", i)
+		commitKey := fmt.Sprintf("layer-%d-commit", i)
+
+		if _, err := snapshtr.Prepare(ctx, key, parentKey); err != nil {
+			t.Fatal(err)
+		}
+
+		id := snapshotID(ctx, t, snap, key)
+		if err := os.WriteFile(filepath.Join(snap.upperPath(id), fmt.Sprintf("file-%d.txt", i)), []byte("content"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := snapshtr.Commit(ctx, commitKey, key); err != nil {
+			t.Fatal(err)
+		}
+		parentKey = commitKey
+	}
+
+	// Create a View (this will mount the EROFS layers)
+	viewKey := "cleanup-test-view"
+	viewMounts, err := snapshtr.View(ctx, viewKey, parentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the view is ready (lower mounts exist)
+	viewID := snapshotID(ctx, t, snap, viewKey)
+	lowerDir := snap.viewLowerPath(viewID)
+
+	// The lower directory should exist with mounted layers
+	entries, err := os.ReadDir(lowerDir)
+	if err != nil {
+		t.Fatalf("failed to read lower directory: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 mounted layers, got %d", len(entries))
+	}
+
+	// Mount the view to ensure it's active
+	viewTarget := t.TempDir()
+	if err := mount.All(viewMounts, viewTarget); err != nil {
+		t.Fatalf("failed to mount view: %v", err)
+	}
+	// Unmount the view overlay before removing the snapshot
+	if err := mount.UnmountAll(viewTarget, 0); err != nil {
+		t.Logf("warning: failed to unmount view target: %v", err)
+	}
+
+	// Remove the view snapshot
+	if err := snapshtr.Remove(ctx, viewKey); err != nil {
+		t.Fatalf("failed to remove view snapshot: %v", err)
+	}
+
+	// After removal, the lower directory should not exist
+	_, err = os.Stat(lowerDir)
+	if err == nil {
+		t.Fatalf("expected lower directory to be removed after snapshot removal: %s", lowerDir)
+	}
+	if !os.IsNotExist(err) {
+		t.Fatalf("expected not exist error, got: %v", err)
+	}
+}
+
+// TestErofsViewMountsIdempotent tests that calling Mounts() multiple times
+// on a View snapshot returns consistent results without re-mounting.
+func TestErofsViewMountsIdempotent(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	sn := newSnapshotter(t)
+	snapshtr, cleanup, err := sn(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	defer cleanupAllSnapshots(ctx, snapshtr)
+
+	snap, ok := snapshtr.(*snapshotter)
+	if !ok {
+		t.Fatal("failed to cast snapshotter to *snapshotter")
+	}
+
+	// Create 2 layers
+	var parentKey string
+	for i := range 2 {
+		key := fmt.Sprintf("layer-%d", i)
+		commitKey := fmt.Sprintf("layer-%d-commit", i)
+
+		if _, err := snapshtr.Prepare(ctx, key, parentKey); err != nil {
+			t.Fatal(err)
+		}
+
+		id := snapshotID(ctx, t, snap, key)
+		if err := os.WriteFile(filepath.Join(snap.upperPath(id), fmt.Sprintf("file-%d.txt", i)), []byte("content"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := snapshtr.Commit(ctx, commitKey, key); err != nil {
+			t.Fatal(err)
+		}
+		parentKey = commitKey
+	}
+
+	// Create a View
+	viewKey := "idempotent-test-view"
+	mounts1, err := snapshtr.View(ctx, viewKey, parentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Call Mounts() again on the same view
+	mounts2, err := snapshtr.Mounts(ctx, viewKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should return consistent results
+	if len(mounts1) != len(mounts2) {
+		t.Fatalf("inconsistent mount counts: first=%d, second=%d", len(mounts1), len(mounts2))
+	}
+
+	// Verify lowerdir options are the same
+	getLowerdir := func(mounts []mount.Mount) string {
+		for _, m := range mounts {
+			for _, opt := range m.Options {
+				if strings.HasPrefix(opt, "lowerdir=") {
+					return opt
+				}
+			}
+		}
+		return ""
+	}
+
+	lowerdir1 := getLowerdir(mounts1)
+	lowerdir2 := getLowerdir(mounts2)
+
+	if lowerdir1 != lowerdir2 {
+		t.Fatalf("inconsistent lowerdir:\n  first:  %s\n  second: %s", lowerdir1, lowerdir2)
+	}
+}
+
+// TestCleanupViewMountsNonExistent tests that cleanupViewMounts handles
+// non-existent directories gracefully.
+func TestCleanupViewMountsNonExistent(t *testing.T) {
+	// Should not error for non-existent directory
+	err := cleanupViewMounts("/nonexistent/path/to/lower")
+	if err != nil {
+		t.Fatalf("expected no error for non-existent directory, got: %v", err)
+	}
+}
+
+// TestCleanupViewMountsEmptyDir tests that cleanupViewMounts handles
+// empty directories correctly.
+func TestCleanupViewMountsEmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	err := cleanupViewMounts(dir)
+	if err != nil {
+		t.Fatalf("expected no error for empty directory, got: %v", err)
+	}
+}
