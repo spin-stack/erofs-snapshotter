@@ -3,12 +3,26 @@
 # This ensures we use the same erofs-utils version (v1.8.10) as specified in build-erofs-utils.sh
 #
 # Usage:
-#   ./scripts/run-docker-tests.sh [options]
+#   ./scripts/run-docker-tests.sh [options] [-- go test args]
 #
 # Options:
 #   --build    Force rebuild of the Docker image
 #   --shell    Start an interactive shell instead of running tests
 #   -h, --help Show this help message
+#
+# Examples:
+#   ./scripts/run-docker-tests.sh                                      # Run all tests
+#   ./scripts/run-docker-tests.sh -- -run TestName ./pkg/...           # Run specific test
+#   ./scripts/run-docker-tests.sh -- -v ./internal/erofs/...           # Run package tests verbose
+#   ./scripts/run-docker-tests.sh -- -run "TestMount.*" ./internal/snapshotter/...
+#
+# AI Assistant Usage (Claude Code):
+#   IMPORTANT: Do NOT use sudo. Always use this script for tests.
+#   - Run all tests:      ./scripts/run-docker-tests.sh
+#   - Run one test:       ./scripts/run-docker-tests.sh -- -run "TestName" ./path/to/pkg/...
+#   - Run one package:    ./scripts/run-docker-tests.sh -- -v ./internal/erofs/...
+#
+# Why Docker: EROFS utils required, privileged mode for mounts, Linux environment.
 
 set -euo pipefail
 
@@ -17,6 +31,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 IMAGE_NAME="nexuserofs-test"
 FORCE_BUILD=false
 INTERACTIVE=false
+GO_TEST_ARGS=()
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -30,11 +45,17 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            head -20 "$0" | tail -n +2 | sed 's/^# //' | sed 's/^#//'
+            head -25 "$0" | tail -n +2 | sed 's/^# //' | sed 's/^#//'
             exit 0
+            ;;
+        --)
+            shift
+            GO_TEST_ARGS=("$@")
+            break
             ;;
         *)
             echo "Unknown option: $1"
+            echo "Use -- to pass arguments to go test, e.g.: $0 -- -run TestName ./pkg/..."
             exit 1
             ;;
     esac
@@ -90,6 +111,9 @@ DOCKER_OPTS=(
 if [[ "${INTERACTIVE}" == "true" ]]; then
     echo "==> Starting interactive shell..."
     docker run -it "${DOCKER_OPTS[@]}" "${IMAGE_NAME}" /bin/bash
+elif [[ ${#GO_TEST_ARGS[@]} -gt 0 ]]; then
+    echo "==> Running: go test ${GO_TEST_ARGS[*]}"
+    docker run "${DOCKER_OPTS[@]}" "${IMAGE_NAME}" go test "${GO_TEST_ARGS[@]}"
 else
     docker run "${DOCKER_OPTS[@]}" "${IMAGE_NAME}"
 fi
