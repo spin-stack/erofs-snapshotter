@@ -165,7 +165,7 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		return nil, fmt.Errorf("failed to create snapshots directory: %w", err)
 	}
 
-	return &snapshotter{
+	s := &snapshotter{
 		root:             root,
 		ms:               ms,
 		ovlOptions:       config.ovlOptions,
@@ -173,7 +173,14 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		setImmutable:     config.setImmutable,
 		defaultWritable:  config.defaultSize,
 		fsMergeThreshold: config.fsMergeThreshold,
-	}, nil
+	}
+
+	// Clean up any orphaned mounts from previous runs.
+	// This uses context.Background() internally since NewSnapshotter doesn't
+	// take a context (per containerd snapshotter interface convention).
+	s.cleanupOrphanedMounts() //nolint:contextcheck // startup cleanup uses background context
+
+	return s, nil
 }
 
 // Close releases all resources held by the snapshotter.

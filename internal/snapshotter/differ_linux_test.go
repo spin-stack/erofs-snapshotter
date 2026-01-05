@@ -34,8 +34,7 @@ package erofs
 // - TestErofsDifferCompareContextCancellation
 // - TestErofsDifferCompareSingleLayerView
 // - TestErofsDifferCompareViewWithMultipleLayers
-// - TestErofsDifferCompareRequiresMountManagerForTemplates
-// - TestErofsDifferCompareRejectsNonEROFSMounts
+// - TestErofsDifferCompareDoesNotRequireMountManager
 
 import (
 	"context"

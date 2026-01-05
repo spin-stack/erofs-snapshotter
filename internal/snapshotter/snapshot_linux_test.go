@@ -36,6 +36,11 @@ package erofs
 // - TestErofsImmutableFlagOnCommit
 // - TestErofsImmutableFlagClearedOnRemove
 // - TestErofsConcurrentMounts
+// - TestErofsViewNoParent
+// - TestErofsViewNoParentBlockMode
+// - TestErofsBlockModeExtractWithParent
+// - TestErofsBlockModeExtractWithMultipleParents
+// - TestErofsConcurrentRemoveAndMounts
 
 import (
 	"context"
@@ -59,6 +64,9 @@ import (
 	"github.com/aledbf/nexuserofs/internal/mountutils"
 	"github.com/aledbf/nexuserofs/internal/preflight"
 )
+
+// mountTypeBind is the mount type for bind mounts.
+const mountTypeBind = "bind"
 
 func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 	testutil.RequiresRoot(t)
@@ -435,7 +443,7 @@ func TestErofsBlockModeMountsAfterPrepare(t *testing.T) {
 	// Should have a bind mount to the upper directory
 	hasBind := false
 	for _, m := range mounts1 {
-		if m.Type == "bind" {
+		if m.Type == mountTypeBind {
 			hasBind = true
 			break
 		}
@@ -767,7 +775,7 @@ func TestErofsExtractSnapshotWithParents(t *testing.T) {
 	}
 
 	m := extractMounts[0]
-	if m.Type != "bind" {
+	if m.Type != mountTypeBind {
 		t.Errorf("expected bind mount for extract snapshot, got %s", m.Type)
 	}
 
@@ -920,4 +928,271 @@ func TestErofsConcurrentMounts(t *testing.T) {
 	}
 
 	t.Logf("all %d concurrent mount calls returned consistent results", numGoroutines)
+}
+
+// TestErofsViewNoParent verifies that View with empty parent returns
+// a read-only bind mount to an empty directory (directory mode).
+func TestErofsViewNoParent(t *testing.T) {
+	env := newSnapshotTestEnv(t)
+
+	// Create a View with no parent - this is an edge case
+	mounts, err := env.snapshotter.View(env.ctx(), "empty-view", "")
+	if err != nil {
+		t.Fatalf("failed to create view with no parent: %v", err)
+	}
+
+	// Should return a single bind mount
+	if len(mounts) != 1 {
+		t.Fatalf("expected 1 mount, got %d", len(mounts))
+	}
+
+	m := mounts[0]
+	if m.Type != mountTypeBind {
+		t.Errorf("expected bind mount, got %s", m.Type)
+	}
+
+	// Should be read-only
+	hasRO := false
+	for _, opt := range m.Options {
+		if opt == "ro" {
+			hasRO = true
+			break
+		}
+	}
+	if !hasRO {
+		t.Error("expected read-only mount options")
+	}
+
+	// Source should be the view's lower directory
+	viewID := snapshotID(env.ctx(), t, env.snapshotter, "empty-view")
+	expectedPath := env.snapshotter.viewLowerPath(viewID)
+	if m.Source != expectedPath {
+		t.Errorf("expected source %s, got %s", expectedPath, m.Source)
+	}
+
+	// Directory should exist and be empty
+	entries, err := os.ReadDir(m.Source)
+	if err != nil {
+		t.Fatalf("failed to read view directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected empty directory, got %d entries", len(entries))
+	}
+
+	// Verify we can get mounts again (idempotent)
+	mounts2, err := env.snapshotter.Mounts(env.ctx(), "empty-view")
+	if err != nil {
+		t.Fatalf("failed to get mounts: %v", err)
+	}
+	if len(mounts2) != 1 || mounts2[0].Source != m.Source {
+		t.Error("mounts not idempotent")
+	}
+}
+
+// TestErofsViewNoParentBlockMode verifies that View with empty parent
+// works correctly in block mode.
+func TestErofsViewNoParentBlockMode(t *testing.T) {
+	env := newSnapshotTestEnv(t, WithDefaultSize(16*1024*1024))
+
+	// Create a View with no parent in block mode
+	mounts, err := env.snapshotter.View(env.ctx(), "empty-view-block", "")
+	if err != nil {
+		t.Fatalf("failed to create view with no parent: %v", err)
+	}
+
+	// Should return a single bind mount (same behavior as directory mode)
+	if len(mounts) != 1 {
+		t.Fatalf("expected 1 mount, got %d", len(mounts))
+	}
+
+	m := mounts[0]
+	if m.Type != mountTypeBind {
+		t.Errorf("expected bind mount, got %s", m.Type)
+	}
+
+	// Should be read-only
+	hasRO := false
+	for _, opt := range m.Options {
+		if opt == "ro" {
+			hasRO = true
+			break
+		}
+	}
+	if !hasRO {
+		t.Error("expected read-only mount options")
+	}
+
+	// Directory should exist and be empty
+	entries, err := os.ReadDir(m.Source)
+	if err != nil {
+		t.Fatalf("failed to read view directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected empty directory, got %d entries", len(entries))
+	}
+}
+
+// TestErofsBlockModeExtractWithParent verifies extract snapshot behavior
+// in block mode with a single parent layer.
+func TestErofsBlockModeExtractWithParent(t *testing.T) {
+	env := newSnapshotTestEnv(t, WithDefaultSize(16*1024*1024))
+
+	// Create and commit a base layer
+	baseCommit := env.createLayer("base-active", "", "base.txt", "base content")
+
+	// Create extract snapshot with 1 parent
+	extractKey := "extract-layer1"
+	mounts, err := env.snapshotter.Prepare(env.ctx(), extractKey, baseCommit)
+	if err != nil {
+		t.Fatalf("failed to prepare extract snapshot: %v", err)
+	}
+
+	// Extract snapshots should return bind mount to fs/ directory
+	if len(mounts) != 1 {
+		t.Fatalf("expected 1 mount, got %d", len(mounts))
+	}
+
+	m := mounts[0]
+	if m.Type != mountTypeBind {
+		t.Errorf("expected bind mount for extract, got %s", m.Type)
+	}
+
+	// Source should be fs/ directory (not rw/upper/)
+	if !strings.HasSuffix(m.Source, "/fs") {
+		t.Errorf("expected source to end with /fs, got %s", m.Source)
+	}
+
+	// Write content to verify it's writable
+	testFile := filepath.Join(m.Source, "extract-test.txt")
+	if err := os.WriteFile(testFile, []byte("extract content"), 0644); err != nil {
+		t.Fatalf("failed to write to extract mount: %v", err)
+	}
+
+	// Verify content exists
+	content, err := os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("failed to read extract file: %v", err)
+	}
+	if string(content) != "extract content" {
+		t.Errorf("unexpected content: %s", content)
+	}
+}
+
+// TestErofsBlockModeExtractWithMultipleParents verifies extract snapshot
+// behavior in block mode with multiple parent layers.
+func TestErofsBlockModeExtractWithMultipleParents(t *testing.T) {
+	env := newSnapshotTestEnv(t, WithDefaultSize(16*1024*1024))
+
+	// Create layer chain: base -> layer1 -> layer2
+	baseCommit := env.createLayer("base-active", "", "base.txt", "base content")
+	layer1Commit := env.createLayer("layer1-active", baseCommit, "layer1.txt", "layer1 content")
+	layer2Commit := env.createLayer("layer2-active", layer1Commit, "layer2.txt", "layer2 content")
+
+	// Create extract snapshot with multiple parents
+	extractKey := "extract-multi"
+	mounts, err := env.snapshotter.Prepare(env.ctx(), extractKey, layer2Commit)
+	if err != nil {
+		t.Fatalf("failed to prepare extract snapshot: %v", err)
+	}
+
+	// Extract snapshots should return bind mount to fs/ directory
+	if len(mounts) != 1 {
+		t.Fatalf("expected 1 mount, got %d", len(mounts))
+	}
+
+	m := mounts[0]
+	if m.Type != mountTypeBind {
+		t.Errorf("expected bind mount for extract, got %s", m.Type)
+	}
+
+	// Source should be fs/ directory
+	if !strings.HasSuffix(m.Source, "/fs") {
+		t.Errorf("expected source to end with /fs, got %s", m.Source)
+	}
+
+	// Write content and verify
+	testFile := filepath.Join(m.Source, "extract-multi.txt")
+	if err := os.WriteFile(testFile, []byte("multi-parent extract"), 0644); err != nil {
+		t.Fatalf("failed to write to extract mount: %v", err)
+	}
+
+	// Verify content
+	content, err := os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("failed to read extract file: %v", err)
+	}
+	if string(content) != "multi-parent extract" {
+		t.Errorf("unexpected content: %s", content)
+	}
+}
+
+// TestErofsConcurrentRemoveAndMounts tests the race condition between
+// Remove() and Mounts() operations on the same snapshot.
+func TestErofsConcurrentRemoveAndMounts(t *testing.T) {
+	env := newSnapshotTestEnv(t)
+
+	// Create a committed base layer
+	labels := map[string]string{extractLabel: "true"}
+	baseCommit := env.createLayerWithLabels("base-active", "", "base.txt", "base", labels)
+
+	// Run multiple iterations to increase chance of hitting race
+	for iter := range 5 {
+		viewKey := fmt.Sprintf("race-view-%d", iter)
+
+		// Create a View
+		_, err := env.snapshotter.View(env.ctx(), viewKey, baseCommit)
+		if err != nil {
+			t.Fatalf("iter %d: failed to create view: %v", iter, err)
+		}
+
+		// Start concurrent operations
+		mountsDone := make(chan error, 1)
+		removeDone := make(chan error, 1)
+
+		// Goroutine 1: repeatedly call Mounts
+		go func() {
+			for range 10 {
+				_, err := env.snapshotter.Mounts(env.ctx(), viewKey)
+				if err != nil {
+					// Snapshot may have been removed - this is expected
+					if strings.Contains(err.Error(), "not found") ||
+						strings.Contains(err.Error(), "does not exist") {
+						break
+					}
+					mountsDone <- err
+					return
+				}
+			}
+			mountsDone <- nil
+		}()
+
+		// Goroutine 2: remove the snapshot after a brief delay
+		go func() {
+			time.Sleep(1 * time.Millisecond)
+			err := env.snapshotter.Remove(env.ctx(), viewKey)
+			// "not found" is acceptable if another iteration already removed it
+			if err != nil && !strings.Contains(err.Error(), "not found") {
+				removeDone <- err
+				return
+			}
+			removeDone <- nil
+		}()
+
+		// Wait for both to complete with timeout
+		timeout := time.After(5 * time.Second)
+		for range 2 {
+			select {
+			case err := <-mountsDone:
+				if err != nil {
+					t.Errorf("iter %d: mounts error: %v", iter, err)
+				}
+			case err := <-removeDone:
+				if err != nil {
+					t.Errorf("iter %d: remove error: %v", iter, err)
+				}
+			case <-timeout:
+				t.Fatalf("iter %d: timeout waiting for concurrent operations", iter)
+			}
+		}
+	}
 }

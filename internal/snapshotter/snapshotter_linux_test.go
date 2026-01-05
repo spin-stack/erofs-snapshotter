@@ -190,6 +190,7 @@ func newSnapshotter(t *testing.T, opts ...Opt) func(ctx context.Context, root st
 		t.Skipf("check for erofs kernel support failed: %v, skipping test", err)
 	}
 	return func(ctx context.Context, root string) (snapshots.Snapshotter, func() error, error) {
+		//nolint:contextcheck // NewSnapshotter follows containerd interface (no context param)
 		snapshotter, err := NewSnapshotter(root, opts...)
 		if err != nil {
 			return nil, nil, err

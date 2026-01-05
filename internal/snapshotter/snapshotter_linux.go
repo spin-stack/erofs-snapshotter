@@ -25,6 +25,8 @@ import (
 	"syscall"
 
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/log"
 	"github.com/moby/sys/mountinfo"
@@ -81,6 +83,18 @@ func setImmutable(path string, enable bool) error {
 	return unix.IoctlSetPointerInt(int(f.Fd()), unix.FS_IOC_SETFLAGS, newattr)
 }
 
+// syncFile opens a file and calls fsync to ensure its data is flushed to disk.
+// This is important for durability - without fsync, data may remain in the
+// kernel's buffer cache and be lost if the system crashes.
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
 // isNotMountError returns true if the error indicates the target was not mounted.
 // These errors are expected during cleanup when the path was never mounted.
 func isNotMountError(err error) bool {
@@ -90,6 +104,86 @@ func isNotMountError(err error) bool {
 	// EINVAL: target is not a mount point
 	// ENOENT: path doesn't exist (already cleaned up)
 	return errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOENT) || os.IsNotExist(err)
+}
+
+// cleanupOrphanedMounts detects and cleans up mount leaks on startup.
+// This handles two cases:
+// 1. Orphaned snapshot directories (on disk but not in metadata) - unmount and remove
+// 2. Stale mounts for existing snapshots (mounts left behind from previous runs)
+// Errors are logged but not returned since this is best-effort cleanup.
+func (s *snapshotter) cleanupOrphanedMounts() {
+	snapshotsDir := filepath.Join(s.root, "snapshots")
+	entries, err := os.ReadDir(snapshotsDir)
+	if err != nil {
+		// If the directory doesn't exist, there's nothing to clean up
+		return
+	}
+
+	// Get all valid snapshot IDs from metadata
+	validIDs := make(map[string]bool)
+	ctx := context.Background()
+	if err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		return storage.WalkInfo(ctx, func(ctx context.Context, info snapshots.Info) error {
+			// Get the snapshot ID from its key
+			id, _, _, err := storage.GetInfo(ctx, info.Name)
+			if err != nil {
+				// Log and continue walking even if one fails
+				log.L.WithError(err).WithField("key", info.Name).Debug("failed to get snapshot info during orphan cleanup")
+				return nil //nolint:nilerr // intentionally continue on error
+			}
+			validIDs[id] = true
+			return nil
+		})
+	}); err != nil {
+		log.L.WithError(err).Warn("failed to enumerate snapshots during orphan cleanup")
+		return
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		id := entry.Name()
+		snapshotDir := filepath.Join(snapshotsDir, id)
+
+		if !validIDs[id] {
+			// Orphaned directory - not in metadata
+			log.L.WithField("id", id).Info("cleaning up orphaned snapshot directory")
+
+			// Unmount all mounts before removing
+			rwDir := filepath.Join(snapshotDir, "rw")
+			if err := unmountAll(rwDir); err != nil && !isNotMountError(err) {
+				log.L.WithError(err).WithField("path", rwDir).Debug("failed to unmount orphan rw")
+			}
+
+			layersDir := filepath.Join(snapshotDir, "layers")
+			if err := mount.UnmountRecursive(layersDir, 0); err != nil {
+				log.L.WithError(err).WithField("path", layersDir).Debug("failed to unmount orphan layers")
+			}
+
+			// Clear immutable flag if present
+			layerBlob := filepath.Join(snapshotDir, "layer.erofs")
+			_ = setImmutable(layerBlob, false)
+
+			// Remove the entire directory
+			if err := os.RemoveAll(snapshotDir); err != nil {
+				log.L.WithError(err).WithField("path", snapshotDir).Warn("failed to remove orphaned snapshot directory")
+			}
+			continue
+		}
+
+		// Valid snapshot - just clean up stale mounts that might have been left behind
+		// This handles cases where the process crashed before unmounting
+		rwDir := filepath.Join(snapshotDir, "rw")
+		if err := unmountAll(rwDir); err != nil && !isNotMountError(err) {
+			log.L.WithError(err).WithField("path", rwDir).Debug("failed to cleanup stale rw mount")
+		}
+
+		layersDir := filepath.Join(snapshotDir, "layers")
+		if err := mount.UnmountRecursive(layersDir, 0); err != nil {
+			log.L.WithError(err).WithField("path", layersDir).Debug("failed to cleanup stale layer mounts")
+		}
+	}
 }
 
 // unmountAll attempts to unmount the target. If normal unmount fails (e.g., due
@@ -125,6 +219,12 @@ func convertDirToErofs(ctx context.Context, layerBlob, upperDir string) error {
 	err := erofsutils.ConvertErofs(ctx, layerBlob, upperDir, nil)
 	if err != nil {
 		return err
+	}
+
+	// Sync the layer blob to disk to ensure durability.
+	// This prevents data loss if the system crashes before the OS flushes the buffer cache.
+	if err := syncFile(layerBlob); err != nil {
+		return fmt.Errorf("failed to sync layer blob: %w", err)
 	}
 
 	// Remove all sub-directories in the overlayfs upperdir.  Leave the

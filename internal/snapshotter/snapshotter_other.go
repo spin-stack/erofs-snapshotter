@@ -52,3 +52,7 @@ func upperDirectoryPermission(p, parent string) error {
 func convertDirToErofs(ctx context.Context, layerBlob, upperDir string) error {
 	return errdefs.ErrNotImplemented
 }
+
+func (s *snapshotter) cleanupOrphanedMounts() {
+	// No-op on non-Linux platforms
+}
