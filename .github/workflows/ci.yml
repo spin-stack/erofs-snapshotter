@@ -72,17 +72,22 @@ jobs:
 
       - name: Setup udev rules for loop devices
         run: |
-          # Skip SCSI detection and warnings for all loop devices
-          # Sets ID_SERIAL to prevent the 55-scsi-sg3_id.rules warning
+          # Skip SCSI detection/warnings and reduce CPU overhead for loop devices
           sudo tee /etc/udev/rules.d/49-skip-loop-scsi.rules << 'EOF'
           SUBSYSTEM=="block", KERNEL=="loop*", ENV{ID_SERIAL}="loop", ENV{ID_SCSI}="0", ENV{ID_SCSI_INQUIRY}="0"
+          SUBSYSTEM=="block", KERNEL=="loop*", ENV{UDISKS_IGNORE}="1"
+          SUBSYSTEM=="block", KERNEL=="loop*", ENV{SYSTEMD_READY}="0", OPTIONS+="nowatch"
           EOF
           sudo udevadm control --reload-rules
 
       - name: Run tests as root
         run: |
-          sudo env "PATH=$PATH" "GOPATH=$GOPATH" "GOCACHE=$GOCACHE" "GOMODCACHE=$GOMODCACHE" \
-            go test -v -race -coverprofile=coverage.txt -covermode=atomic ./... -test.root
+          # Run in private mount namespace to avoid systemd mount unit overhead
+          sudo unshare -m sh -c "
+            mount --make-rprivate /
+            env PATH=$PATH GOPATH=$GOPATH GOCACHE=$GOCACHE GOMODCACHE=$GOMODCACHE \
+              go test -v -race -coverprofile=coverage.txt -covermode=atomic ./... -test.root
+          "
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
