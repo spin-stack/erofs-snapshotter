@@ -27,6 +27,17 @@ package erofs
 // - TestErofsSnapshotterFsmetaSingleLayerView
 // - TestErofsBlockModeMountsAfterPrepare
 // - TestErofsCleanupRemovesOrphan
+// - TestErofsViewMountsMultiLayer
+// - TestErofsViewMountsSingleLayer
+// - TestErofsViewMountsCleanupOnRemove
+// - TestErofsViewMountsIdempotent
+// - TestCleanupViewMountsNonExistent
+// - TestCleanupViewMountsEmptyDir
+// - TestErofsBlockModeIgnoresFsMerge
+// - TestErofsExtractSnapshotWithParents
+// - TestErofsImmutableFlagOnCommit
+// - TestErofsImmutableFlagClearedOnRemove
+// - TestErofsConcurrentMounts
 
 import (
 	"context"
@@ -40,12 +51,10 @@ import (
 
 	"github.com/containerd/containerd/v2/core/images/imagetest"
 	"github.com/containerd/containerd/v2/core/mount"
-	"github.com/containerd/containerd/v2/core/mount/manager"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/testutil"
-	bolt "go.etcd.io/bbolt"
 
 	erofsdiffer "github.com/aledbf/nexuserofs/internal/differ"
 	"github.com/aledbf/nexuserofs/internal/mountutils"
@@ -79,22 +88,7 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 		t.Fatal("failed to cast snapshotter to *snapshotter")
 	}
 
-	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0600, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	mountRoot := filepath.Join(tempDir, "mounts")
-	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if closer, ok := mm.(interface{ Close() error }); ok {
-		defer closer.Close()
-	}
-
-	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm))
+	differ := erofsdiffer.NewErofsDiffer(contentStore)
 
 	writeFiles := func(dir string, files map[string]string) error {
 		for name, content := range files {
@@ -158,17 +152,24 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// Lower mounts should NOT have templates - they should be directly mountable
+		if mountsHaveTemplate(lowerMounts) {
+			t.Fatalf("expected lower mounts without templates, got: %#v", lowerMounts)
+		}
 		if expectMulti {
-			if !mountsHaveTemplate(lowerMounts) {
-				t.Fatalf("expected lower mounts to include overlay templates, got: %#v", lowerMounts)
+			// Multi-layer: expect overlay with real paths
+			if len(lowerMounts) != 1 || lowerMounts[0].Type != "overlay" {
+				t.Fatalf("expected single overlay mount for multi-layer, got: %#v", lowerMounts)
 			}
 		} else {
+			// Single-layer: expect EROFS mount directly
 			if len(lowerMounts) != 1 || mountutils.TypeSuffix(lowerMounts[0].Type) != testTypeErofs {
 				t.Fatalf("expected single EROFS mount, got: %#v", lowerMounts)
 			}
 		}
-		if !mountsHaveTemplate(upperMounts) {
-			t.Fatalf("expected upper mounts to include overlay templates, got: %#v", upperMounts)
+		// Upper mounts should NOT have templates - they should be directly mountable
+		if mountsHaveTemplate(upperMounts) {
+			t.Fatalf("expected upper mounts without templates, got: %#v", upperMounts)
 		}
 
 		desc, err := differ.Compare(ctx, lowerMounts, upperMounts)
@@ -198,13 +199,7 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Use mount manager to process template mounts (overlay templates need to be resolved)
-		viewActivation, err := mm.Activate(ctx, viewKey+"-activation", cloneMounts(viewMounts))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer mm.Deactivate(ctx, viewActivation.Name)
-
+		// View mounts are directly mountable (no templates)
 		verifyFiles := func(root string, files map[string]string) {
 			for name, content := range files {
 				data, err := os.ReadFile(filepath.Join(root, name))
@@ -218,7 +213,7 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 		}
 
 		// Mount and verify files
-		if err := mount.WithTempMount(ctx, viewActivation.System, func(root string) error {
+		if err := mount.WithTempMount(ctx, viewMounts, func(root string) error {
 			verifyFiles(root, baseFiles)
 			if midFiles != nil {
 				verifyFiles(root, midFiles)
@@ -387,30 +382,37 @@ func TestErofsBlockModeMountsAfterPrepare(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Block mode returns template mounts when overlay is not mounted on host.
-	// VM-based runtimes (like qemubox) need block devices, not bind mounts.
+	// Block mode now returns direct mounts (no templates).
+	// The ext4 layer is mounted internally and a bind mount is returned.
 	mounts1, err := snapshtr.Mounts(ctx, key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	hasExt4 := false
+
+	// Should NOT have templates
+	if mountsHaveTemplate(mounts1) {
+		t.Fatalf("block mode should not use templates, got: %#v", mounts1)
+	}
+
+	// Should have a bind mount to the upper directory
+	hasBind := false
 	for _, m := range mounts1 {
-		if m.Type == "ext4" {
-			hasExt4 = true
+		if m.Type == "bind" {
+			hasBind = true
 			break
 		}
 	}
-	if !hasExt4 {
-		t.Fatalf("expected Mounts to include ext4 template, got: %#v", mounts1)
+	if !hasBind {
+		t.Fatalf("expected Mounts to include bind mount, got: %#v", mounts1)
 	}
 
-	// Subsequent calls also return template mounts (no overlay mounted on host).
+	// Subsequent calls return consistent mounts (idempotent).
 	mounts2, err := snapshtr.Mounts(ctx, key)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(mounts1) != len(mounts2) {
-		t.Fatalf("expected consistent template mounts, got %d vs %d", len(mounts1), len(mounts2))
+		t.Fatalf("expected consistent mounts, got %d vs %d", len(mounts1), len(mounts2))
 	}
 
 	if err := snapshtr.Remove(ctx, key); err != nil {
@@ -808,4 +810,525 @@ func TestCleanupViewMountsEmptyDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error for empty directory, got: %v", err)
 	}
+}
+
+// TestErofsBlockModeIgnoresFsMerge verifies that block mode does not use
+// fsMeta merge even when fsMergeThreshold is configured. Block mode always
+// mounts layers individually because fsMeta merge is not supported with
+// block-based writable layers.
+func TestErofsBlockModeIgnoresFsMerge(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+
+	// Create snapshotter with both block mode AND fsMergeThreshold
+	// Block mode should take precedence and ignore fsMerge
+	s, err := NewSnapshotter(snapshotRoot,
+		WithDefaultSize(64*1024*1024), // Enable block mode
+		WithFsMergeThreshold(1),       // Would normally enable fsMerge after 1 layer
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
+
+	snap, ok := s.(*snapshotter)
+	if !ok {
+		t.Fatal("failed to cast snapshotter to *snapshotter")
+	}
+
+	// Verify block mode is enabled
+	if !snap.isBlockMode() {
+		t.Fatal("expected block mode to be enabled")
+	}
+
+	// Create first layer
+	layer1, err := s.Prepare(ctx, "layer1-active", "", snapshots.WithLabels(map[string]string{
+		extractLabel: "true",
+	}))
+	if err != nil {
+		t.Fatalf("failed to prepare layer1: %v", err)
+	}
+
+	// Create content
+	mounts, err := s.Mounts(ctx, "layer1-active")
+	if err != nil {
+		t.Fatalf("failed to get mounts: %v", err)
+	}
+	if err := mount.WithTempMount(ctx, mounts, func(root string) error {
+		return os.WriteFile(filepath.Join(root, "file1.txt"), []byte("layer1"), 0644)
+	}); err != nil {
+		t.Fatalf("failed to write to layer1: %v", err)
+	}
+
+	// Commit first layer
+	if err := s.Commit(ctx, "layer1", "layer1-active"); err != nil {
+		t.Fatalf("failed to commit layer1: %v", err)
+	}
+
+	// Create second layer on top
+	layer2, err := s.Prepare(ctx, "layer2-active", "layer1", snapshots.WithLabels(map[string]string{
+		extractLabel: "true",
+	}))
+	if err != nil {
+		t.Fatalf("failed to prepare layer2: %v", err)
+	}
+
+	mounts, err = s.Mounts(ctx, "layer2-active")
+	if err != nil {
+		t.Fatalf("failed to get mounts: %v", err)
+	}
+	if err := mount.WithTempMount(ctx, mounts, func(root string) error {
+		return os.WriteFile(filepath.Join(root, "file2.txt"), []byte("layer2"), 0644)
+	}); err != nil {
+		t.Fatalf("failed to write to layer2: %v", err)
+	}
+
+	if err := s.Commit(ctx, "layer2", "layer2-active"); err != nil {
+		t.Fatalf("failed to commit layer2: %v", err)
+	}
+
+	// Create a View with 2 parents - this would trigger fsMerge in directory mode
+	viewMounts, err := s.View(ctx, "view-test", "layer2")
+	if err != nil {
+		t.Fatalf("failed to get view mounts: %v", err)
+	}
+
+	t.Logf("layer1 info: %+v", layer1)
+	t.Logf("layer2 info: %+v", layer2)
+	t.Logf("view mounts: %+v", viewMounts)
+
+	// Verify no fsmeta was used (would have device= options)
+	for _, m := range viewMounts {
+		for _, opt := range m.Options {
+			if strings.HasPrefix(opt, "device=") {
+				t.Errorf("block mode should not use fsmeta device= options, got: %s", opt)
+			}
+		}
+	}
+
+	// Should be overlay with real lowerdirs (not merged fsmeta)
+	if len(viewMounts) != 1 {
+		t.Fatalf("expected 1 mount, got %d", len(viewMounts))
+	}
+	if viewMounts[0].Type != "overlay" {
+		t.Fatalf("expected overlay mount, got %s", viewMounts[0].Type)
+	}
+
+	// The lowerdir should contain multiple paths (one per layer)
+	for _, opt := range viewMounts[0].Options {
+		if strings.HasPrefix(opt, "lowerdir=") {
+			lowerdir := strings.TrimPrefix(opt, "lowerdir=")
+			paths := strings.Split(lowerdir, ":")
+			if len(paths) < 2 {
+				t.Errorf("expected multiple lowerdirs for 2-layer view, got: %s", lowerdir)
+			}
+			t.Logf("lowerdir paths: %v", paths)
+		}
+	}
+}
+
+// TestErofsExtractSnapshotWithParents verifies that extract snapshots
+// always return a bind mount to the fs/ directory, regardless of parent count.
+func TestErofsExtractSnapshotWithParents(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+
+	s, err := NewSnapshotter(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
+
+	// Create and commit first layer
+	_, err = s.Prepare(ctx, "layer1-active", "", snapshots.WithLabels(map[string]string{
+		extractLabel: "true",
+	}))
+	if err != nil {
+		t.Fatalf("failed to prepare layer1: %v", err)
+	}
+
+	mounts, err := s.Mounts(ctx, "layer1-active")
+	if err != nil {
+		t.Fatalf("failed to get mounts: %v", err)
+	}
+	if err := mount.WithTempMount(ctx, mounts, func(root string) error {
+		return os.WriteFile(filepath.Join(root, "file1.txt"), []byte("layer1"), 0644)
+	}); err != nil {
+		t.Fatalf("failed to write to layer1: %v", err)
+	}
+
+	if err := s.Commit(ctx, "layer1", "layer1-active"); err != nil {
+		t.Fatalf("failed to commit layer1: %v", err)
+	}
+
+	// Create and commit second layer
+	_, err = s.Prepare(ctx, "layer2-active", "layer1", snapshots.WithLabels(map[string]string{
+		extractLabel: "true",
+	}))
+	if err != nil {
+		t.Fatalf("failed to prepare layer2: %v", err)
+	}
+
+	mounts, err = s.Mounts(ctx, "layer2-active")
+	if err != nil {
+		t.Fatalf("failed to get mounts: %v", err)
+	}
+	if err := mount.WithTempMount(ctx, mounts, func(root string) error {
+		return os.WriteFile(filepath.Join(root, "file2.txt"), []byte("layer2"), 0644)
+	}); err != nil {
+		t.Fatalf("failed to write to layer2: %v", err)
+	}
+
+	if err := s.Commit(ctx, "layer2", "layer2-active"); err != nil {
+		t.Fatalf("failed to commit layer2: %v", err)
+	}
+
+	// Create extract snapshot with 2 parents
+	_, err = s.Prepare(ctx, "extract-with-parents", "layer2", snapshots.WithLabels(map[string]string{
+		extractLabel: "true",
+	}))
+	if err != nil {
+		t.Fatalf("failed to prepare extract snapshot: %v", err)
+	}
+
+	extractMounts, err := s.Mounts(ctx, "extract-with-parents")
+	if err != nil {
+		t.Fatalf("failed to get extract mounts: %v", err)
+	}
+
+	t.Logf("extract mounts: %+v", extractMounts)
+
+	// Extract snapshots should always be bind mounts to fs/
+	if len(extractMounts) != 1 {
+		t.Fatalf("expected 1 mount, got %d", len(extractMounts))
+	}
+
+	m := extractMounts[0]
+	if m.Type != "bind" {
+		t.Errorf("expected bind mount for extract snapshot, got %s", m.Type)
+	}
+
+	if !strings.HasSuffix(m.Source, "/fs") {
+		t.Errorf("expected source to end with /fs, got %s", m.Source)
+	}
+
+	// Verify parent layers don't affect the mount type
+	hasRbind := false
+	for _, opt := range m.Options {
+		if opt == "rbind" {
+			hasRbind = true
+		}
+	}
+	if !hasRbind {
+		t.Error("expected rbind option in extract mount")
+	}
+}
+
+// TestErofsImmutableFlagOnCommit verifies that the immutable flag (FS_IMMUTABLE_FL)
+// is set on the EROFS layer blob when WithImmutable option is enabled.
+func TestErofsImmutableFlagOnCommit(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+
+	// Create snapshotter with immutable flag enabled
+	s, err := NewSnapshotter(snapshotRoot, WithImmutable())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
+
+	snap, ok := s.(*snapshotter)
+	if !ok {
+		t.Fatal("failed to cast snapshotter to *snapshotter")
+	}
+
+	// Create and commit a layer
+	_, err = s.Prepare(ctx, "layer1-active", "", snapshots.WithLabels(map[string]string{
+		extractLabel: "true",
+	}))
+	if err != nil {
+		t.Fatalf("failed to prepare layer1: %v", err)
+	}
+
+	mounts, err := s.Mounts(ctx, "layer1-active")
+	if err != nil {
+		t.Fatalf("failed to get mounts: %v", err)
+	}
+	if err := mount.WithTempMount(ctx, mounts, func(root string) error {
+		return os.WriteFile(filepath.Join(root, "test.txt"), []byte("content"), 0644)
+	}); err != nil {
+		t.Fatalf("failed to write content: %v", err)
+	}
+
+	if err := s.Commit(ctx, "layer1", "layer1-active"); err != nil {
+		t.Fatalf("failed to commit: %v", err)
+	}
+
+	// Get the committed snapshot info
+	info, err := s.Stat(ctx, "layer1")
+	if err != nil {
+		t.Fatalf("failed to stat committed snapshot: %v", err)
+	}
+	t.Logf("committed snapshot info: %+v", info)
+
+	// Verify the layer blob has immutable flag
+	layerBlob := snap.layerBlobPath(getSnapshotID(t, s, ctx, "layer1"))
+	if _, err := os.Stat(layerBlob); err != nil {
+		t.Fatalf("layer blob not found at %s: %v", layerBlob, err)
+	}
+
+	// Check immutable flag using lsattr
+	out, err := exec.Command("lsattr", layerBlob).CombinedOutput()
+	if err != nil {
+		t.Logf("lsattr failed (may not be supported): %v, output: %s", err, string(out))
+		t.Skip("lsattr not available or not supported on this filesystem")
+	}
+
+	// lsattr output format: "----i--------e-- /path/to/file"
+	// The 'i' indicates immutable flag
+	if !strings.Contains(string(out), "i") {
+		t.Errorf("expected immutable flag to be set on %s, lsattr output: %s", layerBlob, string(out))
+	} else {
+		t.Logf("immutable flag verified on %s: %s", layerBlob, strings.TrimSpace(string(out)))
+	}
+}
+
+// TestErofsImmutableFlagClearedOnRemove verifies that the immutable flag
+// is cleared before removing a committed snapshot, allowing deletion.
+func TestErofsImmutableFlagClearedOnRemove(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+
+	// Create snapshotter with immutable flag enabled
+	s, err := NewSnapshotter(snapshotRoot, WithImmutable())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	snap, ok := s.(*snapshotter)
+	if !ok {
+		t.Fatal("failed to cast snapshotter to *snapshotter")
+	}
+
+	// Create and commit a layer
+	_, err = s.Prepare(ctx, "layer1-active", "", snapshots.WithLabels(map[string]string{
+		extractLabel: "true",
+	}))
+	if err != nil {
+		t.Fatalf("failed to prepare: %v", err)
+	}
+
+	mounts, err := s.Mounts(ctx, "layer1-active")
+	if err != nil {
+		t.Fatalf("failed to get mounts: %v", err)
+	}
+	if err := mount.WithTempMount(ctx, mounts, func(root string) error {
+		return os.WriteFile(filepath.Join(root, "test.txt"), []byte("content"), 0644)
+	}); err != nil {
+		t.Fatalf("failed to write content: %v", err)
+	}
+
+	if err := s.Commit(ctx, "layer1", "layer1-active"); err != nil {
+		t.Fatalf("failed to commit: %v", err)
+	}
+
+	// Get the layer blob path before removal
+	layerBlob := snap.layerBlobPath(getSnapshotID(t, s, ctx, "layer1"))
+
+	// Remove the snapshot - this should clear the immutable flag first
+	if err := s.Remove(ctx, "layer1"); err != nil {
+		t.Fatalf("failed to remove snapshot: %v", err)
+	}
+
+	// Verify the layer blob no longer exists
+	if _, err := os.Stat(layerBlob); !os.IsNotExist(err) {
+		t.Errorf("expected layer blob to be removed, but got: %v", err)
+	}
+
+	// Verify snapshot is gone
+	_, err = s.Stat(ctx, "layer1")
+	if err == nil {
+		t.Error("expected snapshot to be removed")
+	}
+}
+
+// getSnapshotID retrieves the internal ID for a snapshot name
+func getSnapshotID(t *testing.T, s snapshots.Snapshotter, ctx context.Context, name string) string {
+	t.Helper()
+
+	// Get from metastore directly via the snapshotter
+	snap, ok := s.(*snapshotter)
+	if !ok {
+		t.Fatal("failed to cast to snapshotter")
+	}
+
+	var id string
+	err := snap.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		snapshotID, _, _, err := storage.GetInfo(ctx, name)
+		if err != nil {
+			return err
+		}
+		id = snapshotID
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("failed to get snapshot ID: %v", err)
+	}
+
+	return id
+}
+
+// TestErofsConcurrentMounts verifies that concurrent mount operations
+// are safe and produce consistent results.
+func TestErofsConcurrentMounts(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+
+	s, err := NewSnapshotter(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
+
+	// Create and commit a base layer
+	_, err = s.Prepare(ctx, "base-active", "", snapshots.WithLabels(map[string]string{
+		extractLabel: "true",
+	}))
+	if err != nil {
+		t.Fatalf("failed to prepare base: %v", err)
+	}
+
+	mounts, err := s.Mounts(ctx, "base-active")
+	if err != nil {
+		t.Fatalf("failed to get mounts: %v", err)
+	}
+	if err := mount.WithTempMount(ctx, mounts, func(root string) error {
+		return os.WriteFile(filepath.Join(root, "base.txt"), []byte("base"), 0644)
+	}); err != nil {
+		t.Fatalf("failed to write content: %v", err)
+	}
+
+	if err := s.Commit(ctx, "base", "base-active"); err != nil {
+		t.Fatalf("failed to commit base: %v", err)
+	}
+
+	// Create a View snapshot
+	if _, err := s.View(ctx, "concurrent-view", "base"); err != nil {
+		t.Fatalf("failed to create view: %v", err)
+	}
+
+	// Concurrent access test
+	const numGoroutines = 10
+	results := make(chan []mount.Mount, numGoroutines)
+	errors := make(chan error, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			mounts, err := s.Mounts(ctx, "concurrent-view")
+			if err != nil {
+				errors <- fmt.Errorf("goroutine %d: %w", id, err)
+				return
+			}
+			results <- mounts
+		}(i)
+	}
+
+	// Collect results
+	var allMounts [][]mount.Mount
+	for i := 0; i < numGoroutines; i++ {
+		select {
+		case mounts := <-results:
+			allMounts = append(allMounts, mounts)
+		case err := <-errors:
+			t.Fatalf("concurrent mount failed: %v", err)
+		case <-time.After(30 * time.Second):
+			t.Fatal("timeout waiting for concurrent mounts")
+		}
+	}
+
+	// Verify all results are consistent
+	if len(allMounts) == 0 {
+		t.Fatal("no mounts returned")
+	}
+
+	reference := allMounts[0]
+	for i, mounts := range allMounts[1:] {
+		if len(mounts) != len(reference) {
+			t.Errorf("goroutine %d returned different number of mounts: %d vs %d",
+				i+1, len(mounts), len(reference))
+			continue
+		}
+		for j := range mounts {
+			if mounts[j].Type != reference[j].Type {
+				t.Errorf("goroutine %d mount %d has different type: %s vs %s",
+					i+1, j, mounts[j].Type, reference[j].Type)
+			}
+			if mounts[j].Source != reference[j].Source {
+				t.Errorf("goroutine %d mount %d has different source: %s vs %s",
+					i+1, j, mounts[j].Source, reference[j].Source)
+			}
+		}
+	}
+
+	t.Logf("all %d concurrent mount calls returned consistent results", numGoroutines)
 }

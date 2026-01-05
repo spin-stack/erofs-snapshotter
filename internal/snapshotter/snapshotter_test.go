@@ -312,24 +312,6 @@ func TestSnapshotterPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("upperDir non-block mode", func(t *testing.T) {
-		s := &snapshotter{root: root, defaultWritable: 0}
-		got := s.upperDir("123")
-		want := filepath.Join(root, "snapshots", "123", "fs")
-		if got != want {
-			t.Errorf("upperDir(123) = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("upperDir block mode", func(t *testing.T) {
-		s := &snapshotter{root: root, defaultWritable: 1024}
-		got := s.upperDir("123")
-		want := filepath.Join(root, "snapshots", "123", "fs", "rw", "upper")
-		if got != want {
-			t.Errorf("upperDir(123) = %q, want %q", got, want)
-		}
-	})
-
 	t.Run("workPath", func(t *testing.T) {
 		got := s.workPath("123")
 		want := filepath.Join(root, "snapshots", "123", "work")

@@ -19,6 +19,7 @@ package erofs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -130,59 +131,41 @@ func cleanupViewMounts(lower string) error {
 	return nil
 }
 
-// cleanupActiveMounts unmounts all active mounts under the upper directory.
-// This is a best-effort cleanup that continues to clean up remaining mounts
-// even if individual unmounts fail. Returns an error describing all failures.
-func cleanupActiveMounts(upper string) error {
-	var errs []error
-
-	merged := filepath.Join(upper, "merged")
-	lower := filepath.Join(upper, "lower")
-	rw := filepath.Join(upper, "rw")
-
-	if err := unmountAll(merged); err != nil {
-		errs = append(errs, fmt.Errorf("merged %s: %w", merged, err))
+// isNotMountError returns true if the error indicates the target was not mounted.
+// These errors are expected during cleanup when the path was never mounted.
+func isNotMountError(err error) bool {
+	if err == nil {
+		return false
 	}
-
-	if entries, err := os.ReadDir(lower); err == nil {
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			target := filepath.Join(lower, e.Name())
-			if err := unmountAll(target); err != nil {
-				errs = append(errs, fmt.Errorf("lower %s: %w", target, err))
-			}
-		}
-	}
-
-	if err := unmountAll(rw); err != nil {
-		errs = append(errs, fmt.Errorf("rw %s: %w", rw, err))
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("cleanup failed: %v", errs)
-	}
-	return nil
+	// EINVAL: target is not a mount point
+	// ENOENT: path doesn't exist (already cleaned up)
+	return errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOENT) || os.IsNotExist(err)
 }
 
 // unmountAll attempts to unmount the target. If normal unmount fails (e.g., due
 // to EBUSY), it falls back to lazy unmount (MNT_DETACH) which detaches the mount
 // immediately but may leave the mount lingering until all references are closed.
 //
-// Returns an error only if both normal and lazy unmount fail. If lazy unmount
-// succeeds, returns nil but wraps context about the fallback for callers who
-// want to log it.
+// Returns nil if the path was not mounted (EINVAL) or doesn't exist (ENOENT),
+// as these are expected during cleanup. Returns an error only for unexpected
+// failures like EBUSY that lazy unmount also can't resolve.
 func unmountAll(target string) error {
 	if err := mount.UnmountAll(target, 0); err != nil {
+		// If the target wasn't a mount point, that's fine - nothing to unmount
+		if isNotMountError(err) {
+			return nil
+		}
 		// Normal unmount failed, try lazy unmount as fallback.
 		// This detaches the mount immediately but resources may linger.
 		if derr := mount.UnmountAll(target, unix.MNT_DETACH); derr != nil {
+			// If lazy unmount also says "not mounted", that's fine
+			if isNotMountError(derr) {
+				return nil
+			}
 			// Both normal and lazy unmount failed - wrap the original error
 			return fmt.Errorf("unmount %s failed (lazy unmount also failed): %w", target, err)
 		}
 		// Lazy unmount succeeded - mount is detached but may linger.
-		// Return nil since cleanup succeeded; caller can log if needed.
 		return nil
 	}
 	return nil

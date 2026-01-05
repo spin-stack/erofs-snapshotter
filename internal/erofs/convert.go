@@ -276,13 +276,29 @@ func extractLayerPath(mounts []mount.Mount) (string, error) {
 	baseType := mountBaseType(mnt.Type)
 
 	switch baseType {
-	case "bind", "erofs":
+	case "bind":
+		return layerFromBindMount(mnt.Source), nil
+	case "erofs":
 		return filepath.Dir(mnt.Source), nil
 	case "overlay":
 		return layerFromOverlay(mounts, mnt)
 	default:
 		return "", fmt.Errorf("unsupported filesystem type %q for erofs differ: %w", mnt.Type, errdefs.ErrNotImplemented)
 	}
+}
+
+// layerFromBindMount extracts the snapshot layer path from a bind mount source.
+//
+// For directory mode: source is .../snapshots/{id}/fs, layer is parent .../snapshots/{id}
+// For block mode: source is .../snapshots/{id}/rw/upper, layer is grandparent .../snapshots/{id}
+func layerFromBindMount(source string) string {
+	parent := filepath.Dir(source)
+	// Block mode has source at .../rw/upper, so parent is .../rw
+	// We need to go up one more level to get the snapshot root
+	if filepath.Base(parent) == "rw" {
+		return filepath.Dir(parent)
+	}
+	return parent
 }
 
 // mountBaseType extracts the base type from a potentially compound mount type.
@@ -295,6 +311,9 @@ func mountBaseType(mountType string) string {
 // layerFromOverlay extracts the layer path from overlay mount options.
 // It prefers upperdir (for read-write layers) and falls back to the first
 // lowerdir (for read-only layers).
+//
+// For block mode overlays where upperdir is .../rw/upper, it goes up two levels
+// to reach the snapshot root where the .erofslayer marker is located.
 func layerFromOverlay(mounts []mount.Mount, mnt mount.Mount) (string, error) {
 	var upperLayer, lowerLayer string
 
@@ -305,7 +324,7 @@ func layerFromOverlay(mounts []mount.Mount, mnt mount.Mount) (string, error) {
 		}
 		switch key {
 		case "upperdir":
-			upperLayer = filepath.Dir(value)
+			upperLayer = layerFromUpperdir(value)
 		case "lowerdir":
 			// For lowerdir, use the first mount source as the top lower layer
 			lowerLayer = filepath.Dir(mounts[0].Source)
@@ -319,6 +338,20 @@ func layerFromOverlay(mounts []mount.Mount, mnt mount.Mount) (string, error) {
 		return lowerLayer, nil
 	}
 	return "", fmt.Errorf("overlay mount has no upperdir or lowerdir: %w", errdefs.ErrNotImplemented)
+}
+
+// layerFromUpperdir extracts the snapshot layer path from the overlay upperdir.
+//
+// For directory mode: upperdir is .../snapshots/{id}/fs, layer is parent .../snapshots/{id}
+// For block mode: upperdir is .../snapshots/{id}/rw/upper, layer is grandparent .../snapshots/{id}
+func layerFromUpperdir(upperdir string) string {
+	parent := filepath.Dir(upperdir)
+	// Block mode has upperdir at .../rw/upper, so parent is .../rw
+	// We need to go up one more level to get the snapshot root
+	if filepath.Base(parent) == "rw" {
+		return filepath.Dir(parent)
+	}
+	return parent
 }
 
 // SupportGenerateFromTar checks if the installed version of mkfs.erofs supports

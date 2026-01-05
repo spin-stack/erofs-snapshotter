@@ -48,7 +48,7 @@ func cleanupUpper(upper string) error {
 	return nil
 }
 
-func cleanupActiveMounts(upper string) error {
+func unmountAll(target string) error {
 	return nil
 }
 

@@ -29,7 +29,6 @@ package erofs
 // Helper functions shared with erofs_differ_linux_test.go and
 // erofs_snapshot_linux_test.go:
 // - newSnapshotter
-// - testMount
 // - findErofs
 // - createTestTarContent
 // - tarHasPath
@@ -265,8 +264,8 @@ func snapshotID(ctx context.Context, t *testing.T, s *snapshotter, key string) s
 
 // cleanupAllSnapshots removes all snapshots using only the public Snapshotter interface.
 // Snapshots are removed in reverse order (children first, then parents) to respect
-// the snapshot dependency chain. The Remove method handles internal cleanup of
-// active mounts and directories.
+// the snapshot dependency chain. After removing all snapshots, Cleanup() is called
+// to unmount any remaining EROFS layers and release resources.
 func cleanupAllSnapshots(ctx context.Context, s snapshots.Snapshotter) {
 	var keys []string
 	_ = s.Walk(ctx, func(ctx context.Context, info snapshots.Info) error {
@@ -276,5 +275,9 @@ func cleanupAllSnapshots(ctx context.Context, s snapshots.Snapshotter) {
 	// Remove in reverse order (children first, then parents)
 	for i := len(keys) - 1; i >= 0; i-- {
 		_ = s.Remove(ctx, keys[i])
+	}
+	// Call Cleanup to unmount EROFS layers and release resources
+	if cleaner, ok := s.(interface{ Cleanup(context.Context) error }); ok {
+		_ = cleaner.Cleanup(ctx)
 	}
 }
