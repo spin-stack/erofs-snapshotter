@@ -362,9 +362,9 @@ func TestApplyErrors(t *testing.T) {
 func TestApplySupportedMediaTypes(t *testing.T) {
 	// Test that the Apply method recognizes all expected media types
 	supportedTypes := []string{
-		ocispec.MediaTypeImageLayer,           // uncompressed tar
-		ocispec.MediaTypeImageLayerGzip,       // gzip compressed
-		ocispec.MediaTypeImageLayerZstd,       // zstd compressed
+		ocispec.MediaTypeImageLayer,             // uncompressed tar
+		ocispec.MediaTypeImageLayerGzip,         // gzip compressed
+		ocispec.MediaTypeImageLayerZstd,         // zstd compressed
 		"application/vnd.oci.image.layer.erofs", // native EROFS
 	}
 
