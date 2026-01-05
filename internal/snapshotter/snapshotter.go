@@ -92,7 +92,6 @@ func WithFsMergeThreshold(v uint) Opt {
 	}
 }
 
-
 type MetaStore interface {
 	TransactionContext(ctx context.Context, writable bool) (context.Context, storage.Transactor, error)
 	WithTransaction(ctx context.Context, writable bool, fn storage.TransactionCallback) error
