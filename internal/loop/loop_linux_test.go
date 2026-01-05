@@ -28,9 +28,10 @@ func TestSetupAndDetach(t *testing.T) {
 	}
 	f.Close()
 
-	// Setup loop device
+	// Setup loop device with serial to match udev rules (erofs-* prefix)
 	dev, err := Setup(backingFile, Config{
 		ReadOnly: true,
+		Serial:   "erofs-test-setup-detach",
 	})
 	if err != nil {
 		t.Fatalf("Setup failed: %v", err)
@@ -111,6 +112,7 @@ func TestSetupWithOffset(t *testing.T) {
 		ReadOnly:  true,
 		Offset:    offset,
 		SizeLimit: sizeLimit,
+		Serial:    "erofs-test-offset",
 	})
 	if err != nil {
 		t.Fatalf("Setup failed: %v", err)
@@ -149,6 +151,7 @@ func TestSetupReadWrite(t *testing.T) {
 	// Setup read-write loop device
 	dev, err := Setup(backingFile, Config{
 		ReadOnly: false,
+		Serial:   "erofs-test-readwrite",
 	})
 	if err != nil {
 		t.Fatalf("Setup failed: %v", err)
@@ -181,7 +184,7 @@ func TestSerial(t *testing.T) {
 	}
 	f.Close()
 
-	serial := "test-serial-12345"
+	serial := "erofs-test-serial-12345"
 
 	dev, err := Setup(backingFile, Config{
 		ReadOnly: true,
@@ -225,6 +228,7 @@ func TestFindByBackingFile(t *testing.T) {
 
 	dev, err := Setup(backingFile, Config{
 		ReadOnly: true,
+		Serial:   "erofs-test-find-backing",
 	})
 	if err != nil {
 		t.Fatalf("Setup failed: %v", err)
@@ -263,7 +267,7 @@ func TestFindBySerial(t *testing.T) {
 	}
 	f.Close()
 
-	serial := "find-test-serial"
+	serial := "erofs-find-test-serial"
 
 	dev, err := Setup(backingFile, Config{
 		ReadOnly: true,
@@ -310,6 +314,7 @@ func TestDetachPath(t *testing.T) {
 
 	dev, err := Setup(backingFile, Config{
 		ReadOnly: true,
+		Serial:   "erofs-test-detach-path",
 	})
 	if err != nil {
 		t.Fatalf("Setup failed: %v", err)
@@ -370,6 +375,7 @@ func TestMultipleDevices(t *testing.T) {
 
 		dev, err := Setup(backingFile, Config{
 			ReadOnly: true,
+			Serial:   fmt.Sprintf("erofs-test-multi-%d", i),
 		})
 		if err != nil {
 			t.Fatalf("Setup %d failed: %v", i, err)

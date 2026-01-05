@@ -212,18 +212,16 @@ func upperDirectoryPermission(p, parent string) error {
 }
 
 // mountErofsWithLoop mounts an EROFS image using a loop device with serial number.
-// The serial ID is used to create a unique identifier for udev rules.
+// The serialID is required and used to create a unique identifier for udev rules.
 // Returns the loop device path for cleanup.
 func mountErofsWithLoop(backingFile, mountPoint, serialID string) (loopDev string, err error) {
-	// Setup loop device with serial
-	serial := ""
-	if serialID != "" {
-		serial = fmt.Sprintf("erofs-%s", serialID)
+	if serialID == "" {
+		return "", fmt.Errorf("serialID is required for loop device setup")
 	}
 
 	dev, err := loop.Setup(backingFile, loop.Config{
 		ReadOnly: true,
-		Serial:   serial,
+		Serial:   fmt.Sprintf("erofs-%s", serialID),
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to setup loop device for %s: %w", backingFile, err)

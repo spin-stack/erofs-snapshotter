@@ -12,7 +12,7 @@ import (
 )
 
 // MinKernelVersion is the minimum required kernel version.
-const MinKernelVersion = "6.16"
+const MinKernelVersion = "6.10"
 
 // Check runs all preflight checks and returns an error if any fail.
 // This should be called early in main() to fail fast.

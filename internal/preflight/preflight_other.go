@@ -6,7 +6,7 @@ package preflight
 import "github.com/containerd/errdefs"
 
 // MinKernelVersion is the minimum required kernel version.
-const MinKernelVersion = "6.16"
+const MinKernelVersion = "6.10"
 
 // Check runs all preflight checks.
 // On non-Linux platforms, this returns ErrNotImplemented.
