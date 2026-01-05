@@ -65,6 +65,9 @@ import (
 	"github.com/aledbf/nexuserofs/internal/preflight"
 )
 
+// mountTypeBind is the mount type for bind mounts.
+const mountTypeBind = "bind"
+
 func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
@@ -440,7 +443,7 @@ func TestErofsBlockModeMountsAfterPrepare(t *testing.T) {
 	// Should have a bind mount to the upper directory
 	hasBind := false
 	for _, m := range mounts1 {
-		if m.Type == "bind" {
+		if m.Type == mountTypeBind {
 			hasBind = true
 			break
 		}
@@ -772,7 +775,7 @@ func TestErofsExtractSnapshotWithParents(t *testing.T) {
 	}
 
 	m := extractMounts[0]
-	if m.Type != "bind" {
+	if m.Type != mountTypeBind {
 		t.Errorf("expected bind mount for extract snapshot, got %s", m.Type)
 	}
 
@@ -944,7 +947,7 @@ func TestErofsViewNoParent(t *testing.T) {
 	}
 
 	m := mounts[0]
-	if m.Type != "bind" {
+	if m.Type != mountTypeBind {
 		t.Errorf("expected bind mount, got %s", m.Type)
 	}
 
@@ -1003,7 +1006,7 @@ func TestErofsViewNoParentBlockMode(t *testing.T) {
 	}
 
 	m := mounts[0]
-	if m.Type != "bind" {
+	if m.Type != mountTypeBind {
 		t.Errorf("expected bind mount, got %s", m.Type)
 	}
 
@@ -1050,7 +1053,7 @@ func TestErofsBlockModeExtractWithParent(t *testing.T) {
 	}
 
 	m := mounts[0]
-	if m.Type != "bind" {
+	if m.Type != mountTypeBind {
 		t.Errorf("expected bind mount for extract, got %s", m.Type)
 	}
 
@@ -1098,7 +1101,7 @@ func TestErofsBlockModeExtractWithMultipleParents(t *testing.T) {
 	}
 
 	m := mounts[0]
-	if m.Type != "bind" {
+	if m.Type != mountTypeBind {
 		t.Errorf("expected bind mount for extract, got %s", m.Type)
 	}
 
@@ -1177,7 +1180,7 @@ func TestErofsConcurrentRemoveAndMounts(t *testing.T) {
 
 		// Wait for both to complete with timeout
 		timeout := time.After(5 * time.Second)
-		for i := 0; i < 2; i++ {
+		for range 2 {
 			select {
 			case err := <-mountsDone:
 				if err != nil {

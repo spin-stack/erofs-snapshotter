@@ -127,7 +127,9 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 			// Get the snapshot ID from its key
 			id, _, _, err := storage.GetInfo(ctx, info.Name)
 			if err != nil {
-				return nil // Continue walking even if one fails
+				// Log and continue walking even if one fails
+				log.L.WithError(err).WithField("key", info.Name).Debug("failed to get snapshot info during orphan cleanup")
+				return nil //nolint:nilerr // intentionally continue on error
 			}
 			validIDs[id] = true
 			return nil
