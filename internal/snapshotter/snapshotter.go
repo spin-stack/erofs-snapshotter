@@ -262,7 +262,7 @@ func (s *snapshotter) mountBlockRwLayer(id string) error {
 	m := mount.Mount{
 		Source:  rwPath,
 		Type:    "ext4",
-		Options: []string{"rw", "loop"},
+		Options: []string{"rw", "loop", "user_xattr"},
 	}
 	if err := m.Mount(mountPoint); err != nil {
 		return fmt.Errorf("failed to mount ext4 rwlayer: %w", err)
@@ -739,7 +739,8 @@ func (s *snapshotter) commitBlock(ctx context.Context, layerBlob string, id stri
 	if _, err := os.Stat(layer); err != nil {
 		if os.IsNotExist(err) {
 			// No block layer - convert directory mode upper
-			if cerr := convertDirToErofs(ctx, layerBlob, s.upperPath(id)); cerr != nil {
+			upperDir := s.upperPath(id)
+			if cerr := convertDirToErofs(ctx, layerBlob, upperDir); cerr != nil {
 				return fmt.Errorf("failed to convert upper to erofs layer: %w", cerr)
 			}
 			return nil

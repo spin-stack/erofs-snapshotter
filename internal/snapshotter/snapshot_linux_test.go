@@ -83,6 +83,10 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 	}
 	defer s.Close()
 	defer cleanupAllSnapshots(ctx, s)
+	// Unmount all mounts under snapshot root to allow TempDir cleanup
+	t.Cleanup(func() {
+		mount.UnmountRecursive(snapshotRoot, 0)
+	})
 
 	snap, ok := s.(*snapshotter)
 	if !ok {
@@ -110,7 +114,7 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 		mount.UnmountRecursive(mountRoot, 0)
 	})
 
-	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm))
+	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm), erofsdiffer.WithTarIndexMode())
 
 	writeFiles := func(dir string, files map[string]string) error {
 		for name, content := range files {
@@ -188,34 +192,32 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 				t.Fatalf("expected single EROFS mount, got: %#v", lowerMounts)
 			}
 		}
-		// Upper mounts should also be directly mountable
-		t.Logf("upper mounts: %#v", upperMounts)
-
 		desc, err := differ.Compare(ctx, lowerMounts, upperMounts)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("Compare failed: %v", err)
 		}
 		if desc.Digest == "" || desc.Size == 0 {
 			t.Fatalf("unexpected diff descriptor: %+v", desc)
 		}
 
-		applyKey := name + "-apply"
+		// Use extract- prefix to get diffMounts (bind mount to fs/) instead of overlay
+		applyKey := "extract-" + name + "-apply"
 		applyMounts, err := s.Prepare(ctx, applyKey, parentCommit)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("Prepare for apply failed: %+v", err)
 		}
 		if _, err := differ.Apply(ctx, desc, applyMounts); err != nil {
-			t.Fatal(err)
+			t.Fatalf("Apply failed: %v", err)
 		}
 		applyCommit := name + "-apply-commit"
 		if err := s.Commit(ctx, applyCommit, applyKey); err != nil {
-			t.Fatal(err)
+			t.Fatalf("Commit failed: %v", err)
 		}
 
 		viewKey := name + "-view"
 		viewMounts, err := s.View(ctx, viewKey, applyCommit)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("View failed: %v", err)
 		}
 
 		// Verify files using mount manager (mounts may have templates)
@@ -231,10 +233,36 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 			}
 		}
 
-		// Mount using mount manager and verify files
+		// Mount and verify files
+		// View mounts may be overlay (with pre-mounted EROFS layers) or EROFS (single layer)
+		// For overlay mounts, mount directly. For EROFS mounts, use the mount manager.
 		viewTarget := t.TempDir()
-		if _, err := mm.Activate(ctx, viewTarget, viewMounts); err != nil {
-			t.Fatal(err)
+		useMountManager := false
+		for _, m := range viewMounts {
+			if mountutils.TypeSuffix(m.Type) == testTypeErofs {
+				useMountManager = true
+				break
+			}
+		}
+		if useMountManager {
+			if _, err := mm.Activate(ctx, viewTarget, viewMounts); err != nil {
+				t.Fatalf("mm.Activate failed: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := mm.Deactivate(ctx, viewTarget); err != nil {
+					t.Logf("failed to deactivate view: %v", err)
+				}
+			})
+		} else {
+			// Direct mount for overlay mounts
+			if err := mount.All(viewMounts, viewTarget); err != nil {
+				t.Fatalf("mount.All failed: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := mount.UnmountAll(viewTarget, 0); err != nil {
+					t.Logf("failed to unmount view: %v", err)
+				}
+			})
 		}
 		verifyFiles(viewTarget, baseFiles)
 		if midFiles != nil {
@@ -244,9 +272,6 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 			verifyFiles(viewTarget, topFiles)
 		}
 		verifyFiles(viewTarget, upperFiles)
-		if err := mm.Deactivate(ctx, viewTarget); err != nil {
-			t.Logf("failed to deactivate view: %v", err)
-		}
 	}
 
 	t.Run("single-layer", func(t *testing.T) {

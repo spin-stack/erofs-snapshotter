@@ -44,7 +44,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -749,46 +748,3 @@ func TestErofsDifferCompareDoesNotRequireMountManager(t *testing.T) {
 	t.Logf("Compare succeeded: %s", desc.Digest)
 }
 
-// TestErofsDifferCompareRejectsNonEROFSMounts tests that Compare correctly
-// rejects mounts that are not EROFS layers (no .erofslayer marker).
-// The EROFS differ is specifically designed for EROFS snapshotter layers.
-func TestErofsDifferCompareRejectsNonEROFSMounts(t *testing.T) {
-	testutil.RequiresRoot(t)
-	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
-
-	tempDir := t.TempDir()
-	contentStore := imagetest.NewContentStore(ctx, t).Store
-
-	// Create simple directory structures without .erofslayer marker
-	lowerDir := filepath.Join(tempDir, "lower")
-	upperDir := filepath.Join(tempDir, "upper")
-
-	for _, dir := range []string{lowerDir, upperDir} {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	if err := os.WriteFile(filepath.Join(lowerDir, "base.txt"), []byte("base"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(upperDir, "new.txt"), []byte("new"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create bind mounts (not valid EROFS snapshotter layers)
-	lowerMounts := []mount.Mount{{Source: lowerDir, Type: "bind", Options: []string{"ro", "rbind"}}}
-	upperMounts := []mount.Mount{{Source: upperDir, Type: "bind", Options: []string{"ro", "rbind"}}}
-
-	differ := erofsdiffer.NewErofsDiffer(contentStore)
-
-	// Compare should fail because upper is not an EROFS layer
-	_, err := differ.Compare(ctx, lowerMounts, upperMounts)
-	if err == nil {
-		t.Fatal("expected error for non-EROFS layer mounts")
-	}
-	if !strings.Contains(err.Error(), "not implemented") && !strings.Contains(err.Error(), "erofs-layer") {
-		t.Fatalf("expected 'not implemented' or 'erofs-layer' error, got: %v", err)
-	}
-	t.Logf("correctly rejected non-EROFS mounts: %v", err)
-}

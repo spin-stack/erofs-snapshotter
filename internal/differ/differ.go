@@ -154,7 +154,7 @@ func (s *ErofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts [
 
 	layer, err := erofsutils.MountsToLayer(mounts)
 	if err != nil {
-		return ocispec.Descriptor{}, err
+		return ocispec.Descriptor{}, fmt.Errorf("MountsToLayer failed: %w", err)
 	}
 
 	ra, err := s.store.ReaderAt(ctx, desc)
@@ -200,7 +200,6 @@ func (s *ErofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts [
 		if err != nil {
 			return ocispec.Descriptor{}, fmt.Errorf("failed to generate tar index: %w", err)
 		}
-		log.G(ctx).WithField("path", layerBlobPath).Debug("Applied layer using tar index mode")
 	} else {
 		// Use the tar method: fully convert tar to EROFS
 		u := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+desc.Digest))
@@ -208,7 +207,6 @@ func (s *ErofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts [
 		if err != nil {
 			return ocispec.Descriptor{}, fmt.Errorf("failed to convert tar to erofs: %w", err)
 		}
-		log.G(ctx).WithField("path", layerBlobPath).Debug("Applied layer using tar conversion mode")
 	}
 
 	// Read any trailing data

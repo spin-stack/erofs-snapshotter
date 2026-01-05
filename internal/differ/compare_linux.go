@@ -35,7 +35,6 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/aledbf/nexuserofs/internal/cleanup"
-	erofsutils "github.com/aledbf/nexuserofs/internal/erofs"
 	"github.com/aledbf/nexuserofs/internal/mountutils"
 )
 
@@ -254,13 +253,7 @@ func withLowerMount(ctx context.Context, lower []mount.Mount, mm mount.Manager, 
 // withUpperMount resolves upper mounts and calls f with the resulting root path.
 // If mounts require the mount manager (formatted mounts, templates, or EROFS),
 // it activates them through the mount manager first.
-// Returns ErrNotImplemented if the mounts are not from the EROFS snapshotter.
 func withUpperMount(ctx context.Context, upper []mount.Mount, mm mount.Manager, f func(root string) error) error {
-	// Validate upper mounts are from EROFS snapshotter (have .erofslayer marker)
-	if _, err := erofsutils.MountsToLayer(upper); err != nil {
-		return err
-	}
-
 	if mountutils.NeedsMountManager(upper) {
 		if mm == nil {
 			return fmt.Errorf("mount manager is required to resolve formatted mounts: %w", errdefs.ErrNotImplemented)
