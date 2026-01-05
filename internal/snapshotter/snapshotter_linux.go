@@ -101,6 +101,35 @@ func cleanupUpper(upper string) error {
 	return unmountAll(upper)
 }
 
+// cleanupViewMounts unmounts all EROFS layers mounted under the lower directory.
+// This is used to cleanup mounts created by viewMounts() for View snapshots.
+// If the lower directory doesn't exist (e.g., for non-View snapshots), returns nil.
+func cleanupViewMounts(lower string) error {
+	entries, err := os.ReadDir(lower)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // No lower directory means no view mounts to cleanup
+		}
+		return fmt.Errorf("failed to read lower dir %s: %w", lower, err)
+	}
+
+	var errs []error
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		target := filepath.Join(lower, e.Name())
+		if err := unmountAll(target); err != nil {
+			errs = append(errs, fmt.Errorf("unmount %s: %w", target, err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("cleanup view mounts failed: %v", errs)
+	}
+	return nil
+}
+
 // cleanupActiveMounts unmounts all active mounts under the upper directory.
 // This is a best-effort cleanup that continues to clean up remaining mounts
 // even if individual unmounts fail. Returns an error describing all failures.

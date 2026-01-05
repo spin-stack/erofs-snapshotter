@@ -303,6 +303,14 @@ func TestSnapshotterPaths(t *testing.T) {
 		}
 	})
 
+	t.Run("viewLowerPath", func(t *testing.T) {
+		got := s.viewLowerPath("123")
+		want := filepath.Join(root, "snapshots", "123", "lower")
+		if got != want {
+			t.Errorf("viewLowerPath(123) = %q, want %q", got, want)
+		}
+	})
+
 	t.Run("upperDir non-block mode", func(t *testing.T) {
 		s := &snapshotter{root: root, defaultWritable: 0}
 		got := s.upperDir("123")
