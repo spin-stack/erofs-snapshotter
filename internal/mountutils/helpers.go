@@ -29,8 +29,8 @@ import (
 )
 
 // NeedsMountManager returns true if any mount requires the mount manager to resolve.
-// This includes mounts with template syntax (e.g., "{{ mount 0 }}"), formatted mounts
-// (format/, mkfs/, mkdir/), or multi-device EROFS mounts (with device= options).
+// This includes mounts with template syntax (e.g., "{{ mount 0 }}") and formatted mounts
+// (format/, mkfs/, mkdir/).
 func NeedsMountManager(mounts []mount.Mount) bool {
 	for _, m := range mounts {
 		if HasTemplate(m) {
@@ -38,22 +38,6 @@ func NeedsMountManager(mounts []mount.Mount) bool {
 		}
 		mt := TypeBase(m.Type)
 		if mt == "format" || mt == "mkfs" || mt == "mkdir" {
-			return true
-		}
-		// Multi-device EROFS mounts have device= options that reference other blobs
-		// needing resolution by the mount manager.
-		if TypeSuffix(m.Type) == "erofs" && hasDeviceOption(m) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasDeviceOption returns true if the mount has any device= options,
-// indicating a multi-device EROFS mount that needs resolution.
-func hasDeviceOption(m mount.Mount) bool {
-	for _, opt := range m.Options {
-		if strings.HasPrefix(opt, "device=") {
 			return true
 		}
 	}

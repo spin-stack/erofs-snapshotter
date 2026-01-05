@@ -20,19 +20,17 @@ package erofs
 
 // This file contains EROFS snapshot flow integration tests.
 // These tests verify end-to-end workflows involving the snapshotter
-// with mount manager operations, commit/apply flows, and cleanup.
+// with commit/apply flows and cleanup.
 //
 // Tests in this file:
 // - TestErofsSnapshotCommitApplyFlow
 // - TestErofsSnapshotterFsmetaSingleLayerView
 // - TestErofsBlockModeMountsAfterPrepare
 // - TestErofsCleanupRemovesOrphan
-// - TestErofsViewMountsMultiLayer
+// - TestErofsViewMountsMultiLayer (verifies EROFS descriptor format)
 // - TestErofsViewMountsSingleLayer
 // - TestErofsViewMountsCleanupOnRemove
 // - TestErofsViewMountsIdempotent
-// - TestCleanupViewMountsNonExistent
-// - TestCleanupViewMountsEmptyDir
 // - TestErofsBlockModeIgnoresFsMerge
 // - TestErofsExtractSnapshotWithParents
 // - TestErofsImmutableFlagOnCommit
@@ -470,13 +468,12 @@ func TestErofsCleanupRemovesOrphan(t *testing.T) {
 }
 
 // TestErofsViewMountsMultiLayer tests that View snapshots with multiple layers
-// return real mountable paths (not templates) that can be used by standard
-// containerd operations like 'nerdctl commit'.
+// return EROFS mount descriptors with device= options for additional layers.
+// These descriptors are transformed by consumers into virtio-blk disks.
 func TestErofsViewMountsMultiLayer(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
 
-	// Direct mounts are now the default - EROFS layers are mounted and real paths returned
 	sn := newSnapshotter(t)
 	snapshtr, cleanup, err := sn(ctx, t.TempDir())
 	if err != nil {
@@ -521,50 +518,51 @@ func TestErofsViewMountsMultiLayer(t *testing.T) {
 
 	t.Logf("view mounts: %#v", viewMounts)
 
-	// The key assertion: View with multiple layers should NOT have template syntax
-	// because viewMounts() should have mounted the layers and returned real paths
-	if mountsHaveTemplate(viewMounts) {
-		t.Fatalf("expected view mounts without templates (for nerdctl commit compatibility), got: %#v", viewMounts)
-	}
-
-	// Should have a single overlay mount
+	// Should have a single EROFS mount (not overlay)
 	if len(viewMounts) != 1 {
-		t.Fatalf("expected single overlay mount, got %d mounts: %#v", len(viewMounts), viewMounts)
+		t.Fatalf("expected single EROFS mount, got %d mounts: %#v", len(viewMounts), viewMounts)
 	}
 
-	if viewMounts[0].Type != testTypeOverlay {
-		t.Fatalf("expected overlay mount type, got: %s", viewMounts[0].Type)
+	// Verify it's an EROFS mount descriptor
+	if viewMounts[0].Type != testTypeErofs {
+		t.Fatalf("expected erofs mount type, got: %s", viewMounts[0].Type)
 	}
 
-	// Verify the overlay can be mounted (this is what nerdctl commit would do)
-	viewTarget := t.TempDir()
-	if err := mount.All(viewMounts, viewTarget); err != nil {
-		t.Fatalf("failed to mount view overlay: %v", err)
+	// Source should be the first (newest) layer blob
+	if viewMounts[0].Source == "" {
+		t.Fatal("expected non-empty source path")
 	}
-	defer testutil.Unmount(t, viewTarget)
+	if !strings.HasSuffix(viewMounts[0].Source, ".erofs") {
+		t.Fatalf("expected source to be EROFS blob, got: %s", viewMounts[0].Source)
+	}
 
-	// Verify all layer files are visible
-	for i := range 3 {
-		filename := fmt.Sprintf("file-%d.txt", i)
-		content, err := os.ReadFile(filepath.Join(viewTarget, filename))
-		if err != nil {
-			t.Fatalf("failed to read %s: %v", filename, err)
+	// Should have device= options for additional layers
+	deviceCount := 0
+	for _, opt := range viewMounts[0].Options {
+		if strings.HasPrefix(opt, "device=") {
+			deviceCount++
+			// Each device= option should point to an EROFS blob
+			devicePath := strings.TrimPrefix(opt, "device=")
+			if !strings.HasSuffix(devicePath, ".erofs") {
+				t.Fatalf("expected device path to be EROFS blob, got: %s", devicePath)
+			}
 		}
-		expected := fmt.Sprintf("content-%d", i)
-		if string(content) != expected {
-			t.Fatalf("expected %s content %q, got %q", filename, expected, string(content))
-		}
 	}
 
-	// Verify the lower directory was created with mounted layers
+	// With 3 layers: source is layer 0, device= for layers 1 and 2
+	if deviceCount != 2 {
+		t.Fatalf("expected 2 device= options for 3-layer view, got %d", deviceCount)
+	}
+
+	// No actual mounting is done - no lower directory should exist
 	viewID := snapshotID(ctx, t, snap, viewKey)
 	lowerDir := snap.viewLowerPath(viewID)
-	entries, err := os.ReadDir(lowerDir)
-	if err != nil {
-		t.Fatalf("failed to read lower directory: %v", err)
+	_, err = os.Stat(lowerDir)
+	if err == nil {
+		t.Fatalf("expected no lower directory (no host mounting), but found: %s", lowerDir)
 	}
-	if len(entries) != 3 {
-		t.Fatalf("expected 3 mounted layers in lower directory, got %d", len(entries))
+	if !os.IsNotExist(err) {
+		t.Fatalf("expected not exist error, got: %v", err)
 	}
 }
 
@@ -628,13 +626,13 @@ func TestErofsViewMountsSingleLayer(t *testing.T) {
 	}
 }
 
-// TestErofsViewMountsCleanupOnRemove tests that View snapshot mounts are properly
-// cleaned up when the snapshot is removed.
+// TestErofsViewMountsCleanupOnRemove tests that View snapshot directories are properly
+// cleaned up when the snapshot is removed. Since no host mounting is done, cleanup
+// simply removes the snapshot directory.
 func TestErofsViewMountsCleanupOnRemove(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
 
-	// Direct mounts are now the default - EROFS layers are mounted and real paths returned
 	sn := newSnapshotter(t)
 	snapshtr, cleanup, err := sn(ctx, t.TempDir())
 	if err != nil {
@@ -669,34 +667,30 @@ func TestErofsViewMountsCleanupOnRemove(t *testing.T) {
 		parentKey = commitKey
 	}
 
-	// Create a View (this will mount the EROFS layers)
+	// Create a View (returns EROFS descriptors, no host mounting)
 	viewKey := "cleanup-test-view"
 	viewMounts, err := snapshtr.View(ctx, viewKey, parentKey)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Verify the view is ready (lower mounts exist)
+	t.Logf("view mounts: %#v", viewMounts)
+
+	// Verify the view returns EROFS descriptor
+	if len(viewMounts) != 1 {
+		t.Fatalf("expected single EROFS mount, got %d", len(viewMounts))
+	}
+	if viewMounts[0].Type != testTypeErofs {
+		t.Fatalf("expected erofs mount type, got: %s", viewMounts[0].Type)
+	}
+
+	// Get snapshot directory path
 	viewID := snapshotID(ctx, t, snap, viewKey)
-	lowerDir := snap.viewLowerPath(viewID)
+	snapshotDir := filepath.Join(snap.root, "snapshots", viewID)
 
-	// The lower directory should exist with mounted layers
-	entries, err := os.ReadDir(lowerDir)
-	if err != nil {
-		t.Fatalf("failed to read lower directory: %v", err)
-	}
-	if len(entries) != 2 {
-		t.Fatalf("expected 2 mounted layers, got %d", len(entries))
-	}
-
-	// Mount the view to ensure it's active
-	viewTarget := t.TempDir()
-	if err := mount.All(viewMounts, viewTarget); err != nil {
-		t.Fatalf("failed to mount view: %v", err)
-	}
-	// Unmount the view overlay before removing the snapshot
-	if err := mount.UnmountAll(viewTarget, 0); err != nil {
-		t.Logf("warning: failed to unmount view target: %v", err)
+	// Snapshot directory should exist
+	if _, err := os.Stat(snapshotDir); err != nil {
+		t.Fatalf("expected snapshot directory to exist: %v", err)
 	}
 
 	// Remove the view snapshot
@@ -704,10 +698,10 @@ func TestErofsViewMountsCleanupOnRemove(t *testing.T) {
 		t.Fatalf("failed to remove view snapshot: %v", err)
 	}
 
-	// After removal, the lower directory should not exist
-	_, err = os.Stat(lowerDir)
+	// After removal, the snapshot directory should not exist
+	_, err = os.Stat(snapshotDir)
 	if err == nil {
-		t.Fatalf("expected lower directory to be removed after snapshot removal: %s", lowerDir)
+		t.Fatalf("expected snapshot directory to be removed: %s", snapshotDir)
 	}
 	if !os.IsNotExist(err) {
 		t.Fatalf("expected not exist error, got: %v", err)
@@ -715,12 +709,11 @@ func TestErofsViewMountsCleanupOnRemove(t *testing.T) {
 }
 
 // TestErofsViewMountsIdempotent tests that calling Mounts() multiple times
-// on a View snapshot returns consistent results without re-mounting.
+// on a View snapshot returns consistent EROFS descriptors.
 func TestErofsViewMountsIdempotent(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
 
-	// Direct mounts are now the default - EROFS layers are mounted and real paths returned
 	sn := newSnapshotter(t)
 	snapshtr, cleanup, err := sn(ctx, t.TempDir())
 	if err != nil {
@@ -773,43 +766,40 @@ func TestErofsViewMountsIdempotent(t *testing.T) {
 		t.Fatalf("inconsistent mount counts: first=%d, second=%d", len(mounts1), len(mounts2))
 	}
 
-	// Verify lowerdir options are the same
-	getLowerdir := func(mounts []mount.Mount) string {
+	// Both should be EROFS descriptors
+	if mounts1[0].Type != testTypeErofs || mounts2[0].Type != testTypeErofs {
+		t.Fatalf("expected both to be erofs type, got: %s and %s", mounts1[0].Type, mounts2[0].Type)
+	}
+
+	// Source paths should be identical
+	if mounts1[0].Source != mounts2[0].Source {
+		t.Fatalf("inconsistent source:\n  first:  %s\n  second: %s", mounts1[0].Source, mounts2[0].Source)
+	}
+
+	// Device options should be identical
+	getDeviceOptions := func(mounts []mount.Mount) []string {
+		var devices []string
 		for _, m := range mounts {
 			for _, opt := range m.Options {
-				if strings.HasPrefix(opt, "lowerdir=") {
-					return opt
+				if strings.HasPrefix(opt, "device=") {
+					devices = append(devices, opt)
 				}
 			}
 		}
-		return ""
+		return devices
 	}
 
-	lowerdir1 := getLowerdir(mounts1)
-	lowerdir2 := getLowerdir(mounts2)
+	devices1 := getDeviceOptions(mounts1)
+	devices2 := getDeviceOptions(mounts2)
 
-	if lowerdir1 != lowerdir2 {
-		t.Fatalf("inconsistent lowerdir:\n  first:  %s\n  second: %s", lowerdir1, lowerdir2)
+	if len(devices1) != len(devices2) {
+		t.Fatalf("inconsistent device count: first=%d, second=%d", len(devices1), len(devices2))
 	}
-}
 
-// TestCleanupViewMountsNonExistent tests that cleanupViewMounts handles
-// non-existent directories gracefully.
-func TestCleanupViewMountsNonExistent(t *testing.T) {
-	// Should not error for non-existent directory
-	err := cleanupViewMounts("/nonexistent/path/to/lower")
-	if err != nil {
-		t.Fatalf("expected no error for non-existent directory, got: %v", err)
-	}
-}
-
-// TestCleanupViewMountsEmptyDir tests that cleanupViewMounts handles
-// empty directories correctly.
-func TestCleanupViewMountsEmptyDir(t *testing.T) {
-	dir := t.TempDir()
-	err := cleanupViewMounts(dir)
-	if err != nil {
-		t.Fatalf("expected no error for empty directory, got: %v", err)
+	for i := range devices1 {
+		if devices1[i] != devices2[i] {
+			t.Fatalf("inconsistent device[%d]:\n  first:  %s\n  second: %s", i, devices1[i], devices2[i])
+		}
 	}
 }
 

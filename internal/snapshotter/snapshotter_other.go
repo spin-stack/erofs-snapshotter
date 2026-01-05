@@ -52,22 +52,10 @@ func unmountAll(target string) error {
 	return nil
 }
 
-func cleanupViewMounts(lower string) error {
-	return nil
-}
-
 func upperDirectoryPermission(p, parent string) error {
 	return nil
 }
 
 func convertDirToErofs(ctx context.Context, layerBlob, upperDir string) error {
 	return errdefs.ErrNotImplemented
-}
-
-func mountErofsWithLoop(backingFile, mountPoint, serialID string) (string, error) {
-	return "", errdefs.ErrNotImplemented
-}
-
-func unmountAndDetachLoop(mountPoint string) error {
-	return nil
 }
