@@ -16,7 +16,7 @@
    limitations under the License.
 */
 
-package erofs
+package snapshotter
 
 // This file contains EROFS differ integration tests.
 // These tests verify the differ's Compare and Apply functionality
@@ -56,8 +56,8 @@ import (
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/sys/unix"
 
-	erofsdiffer "github.com/aledbf/nexuserofs/internal/differ"
-	erofsutils "github.com/aledbf/nexuserofs/internal/erofs"
+	"github.com/aledbf/nexuserofs/internal/differ"
+	"github.com/aledbf/nexuserofs/internal/erofs"
 	"github.com/aledbf/nexuserofs/internal/mountutils"
 	"github.com/aledbf/nexuserofs/internal/preflight"
 )
@@ -309,7 +309,7 @@ func (e *differTestEnv) createView(key, parentKey string) []mount.Mount {
 }
 
 // compareAndVerify runs Compare and verifies the result contains expected files.
-func (e *differTestEnv) compareAndVerify(differ *erofsdiffer.ErofsDiff, lower, upper []mount.Mount, expectedFiles ...string) ocispec.Descriptor {
+func (e *differTestEnv) compareAndVerify(differ *differ.ErofsDiff, lower, upper []mount.Mount, expectedFiles ...string) ocispec.Descriptor {
 	e.t.Helper()
 
 	desc, err := differ.Compare(e.ctx(), lower, upper)
@@ -342,7 +342,7 @@ func TestErofsDifferApply(t *testing.T) {
 	}
 
 	// Check if mkfs.erofs supports tar conversion mode (--tar=f)
-	supported, err := erofsutils.SupportGenerateFromTar()
+	supported, err := erofs.SupportGenerateFromTar()
 	if err != nil || !supported {
 		t.Skip("mkfs.erofs does not support tar conversion mode")
 	}
@@ -380,7 +380,7 @@ func TestErofsDifferApply(t *testing.T) {
 	t.Cleanup(func() { mount.UnmountRecursive(mountRoot, 0) })
 
 	// Create EROFS differ with mount manager
-	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm))
+	differ := differ.NewErofsDiffer(contentStore, differ.WithMountManager(mm))
 
 	// Create test tar content
 	tarReader := createTestTarContent()
@@ -535,7 +535,7 @@ func TestErofsDifferCompareWithMountManager(t *testing.T) {
 	}
 
 	mm := env.createMountManager()
-	differ := erofsdiffer.NewErofsDiffer(env.contentStore, erofsdiffer.WithMountManager(mm))
+	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
 	env.compareAndVerify(differ, lowerMounts, upperMounts)
 }
 
@@ -555,7 +555,7 @@ func TestErofsDifferCompareBlockUpperFallback(t *testing.T) {
 	lowerMounts := env.createView(testKeyLower, "base-commit")
 
 	mm := env.createMountManager()
-	differ := erofsdiffer.NewErofsDiffer(env.contentStore, erofsdiffer.WithMountManager(mm))
+	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
 	env.compareAndVerify(differ, lowerMounts, upperMounts, "marker.txt")
 }
 
@@ -594,7 +594,7 @@ func TestErofsDifferComparePreservesWhiteouts(t *testing.T) {
 	lowerMounts := env.createView(testKeyLower, "base-commit")
 
 	mm := env.createMountManager()
-	differ := erofsdiffer.NewErofsDiffer(env.contentStore, erofsdiffer.WithMountManager(mm))
+	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
 	env.compareAndVerify(differ, lowerMounts, upperMounts, ".wh.gone.txt")
 }
 
@@ -620,7 +620,7 @@ func TestErofsDifferCompareWithFormattedUpperMounts(t *testing.T) {
 	lowerMounts := env.createView(testKeyLower, "base-commit")
 
 	mm := env.createMountManager()
-	differ := erofsdiffer.NewErofsDiffer(env.contentStore, erofsdiffer.WithMountManager(mm))
+	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
 	env.compareAndVerify(differ, lowerMounts, upperMounts, "upper.txt")
 }
 
@@ -647,7 +647,7 @@ func TestErofsDifferCompareWithoutMountManager(t *testing.T) {
 
 	// Compare with mount manager since active mounts may have templates
 	mm := env.createMountManager()
-	differ := erofsdiffer.NewErofsDiffer(env.contentStore, erofsdiffer.WithMountManager(mm))
+	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
 	env.compareAndVerify(differ, lowerMounts, upperMounts)
 }
 
@@ -683,7 +683,7 @@ func TestErofsDifferCompareMultipleStackedLayers(t *testing.T) {
 	}
 
 	mm := env.createMountManager()
-	differ := erofsdiffer.NewErofsDiffer(env.contentStore, erofsdiffer.WithMountManager(mm))
+	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
 	env.compareAndVerify(differ, lowerMounts, upperMounts, "upper.txt")
 }
 
@@ -697,7 +697,7 @@ func TestErofsDifferCompareEmptyLowerMounts(t *testing.T) {
 	upperMounts := env.prepareActiveLayer(testKeyUpper, singleCommit, "upper.txt", "upper")
 
 	mm := env.createMountManager()
-	differ := erofsdiffer.NewErofsDiffer(env.contentStore, erofsdiffer.WithMountManager(mm))
+	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
 
 	// Compare with empty lower mounts - tests the base case
 	emptyLower := []mount.Mount{}
@@ -716,7 +716,7 @@ func TestErofsDifferCompareContextCancellation(t *testing.T) {
 	lowerMounts := env.createView(testKeyLower, baseCommit)
 
 	// Create differ without mount manager (direct mounts)
-	differ := erofsdiffer.NewErofsDiffer(env.contentStore)
+	differ := differ.NewErofsDiffer(env.contentStore)
 
 	// Create a cancelled context
 	ctx, cancel := context.WithCancel(env.ctx())
@@ -751,7 +751,7 @@ func TestErofsDifferCompareSingleLayerView(t *testing.T) {
 	upperMounts := env.prepareActiveLayer(testKeyUpper, baseCommit, "new.txt", "new")
 
 	mm := env.createMountManager()
-	differ := erofsdiffer.NewErofsDiffer(env.contentStore, erofsdiffer.WithMountManager(mm))
+	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
 	env.compareAndVerify(differ, viewMounts, upperMounts, "new.txt")
 }
 
@@ -772,7 +772,7 @@ func TestErofsDifferCompareViewWithMultipleLayers(t *testing.T) {
 	upperMounts := env.prepareActiveLayer(testKeyUpper, layer2Commit, "upper.txt", "upper")
 
 	mm := env.createMountManager()
-	differ := erofsdiffer.NewErofsDiffer(env.contentStore, erofsdiffer.WithMountManager(mm))
+	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
 	env.compareAndVerify(differ, viewMounts, upperMounts, "upper.txt")
 }
 
@@ -802,7 +802,7 @@ func TestErofsDifferCompareDoesNotRequireMountManager(t *testing.T) {
 	}
 
 	mm := env.createMountManager()
-	differ := erofsdiffer.NewErofsDiffer(env.contentStore, erofsdiffer.WithMountManager(mm))
+	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
 
 	desc := env.compareAndVerify(differ, lowerMounts, upperMounts)
 	t.Logf("Compare succeeded: %s", desc.Digest)

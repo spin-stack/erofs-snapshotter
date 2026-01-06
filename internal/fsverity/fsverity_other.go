@@ -18,16 +18,19 @@
 
 package fsverity
 
-import "fmt"
+import "github.com/containerd/errdefs"
 
-func IsSupported(rootPath string) (bool, error) {
-	return false, fmt.Errorf("fsverity is only supported on Linux systems")
+// IsSupported returns false on non-Linux platforms.
+func IsSupported(_ string) (bool, error) {
+	return false, errdefs.ErrNotImplemented
 }
 
-func IsEnabled(path string) (bool, error) {
-	return false, fmt.Errorf("fsverity is only supported on Linux systems")
+// IsEnabled returns false on non-Linux platforms.
+func IsEnabled(_ string) (bool, error) {
+	return false, errdefs.ErrNotImplemented
 }
 
+// Enable returns ErrNotImplemented on non-Linux platforms.
 func Enable(_ string) error {
-	return fmt.Errorf("fsverity is only supported on Linux systems")
+	return errdefs.ErrNotImplemented
 }

@@ -1,6 +1,6 @@
 //go:build linux
 
-package erofs
+package differ
 
 import (
 	"testing"

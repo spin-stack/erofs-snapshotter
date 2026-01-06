@@ -39,10 +39,8 @@ type fsverityEnableArg struct {
 	reserved2     [11]uint64
 }
 
-const (
-	defaultBlockSize int    = 4096
-	maxDigestSize    uint16 = 64
-)
+// defaultBlockSize is the block size used for fsverity verification.
+const defaultBlockSize = 4096
 
 func IsSupported(rootPath string) (bool, error) {
 	minKernelVersion := kernelversion.KernelVersion{Kernel: 5, Major: 4}
@@ -63,7 +61,9 @@ func IsSupported(rootPath string) (bool, error) {
 		return false, err
 	}
 
-	digestFile.Close()
+	if err := digestFile.Close(); err != nil {
+		return false, fmt.Errorf("close digest file: %w", err)
+	}
 
 	eerr := Enable(digestPath)
 	if eerr != nil {

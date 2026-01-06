@@ -16,7 +16,7 @@
    limitations under the License.
 */
 
-package erofs
+package snapshotter
 
 import (
 	"context"

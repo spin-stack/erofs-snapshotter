@@ -38,9 +38,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/grpclog"
 
-	differ "github.com/aledbf/nexuserofs/internal/differ"
+	"github.com/aledbf/nexuserofs/internal/differ"
 	"github.com/aledbf/nexuserofs/internal/preflight"
-	snapshotter "github.com/aledbf/nexuserofs/internal/snapshotter"
+	"github.com/aledbf/nexuserofs/internal/snapshotter"
 	"github.com/aledbf/nexuserofs/internal/store"
 )
 

@@ -22,10 +22,19 @@ import (
 	"time"
 )
 
-// Do runs the provided function with a context in which the
-// errors are cleared out and will timeout after 10 seconds.
+// cleanupTimeout is the maximum time allowed for cleanup operations.
+// 10 seconds provides enough time for typical unmount and file removal
+// operations while preventing indefinite hangs during shutdown.
+const cleanupTimeout = 10 * time.Second
+
+// Do runs the provided function with a context that:
+// 1. Is not cancelled when the parent context is cancelled
+// 2. Has a timeout of cleanupTimeout (10 seconds)
+//
+// This is useful for cleanup operations that should complete even
+// after the main operation's context has been cancelled.
 func Do(ctx context.Context, do func(context.Context)) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	do(ctx)
 	cancel()
 }

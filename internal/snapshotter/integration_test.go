@@ -1,4 +1,4 @@
-package erofs
+package snapshotter
 
 import (
 	"context"

@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-package erofs
+package differ
 
 import (
 	"context"
@@ -35,7 +35,7 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	erofsutils "github.com/aledbf/nexuserofs/internal/erofs"
+	"github.com/aledbf/nexuserofs/internal/erofs"
 )
 
 // MountManagerResolver is a function that resolves the mount manager lazily.
@@ -142,7 +142,7 @@ func (s *ErofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts [
 		}
 	}
 
-	layer, err := erofsutils.MountsToLayer(mounts)
+	layer, err := erofs.MountsToLayer(mounts)
 	if err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("MountsToLayer failed: %w", err)
 	}
@@ -153,7 +153,7 @@ func (s *ErofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts [
 	}
 	defer ra.Close()
 
-	layerBlobPath := path.Join(layer, erofsutils.LayerBlobFilename)
+	layerBlobPath := path.Join(layer, erofs.LayerBlobFilename)
 	if native {
 		f, err := os.Create(layerBlobPath)
 		if err != nil {
@@ -186,7 +186,7 @@ func (s *ErofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts [
 	// Use full conversion mode (--tar=f): converts tar to EROFS with 4096-byte blocks
 	// This creates layers compatible with fsmeta merge for multi-layer images
 	u := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+desc.Digest))
-	err = erofsutils.ConvertTarErofs(ctx, rc, layerBlobPath, u.String(), s.mkfsExtraOpts)
+	err = erofs.ConvertTarErofs(ctx, rc, layerBlobPath, u.String(), s.mkfsExtraOpts)
 	if err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("failed to convert tar to erofs: %w", err)
 	}

@@ -1,4 +1,4 @@
-package erofs
+package differ
 
 import (
 	"bytes"

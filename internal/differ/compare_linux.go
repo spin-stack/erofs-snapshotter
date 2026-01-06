@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-package erofs
+package differ
 
 import (
 	"context"

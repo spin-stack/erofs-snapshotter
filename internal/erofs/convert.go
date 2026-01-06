@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-package erofsutils
+package erofs
 
 import (
 	"bytes"
@@ -386,15 +386,18 @@ const (
 	// with fsmeta merge that requires 4096-byte block size.
 	erofsMinBlockSizeForFsmeta = 4096
 
-	// erofsSuperblocOffset is the offset of the EROFS superblock.
+	// EROFS on-disk format constants.
+	// Reference: https://docs.kernel.org/filesystems/erofs.html
+	// Source: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/erofs/erofs_fs.h
+
+	// erofsSuperblocOffset is the byte offset of the EROFS superblock from the start of the image.
 	erofsSuperblocOffset = 1024
 
-	// erofsMagic is the EROFS magic number.
+	// erofsMagic is the EROFS magic number (0xE0F5E1E2 in little-endian).
 	erofsMagic = 0xE0F5E1E2
 
-	// erofsBlkszBitsOffset is the offset of blkszbits field within the superblock.
-	// The superblock structure has: magic (4), checksum (4), feature_compat (4),
-	// blkszbits (1) at offset 12.
+	// erofsBlkszBitsOffset is the byte offset of the blkszbits field within the superblock.
+	// Superblock layout: magic(4) + checksum(4) + feature_compat(4) + blkszbits(1).
 	erofsBlkszBitsOffset = 12
 )
 

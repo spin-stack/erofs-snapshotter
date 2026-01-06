@@ -16,7 +16,7 @@
    limitations under the License.
 */
 
-package erofs
+package snapshotter
 
 // This file contains EROFS snapshot flow integration tests.
 // These tests verify end-to-end workflows involving the snapshotter

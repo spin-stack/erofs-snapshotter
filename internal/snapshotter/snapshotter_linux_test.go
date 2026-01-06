@@ -16,7 +16,7 @@
    limitations under the License.
 */
 
-package erofs
+package snapshotter
 
 // This file contains the core EROFS snapshotter tests, test suite,
 // and shared helper functions used by other test files.

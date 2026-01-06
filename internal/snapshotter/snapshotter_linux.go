@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-package erofs
+package snapshotter
 
 import (
 	"context"
@@ -31,7 +31,7 @@ import (
 	"github.com/containerd/log"
 	"golang.org/x/sys/unix"
 
-	erofsutils "github.com/aledbf/nexuserofs/internal/erofs"
+	"github.com/aledbf/nexuserofs/internal/erofs"
 	"github.com/aledbf/nexuserofs/internal/preflight"
 )
 
@@ -205,7 +205,7 @@ func unmountAll(target string) error {
 }
 
 func convertDirToErofs(ctx context.Context, layerBlob, upperDir string) error {
-	err := erofsutils.ConvertErofs(ctx, layerBlob, upperDir, nil)
+	err := erofs.ConvertErofs(ctx, layerBlob, upperDir, nil)
 	if err != nil {
 		return err
 	}

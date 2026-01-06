@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-package erofsutils
+package erofs
 
 import (
 	"archive/tar"

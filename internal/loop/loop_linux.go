@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -235,10 +236,7 @@ func FindByBackingFile(backingFile string) (*Device, error) {
 		}
 
 		// Compare paths (strip newline from sysfs output)
-		sysfsBackingFile := string(data)
-		if len(sysfsBackingFile) > 0 && sysfsBackingFile[len(sysfsBackingFile)-1] == '\n' {
-			sysfsBackingFile = sysfsBackingFile[:len(sysfsBackingFile)-1]
-		}
+		sysfsBackingFile := strings.TrimSuffix(string(data), "\n")
 
 		if sysfsBackingFile == absPath || sysfsBackingFile == backingFile {
 			var devNum int
@@ -273,10 +271,7 @@ func FindBySerial(serial string) (*Device, error) {
 			continue
 		}
 
-		devSerial := string(data)
-		if len(devSerial) > 0 && devSerial[len(devSerial)-1] == '\n' {
-			devSerial = devSerial[:len(devSerial)-1]
-		}
+		devSerial := strings.TrimSuffix(string(data), "\n")
 
 		if devSerial == serial {
 			var devNum int
@@ -312,12 +307,9 @@ func FindBySerialPrefix(prefix string) ([]*Device, error) {
 			continue
 		}
 
-		devSerial := string(data)
-		if len(devSerial) > 0 && devSerial[len(devSerial)-1] == '\n' {
-			devSerial = devSerial[:len(devSerial)-1]
-		}
+		devSerial := strings.TrimSuffix(string(data), "\n")
 
-		if len(devSerial) >= len(prefix) && devSerial[:len(prefix)] == prefix {
+		if strings.HasPrefix(devSerial, prefix) {
 			var devNum int
 			_, _ = fmt.Sscanf(name, "loop%d", &devNum)
 			devices = append(devices, &Device{
