@@ -46,48 +46,63 @@ flowchart TB
 
 ### Image Pull (Layer Extraction)
 
-When pulling an image, containerd calls the snapshotter to prepare space for each layer:
+When pulling an image, containerd calls the EROFS differ to apply each layer:
 
 ```
 1. Prepare("extract-sha256:abc...", parent)
    ├── Creates ext4 file (rwlayer.img)
    ├── Mounts ext4 on host via loop device
-   └── Returns bind mount to mounted directory
+   └── Returns bind mount for fallback differs
 
-2. Differ extracts tar content to mounted directory
+2. EROFS differ converts tar stream directly to EROFS:
+   ├── mkfs.erofs --tar=f reads tar from stdin → layer.erofs
+   └── (Optional: --tar=i mode creates tar index + appends raw tar)
 
 3. Commit("layer-sha256:abc...", "extract-sha256:abc...")
-   ├── Runs mkfs.erofs to convert directory → layer.erofs
-   ├── Unmounts ext4
+   ├── layer.erofs already exists (created by differ)
+   ├── Unmounts ext4 (cleanup)
    └── Generates fsmeta.erofs + merged.vmdk (for multi-layer images)
 ```
 
+**Note:** The ext4 mount is only used if a non-EROFS differ (e.g., walking differ) processes the layer. The EROFS differ bypasses this entirely by piping tar data directly to `mkfs.erofs`.
+
 ### Container Run
 
-When running a container, the snapshotter returns raw file paths:
+When running a container, the snapshotter returns raw file paths with mount options:
 
 ```go
-// View (read-only) with VMDK - single fsmeta mount
-// VM runtime detects merged.vmdk in same directory and uses it
+// View (read-only) with VMDK - single fsmeta mount with device= options
+// VM runtime detects merged.vmdk in same directory and uses it for QEMU
 []mount.Mount{{
     Type:   "erofs",
     Source: "/var/lib/nexuserofs/snapshots/123/fsmeta.erofs",
+    Options: []string{"ro", "loop", "device=/path/to/layer1.erofs", "device=/path/to/layer2.erofs"},
 }}
 
-// View (read-only) without VMDK (single layer) - returns EROFS layer directly
+// View (read-only) single layer - returns EROFS layer directly
+[]mount.Mount{{
+    Type:    "erofs",
+    Source:  "/path/to/layer.erofs",
+    Options: []string{"ro", "loop"},
+}}
+
+// View (read-only) multi-layer fallback (when fsmeta generation fails)
+// This happens when layers have incompatible block sizes (e.g., tar-index mode)
 []mount.Mount{
-    {Type: "erofs", Source: "/path/to/layer.erofs", Options: []string{"ro"}},
+    {Type: "erofs", Source: "/path/to/layer1.erofs", Options: []string{"ro", "loop"}},
+    {Type: "erofs", Source: "/path/to/layer2.erofs", Options: []string{"ro", "loop"}},
 }
 
-// Active (with writable layer) - returns EROFS layers + ext4 file
+// Active (with writable layer) - EROFS lower + ext4 upper
 []mount.Mount{
-    {Type: "erofs", Source: "/path/to/layer1.erofs", Options: []string{"ro"}},
-    {Type: "erofs", Source: "/path/to/layer2.erofs", Options: []string{"ro"}},
-    {Type: "ext4",  Source: "/path/to/rwlayer.img",  Options: []string{"rw"}},
+    {Type: "erofs", Source: "/path/to/fsmeta.erofs", Options: []string{"ro", "loop", "device=..."}},
+    {Type: "ext4",  Source: "/path/to/rwlayer.img",  Options: []string{"rw", "loop"}},
 }
 ```
 
 The VM runtime (qemubox) passes these as virtio-blk devices. The guest VM mounts them and creates an overlay.
+
+**Fallback behavior:** When fsmeta/VMDK generation fails (e.g., `mkfs.erofs` lacks `--aufs` support, or layers have incompatible block sizes from `--tar=i` mode), the snapshotter returns individual EROFS mounts. The consumer must handle stacking these layers.
 
 ### VMDK: Single Virtual Disk for Multiple Layers
 
@@ -167,17 +182,18 @@ stateDiagram-v2
 ```
 /var/lib/nexuserofs-snapshotter/
 ├── metadata.db              # BBolt database (snapshot metadata)
+├── mounts.db                # BBolt database (mount manager state)
 └── snapshots/
     └── {id}/
         ├── .erofslayer      # Marker file for EROFS differ
-        ├── fs/              # (unused in block mode)
         ├── rwlayer.img      # ext4 writable layer file
-        ├── rw/              # Mount point for ext4 (during extraction)
-        │   ├── upper/       # Overlay upper directory
-        │   └── work/        # Overlay work directory
+        ├── rw/              # Mount point for ext4 (during extraction only)
+        │   ├── upper/       # Overlay upper directory (fallback differs)
+        │   └── work/        # Overlay work directory (fallback differs)
+        ├── lower/           # Empty directory for View snapshots with no parent
         ├── layer.erofs      # Committed EROFS layer blob
-        ├── fsmeta.erofs     # Merged metadata (multi-layer)
-        └── merged.vmdk      # VMDK descriptor for QEMU
+        ├── fsmeta.erofs     # Merged metadata (multi-layer, requires --aufs)
+        └── merged.vmdk      # VMDK descriptor for QEMU (requires --vmdk-desc)
 ```
 
 ## Requirements
@@ -185,10 +201,31 @@ stateDiagram-v2
 ### Runtime
 
 - Linux kernel with EROFS support (5.4+)
-- erofs-utils 1.8+ (mkfs.erofs with `--aufs` support for layer merging)
+- erofs-utils with the following features:
+  - `--tar=f` or `--tar=i`: Convert tar streams directly to EROFS (required)
+  - `--aufs`: AUFS-style whiteout handling for OCI layers (required)
+  - `--vmdk-desc`: Generate VMDK descriptors for multi-layer images (required for fsmeta)
+  - `-Enoinline_data`: Disable inline data for better block alignment
+  - `--sort=none`: Skip data sorting when no compression (performance optimization)
 - e2fsprogs (mkfs.ext4 for writable layers)
 - util-linux (losetup for loop devices)
 - containerd 2.0+
+
+### erofs-utils
+
+Each release includes a pre-built `mkfs.erofs` binary with all required features enabled. We recommend using this bundled version to ensure compatibility.
+
+The bundled binary is built from the erofs-utils source with patches for features that may not yet be in upstream releases (like `--vmdk-desc`).
+
+To verify feature support:
+
+```bash
+# Check for tar mode support
+mkfs.erofs --help | grep -q '\-\-tar=' && echo "tar mode: OK"
+
+# Check for VMDK descriptor support
+mkfs.erofs --help | grep -q '\-\-vmdk-desc' && echo "vmdk-desc: OK"
+```
 
 ### Build
 
@@ -241,31 +278,17 @@ version = 2
 | `--root` | `/var/lib/nexuserofs-snapshotter` | Root directory for snapshotter data |
 | `--address` | `/run/nexuserofs-snapshotter/snapshotter.sock` | Unix socket address |
 | `--containerd-address` | `/run/containerd/containerd.sock` | containerd socket |
-| `--default-size` | `64M` | Size of ext4 writable layer |
+| `--containerd-namespace` | `default` | containerd namespace to use |
+| `--log-level` | `info` | Log level (debug, info, warn, error) |
+| `--default-size` | `64M` | Size of ext4 writable layer (bytes) |
 | `--enable-fsverity` | `false` | Enable fsverity for layer validation |
 | `--set-immutable` | `true` | Set immutable flag on committed layers |
 | `--mkfs-options` | | Extra options for mkfs.erofs (e.g., `-zlz4hc,12`) |
 | `--version` | | Show version information |
 
-## Usage with qemubox
+### Layer Conversion and fsmeta
 
-```bash
-# Pull image (layers converted to EROFS)
-ctr --address /var/run/qemubox/containerd.sock \
-    pull --snapshotter nexuserofs \
-    ghcr.io/aledbf/qemubox/sandbox:latest
-
-# Run container (VMDK passed to VM as virtio-blk)
-ctr --address /var/run/qemubox/containerd.sock \
-    run -t --snapshotter nexuserofs \
-    --runtime io.containerd.qemubox.v1 \
-    ghcr.io/aledbf/qemubox/sandbox:latest mycontainer
-
-# Commit changes to new image
-nerdctl --address /var/run/qemubox/containerd.sock \
-    commit --snapshotter nexuserofs \
-    mycontainer docker.io/user/sandbox:modified
-```
+Layers are created using full conversion mode (`--tar=f`), which converts tar archives to EROFS format with 4096-byte blocks. This ensures compatibility with fsmeta merge, allowing multi-layer images to be consolidated into a single mount with a VMDK descriptor for efficient VM handling.
 
 ## Key Differences from Traditional Snapshotters
 
@@ -276,6 +299,27 @@ nerdctl --address /var/run/qemubox/containerd.sock \
 | Overlay handling | Host overlayfs | Guest overlayfs |
 | Layer format | Directory trees | EROFS blobs + VMDK |
 | Use case | runc, crun | qemubox, Firecracker |
+
+## Differences vs containerd's Built-in EROFS Snapshotter
+
+containerd 2.0+ includes a built-in EROFS snapshotter. nexuserofs differs in several key ways:
+
+| Aspect | containerd EROFS | nexuserofs |
+|--------|------------------|------------|
+| **Plugin type** | Built-in | External proxy plugin |
+| **Target runtime** | Host containers (runc) | VM containers (qemubox) |
+| **Layer conversion** | Requires pre-converted EROFS layers | Converts tar→EROFS on pull via differ |
+| **Multi-layer handling** | Host overlayfs stacking | fsmeta + VMDK for single virtio-blk device |
+| **Mount returns** | Mounted overlayfs paths | Raw file paths (no host mounting) |
+| **Tar mode** | N/A | `--tar=f` (full) or `--tar=i` (index) |
+| **VMDK generation** | No | Yes (always for multi-layer) |
+
+### Why Use nexuserofs?
+
+1. **VM-native design**: Returns file paths that map directly to virtio-blk devices
+2. **On-the-fly conversion**: Converts standard OCI tar layers to EROFS during pull
+3. **Single device for multi-layer**: VMDK descriptor lets QEMU present all layers as one block device
+4. **No host overlayfs**: Guest VM handles all filesystem stacking internally
 
 ## License
 
