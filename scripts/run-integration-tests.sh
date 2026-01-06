@@ -5,7 +5,8 @@
 #   ./scripts/run-integration-tests.sh [options]
 #
 # Options:
-#   --build         Force rebuild of Docker image
+#   --build         Force local build of Docker image (default: use ghcr.io)
+#   --local         Use locally built image (same as --build)
 #   --shell         Start interactive shell instead of tests
 #   --keep          Keep container data after exit for debugging
 #   --test NAME     Run only the specified test (e.g., --test pull_image)
@@ -13,8 +14,8 @@
 #   -h, --help      Show this help message
 #
 # Examples:
-#   ./scripts/run-integration-tests.sh                    # Run all tests
-#   ./scripts/run-integration-tests.sh --build            # Rebuild image and run
+#   ./scripts/run-integration-tests.sh                    # Run using ghcr.io image
+#   ./scripts/run-integration-tests.sh --build            # Build locally and run
 #   ./scripts/run-integration-tests.sh --shell            # Interactive debugging
 #   ./scripts/run-integration-tests.sh --test commit      # Run only commit test
 #
@@ -27,7 +28,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-IMAGE_NAME="nexuserofs-integration"
+
+# Default to published image on ghcr.io
+# Get repo name from git remote or use fallback
+REPO_NAME=$(git -C "${ROOT_DIR}" remote get-url origin 2>/dev/null | sed -E 's|.*github.com[:/]||; s|\.git$||' || echo "aledbf/nexuserofs")
+GHCR_IMAGE="ghcr.io/${REPO_NAME}/integration:latest"
+LOCAL_IMAGE="nexuserofs-integration"
+
+IMAGE_NAME="${GHCR_IMAGE}"
 FORCE_BUILD=false
 INTERACTIVE=false
 KEEP_DATA=false
@@ -36,8 +44,9 @@ TEST_ARGS=()
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --build)
+        --build|--local)
             FORCE_BUILD=true
+            IMAGE_NAME="${LOCAL_IMAGE}"
             shift
             ;;
         --shell)
@@ -68,23 +77,46 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Check if image exists
+# Check if image exists locally
 image_exists() {
-    docker image inspect "${IMAGE_NAME}" &>/dev/null
+    docker image inspect "$1" &>/dev/null
 }
 
-# Build image
+# Pull image from registry
+pull_image() {
+    echo "==> Pulling integration test image: ${GHCR_IMAGE}"
+    if docker pull "${GHCR_IMAGE}"; then
+        return 0
+    else
+        echo "==> Failed to pull image from ghcr.io"
+        return 1
+    fi
+}
+
+# Build image locally
 build_image() {
-    echo "==> Building integration test image: ${IMAGE_NAME}"
-    docker build -t "${IMAGE_NAME}" -f "${ROOT_DIR}/Dockerfile.integration" "${ROOT_DIR}"
+    echo "==> Building integration test image: ${LOCAL_IMAGE}"
+    docker build -t "${LOCAL_IMAGE}" -f "${ROOT_DIR}/Dockerfile.integration" "${ROOT_DIR}"
 }
 
-# Build if needed
-if [[ "${FORCE_BUILD}" == "true" ]] || ! image_exists; then
+# Get the image to use
+if [[ "${FORCE_BUILD}" == "true" ]]; then
+    # Force local build
     build_image
+    IMAGE_NAME="${LOCAL_IMAGE}"
+elif image_exists "${GHCR_IMAGE}"; then
+    # Use cached ghcr.io image
+    echo "==> Using cached image: ${GHCR_IMAGE}"
+    echo "    (use --build to force local rebuild)"
+    IMAGE_NAME="${GHCR_IMAGE}"
+elif pull_image; then
+    # Successfully pulled from ghcr.io
+    IMAGE_NAME="${GHCR_IMAGE}"
 else
-    echo "==> Using existing image: ${IMAGE_NAME}"
-    echo "    (use --build to force rebuild)"
+    # Fallback to local build
+    echo "==> Falling back to local build"
+    build_image
+    IMAGE_NAME="${LOCAL_IMAGE}"
 fi
 
 echo "==> Running integration tests"
