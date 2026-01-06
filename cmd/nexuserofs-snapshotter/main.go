@@ -44,6 +44,14 @@ import (
 	"github.com/aledbf/nexuserofs/internal/store"
 )
 
+// Version information - set via ldflags at build time
+// Example: go build -ldflags "-X main.version=1.0.0 -X main.gitCommit=$(git rev-parse HEAD)"
+var (
+	version   = "dev"
+	gitCommit = "unknown"
+	buildDate = "unknown"
+)
+
 const (
 	defaultAddress          = "/run/nexuserofs-snapshotter/snapshotter.sock"
 	defaultRoot             = "/var/lib/nexuserofs-snapshotter"
@@ -58,8 +66,9 @@ func main() {
 	}
 
 	app := &cli.App{
-		Name:  "nexuserofs-snapshotter",
-		Usage: "External EROFS snapshotter for containerd",
+		Name:    "nexuserofs-snapshotter",
+		Usage:   "External EROFS snapshotter for containerd",
+		Version: fmt.Sprintf("%s (commit: %s, built: %s)", version, gitCommit, buildDate),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "address",
@@ -127,6 +136,12 @@ func main() {
 				Usage:   "Extra options for overlay mounts",
 				EnvVars: []string{"NEXUSEROFS_OVERLAY_OPTIONS"},
 			},
+			&cli.UintFlag{
+				Name:    "fs-merge-threshold",
+				Usage:   "Layer count threshold for generating fsmeta+VMDK (min 5, 0 to disable)",
+				Value:   5,
+				EnvVars: []string{"NEXUSEROFS_FS_MERGE_THRESHOLD"},
+			},
 		},
 		Action: run,
 	}
@@ -183,6 +198,9 @@ func run(cliCtx *cli.Context) error {
 	}
 	if opts := cliCtx.StringSlice("overlay-options"); len(opts) > 0 {
 		snapshotterOpts = append(snapshotterOpts, snapshotter.WithOvlOptions(opts))
+	}
+	if threshold := cliCtx.Uint("fs-merge-threshold"); threshold > 0 {
+		snapshotterOpts = append(snapshotterOpts, snapshotter.WithFsMergeThreshold(threshold))
 	}
 
 	// Create snapshotter

@@ -29,7 +29,6 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/log"
-	"github.com/moby/sys/mountinfo"
 	"golang.org/x/sys/unix"
 
 	erofsutils "github.com/aledbf/nexuserofs/internal/erofs"
@@ -150,15 +149,10 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 			// Orphaned directory - not in metadata
 			log.L.WithField("id", id).Info("cleaning up orphaned snapshot directory")
 
-			// Unmount all mounts before removing
+			// Unmount rw mount if it exists (from interrupted commit)
 			rwDir := filepath.Join(snapshotDir, "rw")
 			if err := unmountAll(rwDir); err != nil && !isNotMountError(err) {
 				log.L.WithError(err).WithField("path", rwDir).Debug("failed to unmount orphan rw")
-			}
-
-			layersDir := filepath.Join(snapshotDir, "layers")
-			if err := mount.UnmountRecursive(layersDir, 0); err != nil {
-				log.L.WithError(err).WithField("path", layersDir).Debug("failed to unmount orphan layers")
 			}
 
 			// Clear immutable flag if present
@@ -172,16 +166,11 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 			continue
 		}
 
-		// Valid snapshot - just clean up stale mounts that might have been left behind
-		// This handles cases where the process crashed before unmounting
+		// Valid snapshot - clean up stale rw mount that might have been left behind
+		// from an interrupted commit operation
 		rwDir := filepath.Join(snapshotDir, "rw")
 		if err := unmountAll(rwDir); err != nil && !isNotMountError(err) {
 			log.L.WithError(err).WithField("path", rwDir).Debug("failed to cleanup stale rw mount")
-		}
-
-		layersDir := filepath.Join(snapshotDir, "layers")
-		if err := mount.UnmountRecursive(layersDir, 0); err != nil {
-			log.L.WithError(err).WithField("path", layersDir).Debug("failed to cleanup stale layer mounts")
 		}
 	}
 }
@@ -266,35 +255,46 @@ func upperDirectoryPermission(p, parent string) error {
 	return nil
 }
 
-// mountErofsLayer mounts an EROFS layer at the specified mount point using a loop device.
-// The mount is read-only. Returns nil if already mounted or if mounting succeeds.
-func mountErofsLayer(layerPath, mountPoint string) error {
-	return mountErofsWithOptions(mount.Mount{
-		Type:    "erofs",
-		Source:  layerPath,
-		Options: []string{"ro", "loop"},
-	}, mountPoint)
-}
+// mountBlockRwLayer mounts the ext4 writable layer for extract snapshots.
+// This allows the differ to write content to the mounted filesystem.
+// The mount is cleaned up during Commit() after converting to EROFS.
+func (s *snapshotter) mountBlockRwLayer(ctx context.Context, id string) error {
+	rwLayerPath := s.writablePath(id)
+	rwMountPath := s.blockRwMountPath(id)
 
-// mountErofsWithOptions mounts an EROFS image with custom options.
-// Used for fsmeta mounts that need device= options for multi-device support.
-func mountErofsWithOptions(m mount.Mount, mountPoint string) error {
-	if err := os.MkdirAll(mountPoint, 0755); err != nil {
-		return fmt.Errorf("failed to create mount point: %w", err)
+	// Create mount point
+	if err := os.MkdirAll(rwMountPath, 0755); err != nil {
+		return fmt.Errorf("failed to create rw mount point: %w", err)
 	}
 
-	// Check if already mounted to make this idempotent
-	mounted, err := mountinfo.Mounted(mountPoint)
-	if err != nil {
-		return fmt.Errorf("failed to check if %s is mounted: %w", mountPoint, err)
+	// Mount the ext4 file
+	m := mount.Mount{
+		Source:  rwLayerPath,
+		Type:    "ext4",
+		Options: []string{"rw", "loop"},
 	}
-	if mounted {
-		return nil // Already mounted, nothing to do
+	if err := m.Mount(rwMountPath); err != nil {
+		return fmt.Errorf("failed to mount ext4 layer: %w", err)
 	}
 
-	if err := m.Mount(mountPoint); err != nil {
-		return fmt.Errorf("failed to mount EROFS layer %s at %s: %w", m.Source, mountPoint, err)
+	// Create upper and work directories inside the mounted ext4
+	upperDir := s.blockUpperPath(id)
+	workDir := filepath.Join(s.blockRwMountPath(id), "work")
+
+	if err := os.MkdirAll(upperDir, 0755); err != nil {
+		// Cleanup mount on failure
+		_ = unmountAll(rwMountPath)
+		return fmt.Errorf("failed to create upper directory: %w", err)
 	}
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		_ = unmountAll(rwMountPath)
+		return fmt.Errorf("failed to create work directory: %w", err)
+	}
+
+	log.G(ctx).WithFields(log.Fields{
+		"id":     id,
+		"target": rwMountPath,
+	}).Debug("mounted ext4 writable layer for extraction")
 
 	return nil
 }

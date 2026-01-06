@@ -21,10 +21,15 @@ package erofs
 // This file contains the core EROFS snapshotter tests, test suite,
 // and shared helper functions used by other test files.
 //
+// NOTE: Most tests in this file are SKIPPED because the EROFS snapshotter
+// is designed exclusively for VM runtimes (like qemubox). The snapshotter
+// returns raw file paths (EROFS blobs, ext4 images) that are passed to VMs
+// as virtio-blk devices, NOT mounted on the host.
+//
 // Core tests in this file:
-// - TestErofs (testsuite)
-// - TestErofsWithQuota
-// - TestErofsFsverity
+// - TestErofs (testsuite) - SKIPPED (VM-only)
+// - TestErofsWithQuota - SKIPPED (VM-only)
+// - TestErofsFsverity - SKIPPED (VM-only)
 //
 // Helper functions shared with erofs_differ_linux_test.go and
 // erofs_snapshot_linux_test.go:
@@ -61,6 +66,18 @@ import (
 	"github.com/aledbf/nexuserofs/internal/preflight"
 )
 
+// vmOnlySkipMessage is the skip message for tests that require host mounting.
+// The EROFS snapshotter is designed for VM runtimes only - it returns raw file
+// paths (EROFS blobs, ext4 images) that are passed to VMs as virtio-blk devices.
+const vmOnlySkipMessage = "SKIPPED: EROFS snapshotter is VM-only; returns raw file paths for virtio-blk, not host-mountable filesystems"
+
+// skipIfVMOnly skips the test with the VM-only message.
+// Use this for tests that require host mounting of returned mounts.
+func skipIfVMOnly(t *testing.T) {
+	t.Helper()
+	t.Skip(vmOnlySkipMessage)
+}
+
 const (
 	testFileContent       = "Hello, this is content for testing the EROFS Snapshotter!"
 	testNestedFileContent = "Nested file content"
@@ -82,8 +99,13 @@ func (e *snapshotTestEnv) ctx() context.Context {
 
 // newSnapshotTestEnv creates a new test environment with all prerequisites checked.
 // It skips the test if EROFS support is not available.
+//
+// NOTE: This helper is SKIPPED because the EROFS snapshotter is VM-only.
+// Tests using this helper expect host-mountable filesystems, but the snapshotter
+// returns raw file paths for virtio-blk devices.
 func newSnapshotTestEnv(t *testing.T, opts ...Opt) *snapshotTestEnv {
 	t.Helper()
+	skipIfVMOnly(t) // Tests using this helper require host mounting
 	testutil.RequiresRoot(t)
 
 	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
@@ -201,16 +223,19 @@ func newSnapshotter(t *testing.T, opts ...Opt) func(ctx context.Context, root st
 }
 
 func TestErofs(t *testing.T) {
+	skipIfVMOnly(t) // Testsuite requires host mounting
 	testutil.RequiresRoot(t)
 	testsuite.SnapshotterSuite(t, "erofs", newSnapshotter(t))
 }
 
 func TestErofsWithQuota(t *testing.T) {
+	skipIfVMOnly(t) // Testsuite requires host mounting
 	testutil.RequiresRoot(t)
 	testsuite.SnapshotterSuite(t, "erofs", newSnapshotter(t, WithDefaultSize(16*1024*1024)))
 }
 
 func TestErofsFsverity(t *testing.T) {
+	skipIfVMOnly(t) // Test requires host mounting
 	testutil.RequiresRoot(t)
 	ctx := t.Context()
 

@@ -59,6 +59,7 @@ import (
 
 	erofsdiffer "github.com/aledbf/nexuserofs/internal/differ"
 	erofsutils "github.com/aledbf/nexuserofs/internal/erofs"
+	"github.com/aledbf/nexuserofs/internal/mountutils"
 	"github.com/aledbf/nexuserofs/internal/preflight"
 )
 
@@ -89,8 +90,13 @@ func (e *differTestEnv) ctx() context.Context {
 
 // newDifferTestEnv creates a new test environment with all prerequisites checked.
 // It skips the test if EROFS support is not available.
+//
+// NOTE: This helper is SKIPPED because the EROFS snapshotter is VM-only.
+// Tests using this helper expect host-mountable filesystems, but the snapshotter
+// returns raw file paths for virtio-blk devices.
 func newDifferTestEnv(t *testing.T) *differTestEnv {
 	t.Helper()
+	skipIfVMOnly(t) // Tests using this helper require host mounting
 	testutil.RequiresRoot(t)
 	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
 
@@ -133,8 +139,13 @@ func newDifferTestEnv(t *testing.T) *differTestEnv {
 }
 
 // newDifferTestEnvWithBlockMode creates a test environment with block mode enabled.
+//
+// NOTE: This helper is SKIPPED because the EROFS snapshotter is VM-only.
+// Tests using this helper expect host-mountable filesystems, but the snapshotter
+// returns raw file paths for virtio-blk devices.
 func newDifferTestEnvWithBlockMode(t *testing.T) *differTestEnv {
 	t.Helper()
+	skipIfVMOnly(t) // Tests using this helper require host mounting
 	testutil.RequiresRoot(t)
 	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
 
@@ -322,6 +333,7 @@ func (e *differTestEnv) compareAndVerify(differ *erofsdiffer.ErofsDiff, lower, u
 }
 
 func TestErofsDifferWithTarIndexMode(t *testing.T) {
+	skipIfVMOnly(t) // Test requires host mounting
 	testutil.RequiresRoot(t)
 	ctx := t.Context()
 
@@ -491,9 +503,14 @@ func TestErofsDifferCompareWithMountManager(t *testing.T) {
 	upperMounts := env.prepareActiveLayer(testKeyUpper, childCommit, "upper.txt", "upper")
 	lowerMounts := env.createView(testKeyLower, childCommit)
 
-	// Verify multi-layer view returns overlay mount
-	if len(lowerMounts) != 1 || lowerMounts[0].Type != testTypeOverlay {
-		t.Fatalf("expected 1 overlay mount, got: %#v", lowerMounts)
+	// Verify multi-layer view returns multiple EROFS mounts (one per layer)
+	if len(lowerMounts) != 2 {
+		t.Fatalf("expected 2 EROFS mounts, got: %#v", lowerMounts)
+	}
+	for i, m := range lowerMounts {
+		if mountutils.TypeSuffix(m.Type) != testTypeErofs {
+			t.Fatalf("mount %d: expected erofs type, got: %s", i, m.Type)
+		}
 	}
 
 	mm := env.createMountManager()
@@ -563,9 +580,9 @@ func TestErofsDifferCompareWithFormattedUpperMounts(t *testing.T) {
 	// Create active upper layer in block mode
 	upperMounts := env.prepareActiveBlockLayer(testKeyUpper, "base-commit", "upper.txt", "upper")
 
-	// Single-layer Prepare returns 1 overlay mount
-	if len(upperMounts) != 1 {
-		t.Fatalf("expected 1 overlay mount, got: %#v", upperMounts)
+	// Active layer with 1 parent returns: 1 EROFS mount + 1 ext4 mount
+	if len(upperMounts) != 2 {
+		t.Fatalf("expected 2 mounts (1 EROFS + 1 ext4), got: %#v", upperMounts)
 	}
 
 	lowerMounts := env.createView(testKeyLower, "base-commit")
@@ -621,12 +638,14 @@ func TestErofsDifferCompareMultipleStackedLayers(t *testing.T) {
 	upperMounts := env.prepareActiveLayer(testKeyUpper, parentKey, "upper.txt", "upper")
 	lowerMounts := env.createView(testKeyLower, parentKey)
 
-	// Multi-layer views return a single mount (erofs with fsmeta, or overlay without)
-	if len(lowerMounts) != 1 {
-		t.Fatalf("expected 1 mount, got: %#v", lowerMounts)
+	// Multi-layer views return multiple EROFS mounts (one per layer) for the consumer
+	if len(lowerMounts) != 6 {
+		t.Fatalf("expected 6 EROFS mounts (one per layer), got: %#v", lowerMounts)
 	}
-	if lowerMounts[0].Type != testTypeErofs && lowerMounts[0].Type != testTypeOverlay {
-		t.Fatalf("expected erofs or overlay mount, got: %#v", lowerMounts)
+	for i, m := range lowerMounts {
+		if mountutils.TypeSuffix(m.Type) != testTypeErofs {
+			t.Fatalf("mount %d: expected erofs type, got: %s", i, m.Type)
+		}
 	}
 
 	mm := env.createMountManager()
@@ -740,9 +759,14 @@ func TestErofsDifferCompareDoesNotRequireMountManager(t *testing.T) {
 	upperMounts := env.prepareActiveLayer(testKeyUpper, childCommit, "upper.txt", "upper")
 	lowerMounts := env.createView(testKeyLower, childCommit)
 
-	// Multi-layer views return a single overlay mount
-	if len(lowerMounts) != 1 || lowerMounts[0].Type != testTypeOverlay {
-		t.Fatalf("expected 1 overlay mount, got: %#v", lowerMounts)
+	// Multi-layer views return multiple EROFS mounts (one per layer) for the consumer
+	if len(lowerMounts) != 2 {
+		t.Fatalf("expected 2 EROFS mounts, got: %#v", lowerMounts)
+	}
+	for i, m := range lowerMounts {
+		if mountutils.TypeSuffix(m.Type) != testTypeErofs {
+			t.Fatalf("mount %d: expected erofs type, got: %s", i, m.Type)
+		}
 	}
 
 	mm := env.createMountManager()

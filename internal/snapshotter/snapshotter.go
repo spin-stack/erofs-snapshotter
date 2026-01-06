@@ -194,8 +194,9 @@ func (s *snapshotter) Close() error {
 	return s.ms.Close()
 }
 
-// cleanupBlockMounts unmounts any ext4 rw mounts and layer mounts.
+// cleanupBlockMounts unmounts any ext4 rw mounts used during conversion.
 // Errors are logged but not returned since this is best-effort cleanup.
+// Note: EROFS layer mounts are handled by the consumer, not by this snapshotter.
 func (s *snapshotter) cleanupBlockMounts() {
 	snapshotsDir := filepath.Join(s.root, "snapshots")
 	entries, err := os.ReadDir(snapshotsDir)
@@ -210,28 +211,16 @@ func (s *snapshotter) cleanupBlockMounts() {
 		}
 		snapshotDir := filepath.Join(snapshotsDir, entry.Name())
 
-		// Cleanup block mode rw mounts (ext4 loop mounts)
+		// Cleanup block mode rw mounts (ext4 loop mounts used during conversion)
 		rwDir := filepath.Join(snapshotDir, "rw")
 		if err := unmountAll(rwDir); err != nil {
 			log.L.WithError(err).WithField("path", rwDir).Debug("failed to cleanup block rw mount during close")
-		}
-
-		// Cleanup layer mounts (EROFS loop mounts used for views)
-		layersDir := filepath.Join(snapshotDir, "layers")
-		if err := mount.UnmountRecursive(layersDir, 0); err != nil {
-			log.L.WithError(err).WithField("path", layersDir).Debug("failed to cleanup layer mounts during close")
 		}
 	}
 }
 
 func (s *snapshotter) upperPath(id string) string {
 	return filepath.Join(s.root, "snapshots", id, "fs")
-}
-
-// layerMountPath returns the mount path for a specific layer in a snapshot.
-// Layers are indexed from 0 (bottom/oldest) to N (top/newest).
-func (s *snapshotter) layerMountPath(id string, layerIndex int) string {
-	return filepath.Join(s.root, "snapshots", id, "layers", fmt.Sprintf("%d", layerIndex))
 }
 
 func (s *snapshotter) writablePath(id string) string {
@@ -246,41 +235,6 @@ func (s *snapshotter) blockRwMountPath(id string) string {
 // blockUpperPath returns the overlay upperdir inside the mounted ext4.
 func (s *snapshotter) blockUpperPath(id string) string {
 	return filepath.Join(s.blockRwMountPath(id), "upper")
-}
-
-// blockWorkPath returns the overlay workdir inside the mounted ext4.
-func (s *snapshotter) blockWorkPath(id string) string {
-	return filepath.Join(s.blockRwMountPath(id), "work")
-}
-
-// mountBlockRwLayer mounts the ext4 rwlayer image at the rw mount point.
-// This is idempotent - if already mounted, returns nil.
-func (s *snapshotter) mountBlockRwLayer(id string) error {
-	rwPath := s.writablePath(id)
-	mountPoint := s.blockRwMountPath(id)
-
-	if err := os.MkdirAll(mountPoint, 0755); err != nil {
-		return fmt.Errorf("failed to create rw mount point: %w", err)
-	}
-
-	// Check if already mounted
-	alreadyMounted, err := mountinfo.Mounted(mountPoint)
-	if err != nil {
-		return fmt.Errorf("failed to check mount status for %s: %w", mountPoint, err)
-	}
-	if alreadyMounted {
-		return nil
-	}
-
-	m := mount.Mount{
-		Source:  rwPath,
-		Type:    "ext4",
-		Options: []string{"rw", "loop", "user_xattr"},
-	}
-	if err := m.Mount(mountPoint); err != nil {
-		return fmt.Errorf("failed to mount ext4 rwlayer: %w", err)
-	}
-	return nil
 }
 
 // createWritableLayer creates and formats an ext4 filesystem image file.
@@ -363,11 +317,30 @@ func (s *snapshotter) prepareDirectory(snapshotDir string, kind snapshots.Kind) 
 }
 
 func (s *snapshotter) mountFsMeta(snap storage.Snapshot) (mount.Mount, bool) {
-	// fsmeta is generated in rebuild/flatdev mode for use with qemubox via VMDK.
-	// It cannot be mounted directly with device= options (that requires aufs mode).
-	// For direct mounting, we fall back to overlay with individual EROFS layers.
-	// qemubox detects the merged.vmdk file and uses it for a single virtio-blk device.
-	return mount.Mount{}, false
+	// Check if merged VMDK exists for this snapshot.
+	// When VMDK exists, return fsmeta.erofs as the mount source.
+	// the consumer detects the merged.vmdk file and uses it for a single virtio-blk device.
+	if len(snap.ParentIDs) == 0 {
+		return mount.Mount{}, false
+	}
+	// fsmeta is stored under the immediate parent's snapshot ID
+	parentID := snap.ParentIDs[0]
+	vmdkFile := s.vmdkPath(parentID)
+	fsmetaFile := s.fsMetaPath(parentID)
+
+	// Both files must exist for VMDK mode
+	if _, err := os.Stat(vmdkFile); err != nil {
+		return mount.Mount{}, false
+	}
+	if _, err := os.Stat(fsmetaFile); err != nil {
+		return mount.Mount{}, false
+	}
+
+	return mount.Mount{
+		Source:  fsmetaFile,
+		Type:    "erofs",
+		Options: []string{"ro"},
+	}, true
 }
 
 // mounts returns mount specifications for a snapshot.
@@ -436,24 +409,20 @@ func isExtractSnapshot(info snapshots.Info) bool {
 
 // singleLayerMounts returns mounts for an Active snapshot with no parent layers.
 // This is used for new snapshots created with Prepare("key", "") - i.e., no parent.
+// Returns the ext4 writable layer as a block device for VM runtimes.
 func (s *snapshotter) singleLayerMounts(snap storage.Snapshot) ([]mount.Mount, error) {
 	if snap.Kind != snapshots.KindActive {
 		return nil, fmt.Errorf("singleLayerMounts only supports Active snapshots, got %v", snap.Kind)
 	}
 
-	// Mount ext4 and return bind mount to upper inside it
-	if err := s.mountBlockRwLayer(snap.ID); err != nil {
-		return nil, fmt.Errorf("failed to mount block rw layer: %w", err)
-	}
-	upperPath := s.blockUpperPath(snap.ID)
-	if err := os.MkdirAll(upperPath, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create block upperdir: %w", err)
-	}
+	// Return the ext4 writable layer file path directly.
+	// VM runtime (the consumer) passes this as a virtio-blk device to the guest.
+	rwLayerPath := s.writablePath(snap.ID)
 	return []mount.Mount{
 		{
-			Source:  upperPath,
-			Type:    "bind",
-			Options: []string{"rw", "rbind"},
+			Source:  rwLayerPath,
+			Type:    "ext4",
+			Options: []string{"rw"},
 		},
 	}, nil
 }
@@ -492,18 +461,16 @@ func ensureMarkerFile(path string) error {
 }
 
 func (s *snapshotter) diffMounts(snap storage.Snapshot) ([]mount.Mount, error) {
-	upperRoot := s.upperPath(snap.ID)
-	layerRoot := filepath.Dir(upperRoot)
-
-	if err := os.MkdirAll(upperRoot, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create upper root: %w", err)
-	}
+	// For extract snapshots, the ext4 is mounted at blockRwMountPath.
+	// Return a bind mount to the upper directory inside the mounted ext4.
+	upperRoot := s.blockUpperPath(snap.ID)
+	snapshotDir := filepath.Join(s.root, "snapshots", snap.ID)
 
 	// Ensure EROFS layer marker exists at the snapshot root for diff operations.
 	// This may be redundant with createSnapshotDirectory, but ensureMarkerFile
 	// is idempotent and this guards against edge cases where diff mounts are
 	// requested without a prior Prepare call.
-	if err := ensureMarkerFile(filepath.Join(layerRoot, erofsutils.ErofsLayerMarker)); err != nil {
+	if err := ensureMarkerFile(filepath.Join(snapshotDir, erofsutils.ErofsLayerMarker)); err != nil {
 		return nil, fmt.Errorf("failed to create erofs marker: %w", err)
 	}
 
@@ -537,14 +504,13 @@ func (s *snapshotter) getErofsLayerPaths(snap storage.Snapshot) ([]string, error
 }
 
 // viewMounts returns mounts for KindView snapshots.
-// For single-layer views, returns a single EROFS mount.
-// For multi-layer views, mounts all layers and returns an overlay.
+// Returns EROFS mount(s) that the consumer converts to virtio-blk devices.
+// For merged layers with VMDK, returns single fsmeta.erofs mount.
+// For multi-layer without VMDK, returns multiple EROFS mounts (one per layer).
 func (s *snapshotter) viewMounts(snap storage.Snapshot) ([]mount.Mount, error) {
-	// Check if we have a merged fsmeta that collapses all layers into one
-	if s.fsMergeThreshold > 0 {
-		if m, ok := s.mountFsMeta(snap); ok {
-			return []mount.Mount{m}, nil
-		}
+	// Check if we have a merged fsmeta with VMDK - preferred for the consumer
+	if m, ok := s.mountFsMeta(snap); ok {
+		return []mount.Mount{m}, nil
 	}
 
 	// Get EROFS layer paths
@@ -553,99 +519,51 @@ func (s *snapshotter) viewMounts(snap storage.Snapshot) ([]mount.Mount, error) {
 		return nil, err
 	}
 
-	// Single layer: return EROFS mount directly
-	if len(layerPaths) == 1 {
-		return []mount.Mount{{
-			Source:  layerPaths[0],
-			Type:    "erofs",
-			Options: []string{"ro", "loop"},
-		}}, nil
-	}
-
-	// Multi-layer: mount each layer and return overlay
+	// Return EROFS mounts for each layer (the consumer handles stacking)
 	// ParentIDs are ordered from newest (immediate parent) to oldest (root).
-	// For overlayfs, lowerdir must be ordered top-to-bottom (newest first).
-	var lowerdirs []string
-	for i, layerPath := range layerPaths {
-		mountPath := s.layerMountPath(snap.ID, i)
-		if err := mountErofsLayer(layerPath, mountPath); err != nil {
-			// Cleanup already mounted layers on error
-			for j := range i {
-				_ = unmountAll(s.layerMountPath(snap.ID, j))
-			}
-			return nil, err
-		}
-		lowerdirs = append(lowerdirs, mountPath)
+	var mounts []mount.Mount
+	for _, layerPath := range layerPaths {
+		mounts = append(mounts, mount.Mount{
+			Source:  layerPath,
+			Type:    "erofs",
+			Options: []string{"ro"},
+		})
 	}
 
-	// Return overlay combining all layers (read-only)
-	return []mount.Mount{{
-		Type:    "overlay",
-		Source:  "overlay",
-		Options: []string{"lowerdir=" + strings.Join(lowerdirs, ":")},
-	}}, nil
+	return mounts, nil
 }
 
 // activeMounts returns mounts for active (writable) snapshots.
-// Mounts all parent layers and returns an overlay with writable upper.
-// Note: fsmeta is NOT used for active mounts because the kernel's EROFS
-// device= option requires loop devices to be pre-setup, which we can't do
-// when mounting ourselves. For views, we return mount specs that containerd
-// can mount using its mount manager with proper loop device setup.
+// Returns EROFS mounts for read-only lower layers plus ext4 block device for writable upper.
+// the consumer converts these to virtio-blk devices and handles overlay inside the VM.
 func (s *snapshotter) activeMounts(snap storage.Snapshot) ([]mount.Mount, error) {
-	// Get EROFS layer paths
+	var mounts []mount.Mount
+
+	// Get EROFS layer paths for read-only lower layers
 	layerPaths, err := s.getErofsLayerPaths(snap)
 	if err != nil {
 		return nil, err
 	}
 
-	// No parent layers: return just the upper directory as bind mount
-	if len(layerPaths) == 0 {
-		return []mount.Mount{{
-			Type:    "bind",
-			Source:  s.blockUpperPath(snap.ID),
-			Options: []string{"rw", "rbind"},
-		}}, nil
-	}
-
-	// Mount each layer and collect mount paths
+	// Add EROFS mounts for each lower layer
 	// ParentIDs are ordered from newest (immediate parent) to oldest (root).
-	// For overlayfs, lowerdir must be ordered top-to-bottom (newest first).
-	var lowerdirs []string
-	for i, layerPath := range layerPaths {
-		mountPath := s.layerMountPath(snap.ID, i)
-		if err := mountErofsLayer(layerPath, mountPath); err != nil {
-			// Cleanup already mounted layers on error
-			for j := range i {
-				_ = unmountAll(s.layerMountPath(snap.ID, j))
-			}
-			return nil, err
-		}
-		lowerdirs = append(lowerdirs, mountPath)
+	for _, layerPath := range layerPaths {
+		mounts = append(mounts, mount.Mount{
+			Source:  layerPath,
+			Type:    "erofs",
+			Options: []string{"ro"},
+		})
 	}
 
-	return s.activeOverlayMounts(snap, lowerdirs, false)
-}
+	// Add the writable ext4 block device as the last mount
+	rwLayerPath := s.writablePath(snap.ID)
+	mounts = append(mounts, mount.Mount{
+		Source:  rwLayerPath,
+		Type:    "ext4",
+		Options: []string{"rw"},
+	})
 
-// activeOverlayMounts builds the writable overlay configuration for an active snapshot.
-// lowerdirs are the mounted paths for lower layers (already mounted).
-// isFsmeta indicates if the lower is a merged fsmeta mount (needs special handling).
-func (s *snapshotter) activeOverlayMounts(snap storage.Snapshot, lowerdirs []string, isFsmeta bool) ([]mount.Mount, error) {
-	upperPath := s.blockUpperPath(snap.ID)
-	workPath := s.blockWorkPath(snap.ID)
-
-	overlayOptions := []string{
-		"lowerdir=" + strings.Join(lowerdirs, ":"),
-		"upperdir=" + upperPath,
-		"workdir=" + workPath,
-	}
-	overlayOptions = append(overlayOptions, s.ovlOptions...)
-
-	return []mount.Mount{{
-		Type:    "overlay",
-		Source:  "overlay",
-		Options: overlayOptions,
-	}}, nil
+	return mounts, nil
 }
 
 func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (_ []mount.Mount, err error) {
@@ -723,15 +641,14 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return nil, fmt.Errorf("context cancelled after transaction: %w", err)
 	}
 
-	// Generate fsmeta outside of the transaction since it's unnecessary.
-	// Also ignore all errors since it's a nice-to-have stuff.
-	if !isExtractKey(key) {
+	// Generate VMDK for VM runtimes (the consumer) - always generate when there are parent layers.
+	// This must complete before mounts() is called so the VMDK is available.
+	if !isExtractKey(key) && len(snap.ParentIDs) > 0 {
 		s.generateFsMeta(ctx, snap.ParentIDs)
 	}
 
-	// For active snapshots, create and mount the writable layer.
-	// This returns directly usable mounts.
-	if kind == snapshots.KindActive && !isExtractKey(key) {
+	// For active snapshots, create the writable ext4 layer file.
+	if kind == snapshots.KindActive {
 		// Check context before expensive writable layer creation
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("context cancelled before writable layer creation: %w", err)
@@ -739,16 +656,13 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		if err := s.createWritableLayer(ctx, snap.ID); err != nil {
 			return nil, fmt.Errorf("failed to create writable layer: %w", err)
 		}
-		// Mount the ext4 layer immediately so mounts() can return real paths
-		if err := s.mountBlockRwLayer(snap.ID); err != nil {
-			return nil, fmt.Errorf("failed to mount writable layer: %w", err)
-		}
-		// Create upper/work directories inside the mounted ext4
-		if err := os.MkdirAll(s.blockUpperPath(snap.ID), 0755); err != nil {
-			return nil, fmt.Errorf("failed to create block upperdir: %w", err)
-		}
-		if err := os.MkdirAll(s.blockWorkPath(snap.ID), 0711); err != nil {
-			return nil, fmt.Errorf("failed to create block workdir: %w", err)
+
+		// For extract snapshots, mount the ext4 on the host so the differ can write to it.
+		// Container snapshots leave the ext4 unmounted - it's passed to VMs as virtio-blk.
+		if isExtractKey(key) {
+			if err := s.mountBlockRwLayer(ctx, snap.ID); err != nil {
+				return nil, fmt.Errorf("failed to mount writable layer for extraction: %w", err)
+			}
 		}
 	}
 
@@ -820,11 +734,13 @@ func (s *snapshotter) commitBlock(ctx context.Context, layerBlob string, id stri
 	return nil
 }
 
-// generate a metadata-only EROFS fsmeta.erofs if all EROFS layer blobs are valid
+// generateFsMeta creates a merged fsmeta.erofs and VMDK descriptor for VM runtimes.
+// The VMDK allows QEMU to present all EROFS layers as a single concatenated block device.
+// This is always called when there are parent layers (no threshold - VM runtimes need this).
 func (s *snapshotter) generateFsMeta(ctx context.Context, snapIDs []string) {
 	var blobs []string
 
-	if s.fsMergeThreshold == 0 || uint(len(snapIDs)) <= s.fsMergeThreshold {
+	if len(snapIDs) == 0 {
 		return
 	}
 
@@ -844,7 +760,7 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, snapIDs []string) {
 	}
 	tmpMergedMeta := mergedMeta + ".tmp"
 	// Use rebuild mode (no --aufs) to generate flatdev fsmeta with mapped_blkaddr.
-	// This allows qemubox to consolidate layers into a single VMDK device.
+	// This allows the consumer to consolidate layers into a single VMDK device.
 	args := append([]string{"--quiet", tmpMergedMeta}, blobs...)
 	log.G(ctx).Infof("merging layers with mkfs.erofs %v", args)
 	cmd := exec.CommandContext(ctx, "mkfs.erofs", args...)
@@ -999,18 +915,7 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	// key no longer available.
 	defer func() {
 		if err == nil {
-			// Cleanup layer mounts (from viewMounts/activeMounts)
-			layersDir := filepath.Join(s.root, "snapshots", id, "layers")
-			if entries, derr := os.ReadDir(layersDir); derr == nil {
-				for _, entry := range entries {
-					layerMount := filepath.Join(layersDir, entry.Name())
-					if uerr := unmountAll(layerMount); uerr != nil {
-						log.G(ctx).WithError(uerr).WithField("path", layerMount).Warn("failed to unmount layer")
-					}
-				}
-			}
-
-			// Cleanup block rw mount
+			// Cleanup block rw mount (only exists if commit was in progress)
 			if err := unmountAll(s.blockRwMountPath(id)); err != nil {
 				log.G(ctx).WithError(err).WithField("id", id).Warnf("failed to cleanup block rw mount")
 			}
