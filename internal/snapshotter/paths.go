@@ -39,6 +39,9 @@ const (
 
 	// vmdkFilename is the filename for the VMDK descriptor.
 	vmdkFilename = "merged.vmdk"
+
+	// manifestFilename is the filename for the layer manifest (stores digests in VMDK order).
+	manifestFilename = "layers.manifest"
 )
 
 // upperPath returns the path to the overlay upper directory for a snapshot.
@@ -100,6 +103,11 @@ func (s *snapshotter) fsMetaPath(id string) string {
 // vmdkPath returns the path to the VMDK descriptor file.
 func (s *snapshotter) vmdkPath(id string) string {
 	return filepath.Join(s.root, snapshotsDirName, id, vmdkFilename)
+}
+
+// manifestPath returns the path to the layer manifest file.
+func (s *snapshotter) manifestPath(id string) string {
+	return filepath.Join(s.root, snapshotsDirName, id, manifestFilename)
 }
 
 // viewLowerPath returns the path to the lower directory for View snapshots.

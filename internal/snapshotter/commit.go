@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
@@ -18,6 +21,9 @@ import (
 	"github.com/aledbf/nexus-erofs/internal/erofs"
 	"github.com/aledbf/nexus-erofs/internal/fsverity"
 )
+
+// blobDigestRegex extracts the digest from sha256-<hex>.erofs filenames.
+var blobDigestRegex = regexp.MustCompile(`^sha256-([a-f0-9]+)\.erofs$`)
 
 // commitBlock handles the conversion of a writable layer to EROFS.
 // It supports both block mode (ext4 image) and directory mode (overlay upper).
@@ -159,9 +165,39 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, snapIDs []string) {
 		return
 	}
 
+	// Write layer manifest file with digests in VMDK order (newest-to-oldest).
+	// This allows external tools to verify VMDK layer order without parsing the snapshot chain.
+	manifestFile := s.manifestPath(snapIDs[0])
+	if err := s.writeLayerManifest(manifestFile, blobs); err != nil {
+		log.G(ctx).WithError(err).Warn("failed to write layer manifest")
+		// Non-fatal - continue even if manifest fails
+	}
+
 	log.G(ctx).WithFields(log.Fields{
 		"d": time.Since(t1),
 	}).Infof("merged fsmeta and vmdk for %v generated", snapIDs[0])
+}
+
+// writeLayerManifest writes layer digests to a manifest file in VMDK order.
+// Format: one digest per line (sha256:hex...), newest layer first.
+// This is the authoritative source for VMDK layer order verification.
+func (s *snapshotter) writeLayerManifest(manifestFile string, blobs []string) error {
+	var digests []string
+	for _, blob := range blobs {
+		filename := filepath.Base(blob)
+		matches := blobDigestRegex.FindStringSubmatch(filename)
+		if matches != nil {
+			digests = append(digests, "sha256:"+matches[1])
+		}
+		// Skip non-digest-based blobs (e.g., snapshot-xxx.erofs fallback)
+	}
+
+	if len(digests) == 0 {
+		return nil // No digests to write
+	}
+
+	content := strings.Join(digests, "\n") + "\n"
+	return os.WriteFile(manifestFile, []byte(content), 0644)
 }
 
 // Commit finalizes an active snapshot, converting it to EROFS format.

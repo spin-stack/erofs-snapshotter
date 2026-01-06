@@ -1077,7 +1077,7 @@ test_erofs_layers() {
 # Test: test_vmdk_layer_order
 # =============================================================================
 # Goal: Verify that VMDK descriptor files list layers in the correct order
-#       matching the snapshot chain hierarchy.
+#       matching the layers.manifest file.
 #
 # CRITICAL: Wrong layer order = VM will not boot!
 #   - Layers must be ordered: fsmeta first, then newest layer -> base layer
@@ -1088,7 +1088,7 @@ test_erofs_layers() {
 #   - fsmeta.erofs is in extent 0 (first position)
 #   - VMDK layers are ordered top-to-bottom (newest first, base last)
 #   - All layer files referenced in VMDK exist on disk
-#   - Layer order matches the snapshot chain walk via containerd API
+#   - Layer order matches the layers.manifest file (authoritative source)
 # =============================================================================
 test_vmdk_layer_order() {
     # Find the VMDK file with multiple layers (from the multi-layer image)
@@ -1210,136 +1210,52 @@ test_vmdk_layer_order() {
     done
 
     # =========================================================================
-    # Step 5: Walk snapshot chain using containerd API to get expected order
+    # Step 5: Read layers.manifest file for authoritative layer order
     # =========================================================================
-    log_info "Walking snapshot chain to verify layer order..."
+    # The manifest file is generated alongside the VMDK and contains the
+    # definitive layer order (newest-to-oldest) as written by the snapshotter.
+    log_info "Reading layer manifest for expected order..."
 
-    # Start from the view snapshot we created (or find it)
-    local current_snap=""
+    local manifest_file
+    manifest_file=$(dirname "$vmdk_file")/layers.manifest
 
-    if [ -n "$MULTI_LAYER_VIEW_NAME" ]; then
-        # Use the view snapshot name from test_multi_layer
-        current_snap="$MULTI_LAYER_VIEW_NAME"
-        log_debug "Using view snapshot from test_multi_layer: $current_snap"
-    else
-        # Find view snapshots
-        current_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls 2>/dev/null | \
-            grep -v "^KEY" | grep "test-multi-view" | head -1 | awk '{print $1}')
+    if [ ! -f "$manifest_file" ]; then
+        log_error "Layer manifest not found: $manifest_file"
+        log_error "The snapshotter must generate layers.manifest alongside merged.vmdk"
+        return 1
     fi
 
-    if [ -z "$current_snap" ]; then
-        # Fall back to finding by VMDK path
-        local snap_dir
-        snap_dir=$(dirname "$vmdk_file")
-        local snap_id
-        snap_id=$(basename "$snap_dir")
-        log_debug "Attempting to find snapshot for directory: $snap_id"
+    log_debug "Using manifest file: $manifest_file"
 
-        # Try to find any snapshot that might match
-        current_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls 2>/dev/null | \
-            grep -v "^KEY" | tail -1 | awk '{print $1}')
+    # Parse manifest - one digest per line (sha256:hex...)
+    local -a manifest_digests=()
+    while IFS= read -r line; do
+        # Skip empty lines
+        [[ -z "$line" ]] && continue
+        # Extract just the hex part after sha256:
+        if [[ "$line" =~ ^sha256:([a-f0-9]+)$ ]]; then
+            manifest_digests+=("${BASH_REMATCH[1]}")
+            log_debug "  Manifest: sha256:${BASH_REMATCH[1]:0:12}..."
+        fi
+    done < "$manifest_file"
+
+    if [ ${#manifest_digests[@]} -eq 0 ]; then
+        log_error "No valid digests found in manifest file: $manifest_file"
+        return 1
     fi
 
-    if [ -z "$current_snap" ]; then
-        log_error "Could not find snapshot to verify chain order"
-        if [ "$STRICT_MODE" = "true" ]; then
-            return 1
-        fi
-        log_warn "Skipping chain verification (use --strict to fail)"
-        return 0
-    fi
-
-    log_info "Starting chain walk from snapshot: $current_snap"
-
-    # Walk the parent chain using containerd snapshots info
-    local -a chain_digests=()
-    local -A visited_snaps=()
-    local max_depth=20  # Prevent infinite loops
-    local depth=0
-
-    while [ -n "$current_snap" ] && [ $depth -lt $max_depth ]; do
-        # Prevent cycles
-        if [ -n "${visited_snaps[$current_snap]:-}" ]; then
-            log_warn "Cycle detected in snapshot chain at: $current_snap"
-            break
-        fi
-        visited_snaps[$current_snap]=1
-
-        # Get layer digest from snapshot labels
-        local layer_digest
-        layer_digest=$(get_snapshot_layer_digest "$current_snap")
-
-        if [ -n "$layer_digest" ]; then
-            chain_digests+=("$layer_digest")
-            log_debug "  Chain[$depth]: sha256:${layer_digest:0:12}... (snap: $current_snap)"
-        else
-            log_debug "  Chain[$depth]: no digest found (snap: $current_snap)"
-        fi
-
-        # Get parent snapshot
-        local parent
-        parent=$(get_snapshot_parent "$current_snap")
-
-        if [ -z "$parent" ]; then
-            log_debug "Reached root of snapshot chain"
-            break
-        fi
-
-        current_snap="$parent"
-        depth=$((depth + 1))
+    log_info "Manifest layer order (${#manifest_digests[@]} layers, newest→oldest):"
+    for i in "${!manifest_digests[@]}"; do
+        log_info "  [$((i+1))] sha256:${manifest_digests[$i]:0:12}..."
     done
 
-    if [ ${#chain_digests[@]} -eq 0 ]; then
-        log_warn "Could not extract digests from snapshot chain"
-
-        if [ "$STRICT_MODE" = "true" ]; then
-            log_error "STRICT MODE: Cannot verify VMDK layer order without chain digests"
-            return 1
-        fi
-
-        # Fall back to file timestamp verification
-        log_info "Falling back to file timestamp verification..."
-
-        local prev_mtime=999999999999
-        local order_valid=true
-
-        for digest in "${vmdk_digests[@]}"; do
-            local layer_file
-            layer_file=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "sha256-${digest}.erofs" 2>/dev/null | head -1)
-
-            if [ -n "$layer_file" ]; then
-                local mtime
-                mtime=$(stat -c %Y "$layer_file" 2>/dev/null || echo 0)
-
-                # For proper ordering, later extents (older/base layers) should have <= mtime
-                if [ $mtime -gt $prev_mtime ]; then
-                    log_warn "Layer ${digest:0:12} (mtime: $mtime) is newer than previous layer (mtime: $prev_mtime)"
-                    log_warn "This may indicate incorrect layer ordering"
-                    order_valid=false
-                fi
-                prev_mtime=$mtime
-            fi
-        done
-
-        if [ "$order_valid" = "true" ]; then
-            log_info "✓ Layer file timestamps consistent with expected order"
-        else
-            log_warn "⚠ Layer timestamps suggest possible ordering issue"
-        fi
-
-        log_info "✓ VMDK structure verified (chain walk unavailable, used timestamp fallback)"
-        return 0
-    fi
-
-    log_info "Snapshot chain order (${#chain_digests[@]} layers, newest→oldest):"
-    for i in "${!chain_digests[@]}"; do
-        log_info "  [$((i+1))] sha256:${chain_digests[$i]:0:12}..."
-    done
+    # Use manifest digests as the expected order
+    local -a chain_digests=("${manifest_digests[@]}")
 
     # =========================================================================
-    # Step 6: Compare VMDK order with snapshot chain order - MUST MATCH
+    # Step 6: Compare VMDK order with manifest order - MUST MATCH
     # =========================================================================
-    log_info "Comparing VMDK order with snapshot chain..."
+    log_info "Comparing VMDK order with manifest..."
 
     local mismatch=false
     local min_count=${#vmdk_digests[@]}
@@ -1351,8 +1267,8 @@ test_vmdk_layer_order() {
 
         if [ "$vmdk_digest" != "$chain_digest" ]; then
             log_error "LAYER ORDER MISMATCH at position $((i+1)):"
-            log_error "  VMDK has:  sha256:${vmdk_digest:0:12}..."
-            log_error "  Chain has: sha256:${chain_digest:0:12}..."
+            log_error "  VMDK has:     sha256:${vmdk_digest:0:12}..."
+            log_error "  Manifest has: sha256:${chain_digest:0:12}..."
             mismatch=true
         else
             log_debug "  Position $((i+1)) matches: sha256:${vmdk_digest:0:12}..."
@@ -1360,12 +1276,12 @@ test_vmdk_layer_order() {
     done
 
     if [ ${#vmdk_digests[@]} -ne ${#chain_digests[@]} ]; then
-        log_warn "Layer count differs: VMDK has ${#vmdk_digests[@]}, chain has ${#chain_digests[@]}"
+        log_warn "Layer count differs: VMDK has ${#vmdk_digests[@]}, manifest has ${#chain_digests[@]}"
     fi
 
     if [ "$mismatch" = "true" ]; then
         log_error "=========================================="
-        log_error "CRITICAL: VMDK layer order does not match snapshot chain!"
+        log_error "CRITICAL: VMDK layer order does not match manifest!"
         log_error "The VM will likely fail to boot or have incorrect filesystem contents."
         log_error "=========================================="
 
@@ -1375,7 +1291,7 @@ test_vmdk_layer_order() {
         echo "──────────────────────────────────────────"
         cat "$vmdk_file"
         echo ""
-        echo "Expected layer order (from snapshot chain):"
+        echo "Expected layer order (from manifest):"
         echo "──────────────────────────────────────────"
         printf "  0. fsmeta.erofs\n"
         for i in "${!chain_digests[@]}"; do
@@ -1392,7 +1308,7 @@ test_vmdk_layer_order() {
         return 1
     fi
 
-    log_info "✓ VMDK layer order matches snapshot chain - VM should boot correctly"
+    log_info "✓ VMDK layer order matches manifest - VM should boot correctly"
     return 0
 }
 

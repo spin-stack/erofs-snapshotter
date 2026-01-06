@@ -113,3 +113,34 @@ func ReverseDigests(digests []string) []string {
 	}
 	return reversed
 }
+
+// ParseLayerManifest reads a layer manifest file and returns the digests in VMDK order.
+// The manifest file contains one digest per line (sha256:hex...), newest layer first.
+// This is the authoritative source for verifying VMDK layer order.
+func ParseLayerManifest(manifestPath string) ([]string, error) {
+	f, err := os.Open(manifestPath)
+	if err != nil {
+		return nil, fmt.Errorf("open manifest: %w", err)
+	}
+	defer f.Close()
+
+	var digests []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		// Validate digest format
+		if !strings.HasPrefix(line, "sha256:") {
+			continue
+		}
+		digests = append(digests, line)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan manifest: %w", err)
+	}
+
+	return digests, nil
+}
