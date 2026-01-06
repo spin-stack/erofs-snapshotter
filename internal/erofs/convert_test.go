@@ -305,28 +305,28 @@ func TestBuildTarErofsArgs(t *testing.T) {
 			layerPath:     "/path/to/layer.erofs",
 			uuid:          "",
 			mkfsExtraOpts: nil,
-			wantArgs:      []string{"--tar=f", "--aufs", "--quiet", "-Enoinline_data", "/path/to/layer.erofs"},
+			wantArgs:      []string{"--tar=f", "--aufs", "--quiet", "-Enoinline_data", "--sort=none", "/path/to/layer.erofs"},
 		},
 		{
 			name:          "with uuid",
 			layerPath:     "/path/to/layer.erofs",
 			uuid:          "550e8400-e29b-41d4-a716-446655440000",
 			mkfsExtraOpts: nil,
-			wantArgs:      []string{"--tar=f", "--aufs", "--quiet", "-Enoinline_data", "-U", "550e8400-e29b-41d4-a716-446655440000", "/path/to/layer.erofs"},
+			wantArgs:      []string{"--tar=f", "--aufs", "--quiet", "-Enoinline_data", "--sort=none", "-U", "550e8400-e29b-41d4-a716-446655440000", "/path/to/layer.erofs"},
 		},
 		{
 			name:          "with extra options",
 			layerPath:     "/path/to/layer.erofs",
 			uuid:          "",
 			mkfsExtraOpts: []string{"-zlz4hc", "-C65536"},
-			wantArgs:      []string{"--tar=f", "--aufs", "--quiet", "-Enoinline_data", "-zlz4hc", "-C65536", "/path/to/layer.erofs"},
+			wantArgs:      []string{"--tar=f", "--aufs", "--quiet", "-Enoinline_data", "--sort=none", "-zlz4hc", "-C65536", "/path/to/layer.erofs"},
 		},
 		{
 			name:          "with uuid and extra options",
 			layerPath:     "/path/to/layer.erofs",
 			uuid:          "550e8400-e29b-41d4-a716-446655440000",
 			mkfsExtraOpts: []string{"-zlz4hc", "12", "-C65536"},
-			wantArgs:      []string{"--tar=f", "--aufs", "--quiet", "-Enoinline_data", "-zlz4hc", "12", "-C65536", "-U", "550e8400-e29b-41d4-a716-446655440000", "/path/to/layer.erofs"},
+			wantArgs:      []string{"--tar=f", "--aufs", "--quiet", "-Enoinline_data", "--sort=none", "-zlz4hc", "12", "-C65536", "-U", "550e8400-e29b-41d4-a716-446655440000", "/path/to/layer.erofs"},
 		},
 	}
 

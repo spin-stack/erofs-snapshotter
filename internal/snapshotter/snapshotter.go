@@ -751,9 +751,13 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, snapIDs []string) {
 		blobs = append(blobs, blob)
 	}
 	tmpMergedMeta := mergedMeta + ".tmp"
-	// Use rebuild mode (no --aufs) to generate flatdev fsmeta with mapped_blkaddr.
-	// This allows the consumer to consolidate layers into a single VMDK device.
-	args := append([]string{"--quiet", tmpMergedMeta}, blobs...)
+	vmdkFile := s.vmdkPath(snapIDs[0])
+	tmpVmdkFile := vmdkFile + ".tmp"
+
+	// Use rebuild mode to generate flatdev fsmeta with mapped_blkaddr.
+	// The --vmdk-desc option generates both fsmeta and VMDK descriptor in one step.
+	// This allows QEMU to present all layers as a single concatenated block device.
+	args := append([]string{"--quiet", "--vmdk-desc=" + tmpVmdkFile, tmpMergedMeta}, blobs...)
 	log.G(ctx).Infof("merging layers with mkfs.erofs %v", args)
 	cmd := exec.CommandContext(ctx, "mkfs.erofs", args...)
 	out, err := cmd.CombinedOutput()
@@ -761,19 +765,14 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, snapIDs []string) {
 		log.G(ctx).Warnf("failed to generate merged fsmeta for %v: %q: %v", snapIDs[0], string(out), err)
 		return
 	}
-	// Atomically replace the fsmeta with the generated file
+
+	// Atomically replace the fsmeta and VMDK with the generated files
 	if err = os.Rename(tmpMergedMeta, mergedMeta); err != nil {
 		log.G(ctx).Errorf("failed to rename fsmeta: %v", err)
 		return
 	}
-
-	// Generate VMDK descriptor that references fsmeta + all layer blobs.
-	// This allows QEMU to present them as a single concatenated block device.
-	vmdkFile := s.vmdkPath(snapIDs[0])
-	vmdkDevices := append([]string{mergedMeta}, blobs...)
-	if err = erofsutils.WriteVMDKDescriptorToFile(vmdkFile, vmdkDevices); err != nil {
-		log.G(ctx).Errorf("failed to generate VMDK descriptor: %v", err)
-		// Clean up fsmeta since VMDK generation failed
+	if err = os.Rename(tmpVmdkFile, vmdkFile); err != nil {
+		log.G(ctx).Errorf("failed to rename vmdk: %v", err)
 		_ = os.Remove(mergedMeta)
 		return
 	}

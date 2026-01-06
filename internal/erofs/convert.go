@@ -36,10 +36,14 @@ import (
 // buildTarErofsArgs constructs the command-line arguments for mkfs.erofs
 // when converting a tar stream to an EROFS image.
 //
-// The arguments follow the pattern: --tar=f --aufs --quiet -Enoinline_data [extraOpts] [-U uuid] FILE
+// The arguments follow the pattern: --tar=f --aufs --quiet -Enoinline_data --sort=none [extraOpts] [-U uuid] FILE
 // When no SOURCE is specified after FILE, mkfs.erofs reads from stdin automatically.
+//
+// The --sort=none option avoids unnecessary data writes when strict data order is not required.
+// It takes effect when -Enoinline_data is specified and no compression is applied (the default).
+// See: https://www.mail-archive.com/linux-erofs@lists.ozlabs.org/msg11685.html
 func buildTarErofsArgs(layerPath, uuid string, mkfsExtraOpts []string) []string {
-	args := append([]string{"--tar=f", "--aufs", "--quiet", "-Enoinline_data"}, mkfsExtraOpts...)
+	args := append([]string{"--tar=f", "--aufs", "--quiet", "-Enoinline_data", "--sort=none"}, mkfsExtraOpts...)
 	if uuid != "" {
 		args = append(args, "-U", uuid)
 	}
