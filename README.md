@@ -59,7 +59,7 @@ When pulling an image, containerd calls the snapshotter to prepare space for eac
 3. Commit("layer-sha256:abc...", "extract-sha256:abc...")
    ├── Runs mkfs.erofs to convert directory → layer.erofs
    ├── Unmounts ext4
-   └── Generates fsmeta.erofs + merged.vmdk for multi-layer images
+   └── Generates fsmeta.erofs + merged.vmdk (for multi-layer images)
 ```
 
 ### Container Run
@@ -67,12 +67,17 @@ When pulling an image, containerd calls the snapshotter to prepare space for eac
 When running a container, the snapshotter returns raw file paths:
 
 ```go
-// View (read-only) - returns VMDK pointing to all EROFS layers
+// View (read-only) with VMDK - single fsmeta mount
+// VM runtime detects merged.vmdk in same directory and uses it
 []mount.Mount{{
     Type:   "erofs",
     Source: "/var/lib/nexuserofs/snapshots/123/fsmeta.erofs",
-    // VM runtime detects merged.vmdk in same directory
 }}
+
+// View (read-only) without VMDK (single layer) - returns EROFS layer directly
+[]mount.Mount{
+    {Type: "erofs", Source: "/path/to/layer.erofs", Options: []string{"ro"}},
+}
 
 // Active (with writable layer) - returns EROFS layers + ext4 file
 []mount.Mount{
@@ -86,7 +91,7 @@ The VM runtime (qemubox) passes these as virtio-blk devices. The guest VM mounts
 
 ### VMDK: Single Virtual Disk for Multiple Layers
 
-For images with multiple layers, nexuserofs generates a **VMDK descriptor** that concatenates:
+For multi-layer images, nexuserofs generates a **VMDK descriptor** that concatenates:
 - `fsmeta.erofs` - Metadata-only EROFS referencing all layer blobs
 - `layer1.erofs`, `layer2.erofs`, ... - Individual layer blobs
 
@@ -107,7 +112,9 @@ Guest sees: /dev/vda (single device containing entire image)
 Creating a new image from a running container:
 
 ```bash
-nerdctl commit --snapshotter nexuserofs container-name docker.io/user/image:tag
+nerdctl --address /var/run/qemubox/containerd.sock \
+    commit --snapshotter nexuserofs \
+    container-name docker.io/user/image:tag
 ```
 
 Flow:
@@ -235,7 +242,6 @@ version = 2
 | `--address` | `/run/nexuserofs-snapshotter/snapshotter.sock` | Unix socket address |
 | `--containerd-address` | `/run/containerd/containerd.sock` | containerd socket |
 | `--default-size` | `64M` | Size of ext4 writable layer |
-| `--fs-merge-threshold` | `5` | Layer count threshold for generating fsmeta+VMDK (0 to disable) |
 | `--enable-fsverity` | `false` | Enable fsverity for layer validation |
 | `--set-immutable` | `true` | Set immutable flag on committed layers |
 | `--mkfs-options` | | Extra options for mkfs.erofs (e.g., `-zlz4hc,12`) |

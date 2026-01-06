@@ -326,9 +326,9 @@ func TestErofsSnapshotterFsmetaSingleLayerView(t *testing.T) {
 
 	tempDir := t.TempDir()
 
-	// Create snapshotter with fsMergeThreshold=5 to trigger merge with 6 layers
+	// Create snapshotter - VMDK is always generated for multi-layer images
 	snapshotRoot := filepath.Join(tempDir, "snapshots")
-	s, err := NewSnapshotter(snapshotRoot, WithFsMergeThreshold(5))
+	s, err := NewSnapshotter(snapshotRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -669,12 +669,10 @@ func TestErofsViewMountsIdempotent(t *testing.T) {
 	}
 }
 
-// TestErofsBlockModeIgnoresFsMerge verifies that block mode does not use
-// fsMeta merge even when fsMergeThreshold is configured. Block mode always
-// returns individual EROFS mounts because fsMeta merge is not supported with
-// block-based writable layers.
-func TestErofsBlockModeIgnoresFsMerge(t *testing.T) {
-	env := newSnapshotTestEnv(t, WithDefaultSize(64*1024*1024), WithFsMergeThreshold(5))
+// TestErofsMultiLayerViewMounts verifies that multi-layer views return
+// multiple EROFS mounts (one per layer) for the VM runtime to handle.
+func TestErofsMultiLayerViewMounts(t *testing.T) {
+	env := newSnapshotTestEnv(t, WithDefaultSize(64*1024*1024))
 
 	// Create first layer with extract label
 	labels := map[string]string{extractLabel: "true"}
@@ -683,21 +681,12 @@ func TestErofsBlockModeIgnoresFsMerge(t *testing.T) {
 	// Create second layer on top with extract label
 	layer2Commit := env.createLayerWithLabels("layer2-active", layer1Commit, "file2.txt", "layer2", labels)
 
-	// Create a View with 2 parents - this would trigger fsMerge in directory mode
+	// Create a View with 2 parents
 	viewMounts := env.createView("view-test", layer2Commit)
 
 	t.Logf("view mounts: %+v", viewMounts)
 
-	// Verify no fsmeta was used (would have device= options)
-	for _, m := range viewMounts {
-		for _, opt := range m.Options {
-			if strings.HasPrefix(opt, "device=") {
-				t.Errorf("block mode should not use fsmeta device= options, got: %s", opt)
-			}
-		}
-	}
-
-	// Multi-layer views return multiple EROFS mounts (one per layer) for the consumer
+	// Multi-layer views return multiple EROFS mounts (one per layer) for the VM runtime
 	if len(viewMounts) != 2 {
 		t.Fatalf("expected 2 EROFS mounts (one per layer), got %d: %+v", len(viewMounts), viewMounts)
 	}

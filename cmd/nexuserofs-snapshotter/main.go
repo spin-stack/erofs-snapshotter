@@ -136,12 +136,6 @@ func main() {
 				Usage:   "Extra options for overlay mounts",
 				EnvVars: []string{"NEXUSEROFS_OVERLAY_OPTIONS"},
 			},
-			&cli.UintFlag{
-				Name:    "fs-merge-threshold",
-				Usage:   "Layer count threshold for generating fsmeta+VMDK (min 5, 0 to disable)",
-				Value:   5,
-				EnvVars: []string{"NEXUSEROFS_FS_MERGE_THRESHOLD"},
-			},
 		},
 		Action: run,
 	}
@@ -198,9 +192,6 @@ func run(cliCtx *cli.Context) error {
 	}
 	if opts := cliCtx.StringSlice("overlay-options"); len(opts) > 0 {
 		snapshotterOpts = append(snapshotterOpts, snapshotter.WithOvlOptions(opts))
-	}
-	if threshold := cliCtx.Uint("fs-merge-threshold"); threshold > 0 {
-		snapshotterOpts = append(snapshotterOpts, snapshotter.WithFsMergeThreshold(threshold))
 	}
 
 	// Create snapshotter

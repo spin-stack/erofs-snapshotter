@@ -246,16 +246,6 @@ func TestSnapshotterOptions(t *testing.T) {
 		}
 	})
 
-	t.Run("WithFsMergeThreshold", func(t *testing.T) {
-		config := &SnapshotterConfig{}
-		opt := WithFsMergeThreshold(5)
-		opt(config)
-
-		if config.fsMergeThreshold != 5 {
-			t.Errorf("expected fsMergeThreshold to be 5, got %d", config.fsMergeThreshold)
-		}
-	})
-
 }
 
 func TestSnapshotterPaths(t *testing.T) {
