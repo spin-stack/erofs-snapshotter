@@ -4,21 +4,21 @@
 
 version = 2
 
-# Register the external nexuserofs snapshotter
+# Register the external nexus-erofs snapshotter
 [proxy_plugins]
-  [proxy_plugins.nexuserofs]
+  [proxy_plugins.nexus-erofs]
     type = "snapshot"
-    address = "/run/nexuserofs-snapshotter/snapshotter.sock"
+    address = "/run/nexus-erofs-snapshotter/snapshotter.sock"
 
-  [proxy_plugins.nexuserofs-diff]
+  [proxy_plugins.nexus-erofs-diff]
     type = "diff"
-    address = "/run/nexuserofs-snapshotter/snapshotter.sock"
+    address = "/run/nexus-erofs-snapshotter/snapshotter.sock"
 
-# Optional: Use nexuserofs as the default snapshotter for CRI
+# Optional: Use nexus-erofs as the default snapshotter for CRI
 [plugins."io.containerd.cri.v1.images"]
-  snapshotter = "nexuserofs"
+  snapshotter = "nexus-erofs"
 
-# Optional: Configure the default runtime to use nexuserofs
+# Optional: Configure the default runtime to use nexus-erofs
 # [plugins."io.containerd.cri.v1.runtime"]
 #   [plugins."io.containerd.cri.v1.runtime".containerd]
-#     snapshotter = "nexuserofs"
+#     snapshotter = "nexus-erofs"

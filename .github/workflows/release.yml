@@ -73,13 +73,13 @@ jobs:
           BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           go build -trimpath \
             -ldflags "-s -w -X main.version=${{ steps.version.outputs.version }} -X main.gitCommit=${{ github.sha }} -X main.buildDate=${BUILD_DATE}" \
-            -o dist/nexuserofs-snapshotter-linux-${{ matrix.arch }} \
-            ./cmd/nexuserofs-snapshotter
+            -o dist/nexus-erofs-snapshotter-linux-${{ matrix.arch }} \
+            ./cmd/nexus-erofs-snapshotter
 
       - name: Upload snapshotter artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nexuserofs-snapshotter-linux-${{ matrix.arch }}
+          name: nexus-erofs-snapshotter-linux-${{ matrix.arch }}
           path: dist/*
 
   release:

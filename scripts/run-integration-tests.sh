@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run integration tests in Docker with containerd and nexuserofs snapshotter
+# Run integration tests in Docker with containerd and nexus-erofs snapshotter
 #
 # Usage:
 #   ./scripts/run-integration-tests.sh [options]
@@ -31,9 +31,9 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Default to published image on ghcr.io
 # Get repo name from git remote or use fallback
-REPO_NAME=$(git -C "${ROOT_DIR}" remote get-url origin 2>/dev/null | sed -E 's|.*github.com[:/]||; s|\.git$||' || echo "aledbf/nexuserofs")
+REPO_NAME=$(git -C "${ROOT_DIR}" remote get-url origin 2>/dev/null | sed -E 's|.*github.com[:/]||; s|\.git$||' || echo "aledbf/nexus-erofs")
 GHCR_IMAGE="ghcr.io/${REPO_NAME}/integration:latest"
-LOCAL_IMAGE="nexuserofs-integration"
+LOCAL_IMAGE="nexus-erofs-integration"
 
 IMAGE_NAME="${GHCR_IMAGE}"
 FORCE_BUILD=false
@@ -142,7 +142,7 @@ DOCKER_OPTS=(
     --tmpfs /tmp:exec
     --tmpfs /run:exec
     --tmpfs /var/lib/containerd-test:exec
-    --tmpfs /var/lib/nexuserofs-snapshotter:exec
+    --tmpfs /var/lib/nexus-erofs-snapshotter:exec
 )
 
 # Mount Docker credentials if available
@@ -156,7 +156,7 @@ if [[ "${KEEP_DATA}" == "true" ]]; then
     DOCKER_OPTS+=(-e CLEANUP_ON_EXIT=false)
     # Remove tmpfs mounts so data persists
     DOCKER_OPTS=("${DOCKER_OPTS[@]/--tmpfs \/var\/lib\/containerd-test:exec/}")
-    DOCKER_OPTS=("${DOCKER_OPTS[@]/--tmpfs \/var\/lib\/nexuserofs-snapshotter:exec/}")
+    DOCKER_OPTS=("${DOCKER_OPTS[@]/--tmpfs \/var\/lib\/nexus-erofs-snapshotter:exec/}")
 fi
 
 if [[ "${INTERACTIVE}" == "true" ]]; then

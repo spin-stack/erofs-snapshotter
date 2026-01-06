@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/aledbf/nexuserofs/internal/erofs"
+	"github.com/aledbf/nexus-erofs/internal/erofs"
 )
 
 // Snapshot directory structure constants.

@@ -9,7 +9,7 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 
-	"github.com/aledbf/nexuserofs/internal/erofs"
+	"github.com/aledbf/nexus-erofs/internal/erofs"
 )
 
 // mountFsMeta returns a mount for merged fsmeta.erofs if VMDK exists.

@@ -1,5 +1,5 @@
-nexuserofs - External EROFS Snapshotter for containerd
-Copyright 2024-2025 The nexuserofs Authors
+nexus-erofs - External EROFS Snapshotter for containerd
+Copyright 2024-2025 The nexus-erofs Authors
 
 This project contains code derived from containerd
 (https://github.com/containerd/containerd)

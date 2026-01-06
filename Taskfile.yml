@@ -3,7 +3,7 @@
 version: '3'
 
 vars:
-  BINARY: nexuserofs-snapshotter
+  BINARY: nexus-erofs-snapshotter
   VERSION:
     sh: git describe --tags --always --dirty 2>/dev/null || echo "dev"
   COMMIT:
@@ -12,7 +12,7 @@ vars:
     sh: date -u '+%Y-%m-%d_%H:%M:%S'
   LDFLAGS: -X main.version={{.VERSION}} -X main.commit={{.COMMIT}} -X main.buildTime={{.BUILD_TIME}}
   BIN_DIR: bin
-  CMD_DIR: cmd/nexuserofs-snapshotter
+  CMD_DIR: cmd/nexus-erofs-snapshotter
 
 tasks:
   default:

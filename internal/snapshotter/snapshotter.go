@@ -28,9 +28,9 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/log"
 
-	"github.com/aledbf/nexuserofs/internal/erofs"
-	"github.com/aledbf/nexuserofs/internal/fsverity"
-	"github.com/aledbf/nexuserofs/internal/stringutil"
+	"github.com/aledbf/nexus-erofs/internal/erofs"
+	"github.com/aledbf/nexus-erofs/internal/fsverity"
+	"github.com/aledbf/nexus-erofs/internal/stringutil"
 )
 
 // SnapshotterConfig is used to configure the erofs snapshotter instance

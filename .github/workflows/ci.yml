@@ -121,13 +121,13 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          go build -trimpath -ldflags "-s -w" -o nexuserofs-snapshotter-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/nexuserofs-snapshotter
+          go build -trimpath -ldflags "-s -w" -o nexus-erofs-snapshotter-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/nexus-erofs-snapshotter
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nexuserofs-snapshotter-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: nexuserofs-snapshotter-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: nexus-erofs-snapshotter-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: nexus-erofs-snapshotter-${{ matrix.goos }}-${{ matrix.goarch }}
 
   integration-test:
     runs-on: ubuntu-latest
@@ -145,7 +145,7 @@ jobs:
           context: .
           file: Dockerfile.integration
           load: true
-          tags: nexuserofs-integration:local
+          tags: nexus-erofs-integration:local
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -160,8 +160,8 @@ jobs:
             --tmpfs /tmp:exec \
             --tmpfs /run:exec \
             --tmpfs /var/lib/containerd-test:exec \
-            --tmpfs /var/lib/nexuserofs-snapshotter:exec \
-            nexuserofs-integration:local
+            --tmpfs /var/lib/nexus-erofs-snapshotter:exec \
+            nexus-erofs-integration:local
 
       - name: Upload logs on failure
         if: failure()

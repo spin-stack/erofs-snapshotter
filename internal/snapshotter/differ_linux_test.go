@@ -56,10 +56,10 @@ import (
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/sys/unix"
 
-	"github.com/aledbf/nexuserofs/internal/differ"
-	"github.com/aledbf/nexuserofs/internal/erofs"
-	"github.com/aledbf/nexuserofs/internal/mountutils"
-	"github.com/aledbf/nexuserofs/internal/preflight"
+	"github.com/aledbf/nexus-erofs/internal/differ"
+	"github.com/aledbf/nexus-erofs/internal/erofs"
+	"github.com/aledbf/nexus-erofs/internal/mountutils"
+	"github.com/aledbf/nexus-erofs/internal/preflight"
 )
 
 // Snapshot key constants used across tests

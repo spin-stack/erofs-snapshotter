@@ -30,7 +30,7 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 
-	"github.com/aledbf/nexuserofs/internal/stringutil"
+	"github.com/aledbf/nexus-erofs/internal/stringutil"
 )
 
 // buildTarErofsArgs constructs the command-line arguments for mkfs.erofs

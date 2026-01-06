@@ -15,8 +15,8 @@ import (
 	"github.com/containerd/log"
 	"github.com/moby/sys/mountinfo"
 
-	"github.com/aledbf/nexuserofs/internal/erofs"
-	"github.com/aledbf/nexuserofs/internal/fsverity"
+	"github.com/aledbf/nexus-erofs/internal/erofs"
+	"github.com/aledbf/nexus-erofs/internal/fsverity"
 )
 
 // commitBlock handles the conversion of a writable layer to EROFS.

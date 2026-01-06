@@ -23,7 +23,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/aledbf/nexuserofs/internal/loop"
+	"github.com/aledbf/nexus-erofs/internal/loop"
 	"github.com/containerd/containerd/v2/core/mount"
 )
 

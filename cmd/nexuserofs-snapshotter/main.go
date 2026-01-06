@@ -38,10 +38,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/grpclog"
 
-	"github.com/aledbf/nexuserofs/internal/differ"
-	"github.com/aledbf/nexuserofs/internal/preflight"
-	"github.com/aledbf/nexuserofs/internal/snapshotter"
-	"github.com/aledbf/nexuserofs/internal/store"
+	"github.com/aledbf/nexus-erofs/internal/differ"
+	"github.com/aledbf/nexus-erofs/internal/preflight"
+	"github.com/aledbf/nexus-erofs/internal/snapshotter"
+	"github.com/aledbf/nexus-erofs/internal/store"
 )
 
 // Version information - set via ldflags at build time
@@ -53,8 +53,8 @@ var (
 )
 
 const (
-	defaultAddress          = "/run/nexuserofs-snapshotter/snapshotter.sock"
-	defaultRoot             = "/var/lib/nexuserofs-snapshotter"
+	defaultAddress          = "/run/nexus-erofs-snapshotter/snapshotter.sock"
+	defaultRoot             = "/var/lib/nexus-erofs-snapshotter"
 	defaultContainerdSocket = "/run/containerd/containerd.sock"
 )
 
@@ -66,7 +66,7 @@ func main() {
 	}
 
 	app := &cli.App{
-		Name:    "nexuserofs-snapshotter",
+		Name:    "nexus-erofs-snapshotter",
 		Usage:   "External EROFS snapshotter for containerd",
 		Version: fmt.Sprintf("%s (commit: %s, built: %s)", version, gitCommit, buildDate),
 		Flags: []cli.Flag{
@@ -75,14 +75,14 @@ func main() {
 				Aliases: []string{"a"},
 				Usage:   "Address for the snapshotter socket",
 				Value:   defaultAddress,
-				EnvVars: []string{"NEXUSEROFS_SNAPSHOTTER_ADDRESS"},
+				EnvVars: []string{"nexus-erofs_SNAPSHOTTER_ADDRESS"},
 			},
 			&cli.StringFlag{
 				Name:    "root",
 				Aliases: []string{"r"},
 				Usage:   "Root directory for snapshotter data",
 				Value:   defaultRoot,
-				EnvVars: []string{"NEXUSEROFS_SNAPSHOTTER_ROOT"},
+				EnvVars: []string{"nexus-erofs_SNAPSHOTTER_ROOT"},
 			},
 			&cli.StringFlag{
 				Name:    "containerd-address",
@@ -106,24 +106,24 @@ func main() {
 				Name:    "default-size",
 				Usage:   "Size of ext4 writable layer in bytes (must be > 0)",
 				Value:   64 * 1024 * 1024, // 64 MiB
-				EnvVars: []string{"NEXUSEROFS_DEFAULT_SIZE"},
+				EnvVars: []string{"nexus-erofs_DEFAULT_SIZE"},
 			},
 			&cli.BoolFlag{
 				Name:    "enable-fsverity",
 				Usage:   "Enable fsverity for layer validation",
 				Value:   false,
-				EnvVars: []string{"NEXUSEROFS_ENABLE_FSVERITY"},
+				EnvVars: []string{"nexus-erofs_ENABLE_FSVERITY"},
 			},
 			&cli.BoolFlag{
 				Name:    "set-immutable",
 				Usage:   "Set immutable flag on committed layers",
 				Value:   true,
-				EnvVars: []string{"NEXUSEROFS_SET_IMMUTABLE"},
+				EnvVars: []string{"nexus-erofs_SET_IMMUTABLE"},
 			},
 			&cli.StringSliceFlag{
 				Name:    "mkfs-options",
 				Usage:   "Extra options for mkfs.erofs",
-				EnvVars: []string{"NEXUSEROFS_MKFS_OPTIONS"},
+				EnvVars: []string{"nexus-erofs_MKFS_OPTIONS"},
 			},
 		},
 		Action: run,

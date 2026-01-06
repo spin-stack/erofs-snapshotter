@@ -31,8 +31,8 @@ import (
 	"github.com/containerd/log"
 	"golang.org/x/sys/unix"
 
-	"github.com/aledbf/nexuserofs/internal/erofs"
-	"github.com/aledbf/nexuserofs/internal/preflight"
+	"github.com/aledbf/nexus-erofs/internal/erofs"
+	"github.com/aledbf/nexus-erofs/internal/preflight"
 )
 
 // defaultWritableSize is the default size for the ext4 writable layer.

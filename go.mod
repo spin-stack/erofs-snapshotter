@@ -1,4 +1,4 @@
-module github.com/aledbf/nexuserofs
+module github.com/aledbf/nexus-erofs
 
 go 1.25
 

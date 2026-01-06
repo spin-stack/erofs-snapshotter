@@ -35,8 +35,8 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/aledbf/nexuserofs/internal/cleanup"
-	"github.com/aledbf/nexuserofs/internal/mountutils"
+	"github.com/aledbf/nexus-erofs/internal/cleanup"
+	"github.com/aledbf/nexus-erofs/internal/mountutils"
 )
 
 // diffWriteFunc is a function that writes diff content to the provided writer.

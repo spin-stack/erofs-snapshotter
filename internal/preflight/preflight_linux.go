@@ -1,4 +1,4 @@
-// Package preflight provides system requirement checks for nexuserofs.
+// Package preflight provides system requirement checks for nexus-erofs.
 package preflight
 
 import (

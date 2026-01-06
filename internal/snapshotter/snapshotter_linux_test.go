@@ -63,10 +63,10 @@ import (
 	"github.com/containerd/containerd/v2/pkg/testutil"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/aledbf/nexuserofs/internal/fsverity"
-	"github.com/aledbf/nexuserofs/internal/loop"
-	"github.com/aledbf/nexuserofs/internal/mountutils"
-	"github.com/aledbf/nexuserofs/internal/preflight"
+	"github.com/aledbf/nexus-erofs/internal/fsverity"
+	"github.com/aledbf/nexus-erofs/internal/loop"
+	"github.com/aledbf/nexus-erofs/internal/mountutils"
+	"github.com/aledbf/nexus-erofs/internal/preflight"
 )
 
 // vmOnlySkipMessage is the skip message for tests that require host mounting.

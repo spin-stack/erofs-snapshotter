@@ -15,7 +15,7 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 
-	"github.com/aledbf/nexuserofs/internal/erofs"
+	"github.com/aledbf/nexus-erofs/internal/erofs"
 )
 
 // isExtractKey returns true if the key indicates an extract/unpack operation.
