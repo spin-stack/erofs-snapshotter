@@ -256,19 +256,6 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 			t.Fatalf("View failed: %v", err)
 		}
 
-		// Verify files using mount manager (mounts may have templates)
-		verifyFiles := func(root string, files map[string]string) {
-			for name, content := range files {
-				data, err := os.ReadFile(filepath.Join(root, name))
-				if err != nil {
-					t.Fatal(err)
-				}
-				if string(data) != content {
-					t.Fatalf("expected %s content %q, got %q", name, content, string(data))
-				}
-			}
-		}
-
 		// Mount and verify files
 		// View mounts may be overlay (with pre-mounted EROFS layers) or EROFS (single layer)
 		// For overlay mounts, mount directly. For EROFS mounts, use mountErofsView helper
@@ -295,17 +282,18 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 		var layerDirs []string
 		var overlayMounted bool
 
-		if len(erofsLayers) > 1 && !hasFsmetaMount {
+		switch {
+		case len(erofsLayers) > 1 && !hasFsmetaMount:
 			t.Logf("fsmeta merge failed, mounting %d individual EROFS layers with overlay", len(erofsLayers))
 			result := mountErofsLayersWithOverlay(t, erofsLayers, viewTarget)
 			t.Cleanup(result.cleanup)
 			layerDirs = result.layerDirs
 			overlayMounted = result.overlayMounted
-		} else if len(erofsLayers) > 0 {
+		case len(erofsLayers) > 0:
 			cleanup := mountErofsView(t, viewMounts, viewTarget)
 			t.Cleanup(cleanup)
 			overlayMounted = true
-		} else {
+		default:
 			// Direct mount for overlay mounts
 			if err := mount.All(viewMounts, viewTarget); err != nil {
 				t.Fatalf("mount.All failed: %v", err)
@@ -320,14 +308,14 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 
 		// Verify files - either from overlay mount or individual layers
 		if overlayMounted {
-			verifyFiles(viewTarget, baseFiles)
+			verifyFilesInDir(t, viewTarget, baseFiles)
 			if midFiles != nil {
-				verifyFiles(viewTarget, midFiles)
+				verifyFilesInDir(t, viewTarget, midFiles)
 			}
 			if topFiles != nil {
-				verifyFiles(viewTarget, topFiles)
+				verifyFilesInDir(t, viewTarget, topFiles)
 			}
-			verifyFiles(viewTarget, upperFiles)
+			verifyFilesInDir(t, viewTarget, upperFiles)
 		} else {
 			// Overlay mount failed - verify files exist in individual layers
 			// Layer 0 = newest (upper), Layer N-1 = oldest (base)
@@ -339,22 +327,7 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 				allFiles = append(allFiles, midFiles)
 			}
 			allFiles = append(allFiles, baseFiles)
-
-			for i, files := range allFiles {
-				if i >= len(layerDirs) {
-					t.Fatalf("not enough layers: need %d, have %d", i+1, len(layerDirs))
-				}
-				for name, content := range files {
-					data, err := os.ReadFile(filepath.Join(layerDirs[i], name))
-					if err != nil {
-						t.Fatalf("layer %d: failed to read %s: %v", i, name, err)
-					}
-					if string(data) != content {
-						t.Fatalf("layer %d: expected %s content %q, got %q", i, name, content, string(data))
-					}
-				}
-				t.Logf("layer %d verified: %v", i, files)
-			}
+			verifyFilesInLayers(t, layerDirs, allFiles)
 		}
 	}
 
@@ -1240,5 +1213,39 @@ func TestErofsConcurrentRemoveAndMounts(t *testing.T) {
 				t.Fatalf("iter %d: timeout waiting for concurrent operations", iter)
 			}
 		}
+	}
+}
+
+// verifyFilesInDir verifies that all files in the map exist with the expected content.
+func verifyFilesInDir(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	for name, content := range files {
+		data, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != content {
+			t.Fatalf("expected %s content %q, got %q", name, content, string(data))
+		}
+	}
+}
+
+// verifyFilesInLayers verifies files across separate layer directories when overlay mount fails.
+func verifyFilesInLayers(t *testing.T, layerDirs []string, fileLayers []map[string]string) {
+	t.Helper()
+	for i, files := range fileLayers {
+		if i >= len(layerDirs) {
+			t.Fatalf("not enough layers: need %d, have %d", i+1, len(layerDirs))
+		}
+		for name, content := range files {
+			data, err := os.ReadFile(filepath.Join(layerDirs[i], name))
+			if err != nil {
+				t.Fatalf("layer %d: failed to read %s: %v", i, name, err)
+			}
+			if string(data) != content {
+				t.Fatalf("layer %d: expected %s content %q, got %q", i, name, content, string(data))
+			}
+		}
+		t.Logf("layer %d verified: %v", i, files)
 	}
 }

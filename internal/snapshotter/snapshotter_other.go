@@ -52,3 +52,7 @@ func convertDirToErofs(ctx context.Context, layerBlob, upperDir string) error {
 func (s *snapshotter) cleanupOrphanedMounts() {
 	// No-op on non-Linux platforms
 }
+
+func (s *snapshotter) mountBlockRwLayer(ctx context.Context, id string) error {
+	return errdefs.ErrNotImplemented
+}

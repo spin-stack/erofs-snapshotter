@@ -105,8 +105,8 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 	}
 
 	// Mount with device= options pointing to loop devices
-	allOpts := append(otherOpts, deviceOpts...)
-	args := []string{"-t", "erofs", "-o", strings.Join(allOpts, ",")}
+	otherOpts = append(otherOpts, deviceOpts...)
+	args := []string{"-t", "erofs", "-o", strings.Join(otherOpts, ",")}
 	args = append(args, mainDev.Path, target)
 	cmd := exec.Command("mount", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
