@@ -121,20 +121,33 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          go build -trimpath -ldflags "-s -w" -o nexus-erofs-snapshotter-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/nexus-erofs-snapshotter
+          mkdir -p bin
+          go build -trimpath -ldflags "-s -w" -o bin/nexus-erofs-snapshotter ./cmd/nexus-erofs-snapshotter
+          go build -trimpath -ldflags "-s -w" -o bin/integration-commit ./cmd/integration-commit
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nexus-erofs-snapshotter-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: nexus-erofs-snapshotter-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: nexus-erofs-binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: bin/
 
   integration-test:
     runs-on: ubuntu-latest
-    needs: [lint, test]
+    needs: [lint, test, build]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: nexus-erofs-binaries-linux-amd64
+          path: bin/
+
+      - name: Prepare binaries
+        run: |
+          chmod +x bin/nexus-erofs-snapshotter bin/integration-commit
+          ls -la bin/
 
       - name: Pull integration test image
         run: |
@@ -148,6 +161,8 @@ jobs:
           docker run --privileged --rm \
             -v /dev:/dev \
             -v ${{ github.workspace }}:/workspace \
+            -v ${{ github.workspace }}/bin/nexus-erofs-snapshotter:/usr/local/bin/nexus-erofs-snapshotter \
+            -v ${{ github.workspace }}/bin/integration-commit:/usr/local/bin/integration-commit \
             -w /workspace \
             --tmpfs /tmp:exec \
             --tmpfs /run:exec \
