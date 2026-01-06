@@ -113,8 +113,8 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, snapIDs []string) {
 	// Collect blobs in newest-to-oldest order (same as ParentIDs/overlay lowerdir order).
 	// mkfs.erofs multidev mode expects layers ordered from top (newest) to bottom (oldest).
 	for _, snapID := range snapIDs {
-		blob := s.layerBlobPath(snapID)
-		if _, err := os.Stat(blob); err != nil {
+		blob, err := s.findLayerBlob(snapID)
+		if err != nil {
 			blobs = nil // Signal failure
 			return
 		}
@@ -168,11 +168,14 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 
 	// If the layer blob doesn't exist, which means this layer wasn't applied by
 	// the EROFS differ (possibly the walking differ), convert the upperdir instead.
-	layerBlob = s.layerBlobPath(id)
-	if _, err := os.Stat(layerBlob); err != nil {
+	// Use fallback naming since we don't have the original layer digest.
+	layerBlob, err = s.findLayerBlob(id)
+	if err != nil {
+		// Layer doesn't exist - create it using fallback path
+		layerBlob = s.fallbackLayerBlobPath(id)
 		if cerr := s.commitBlock(ctx, layerBlob, id); cerr != nil {
 			if errdefs.IsNotImplemented(cerr) {
-				return err
+				return fmt.Errorf("layer blob not found and fallback failed: %w", err)
 			}
 			return cerr
 		}

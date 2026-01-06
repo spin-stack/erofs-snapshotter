@@ -287,8 +287,33 @@ func TestConstants(t *testing.T) {
 	if ErofsLayerMarker != ".erofslayer" {
 		t.Errorf("ErofsLayerMarker = %q, want %q", ErofsLayerMarker, ".erofslayer")
 	}
-	if LayerBlobFilename != "layer.erofs" {
-		t.Errorf("LayerBlobFilename = %q, want %q", LayerBlobFilename, "layer.erofs")
+	if LayerBlobPattern != "sha256-*.erofs" {
+		t.Errorf("LayerBlobPattern = %q, want %q", LayerBlobPattern, "sha256-*.erofs")
+	}
+}
+
+func TestLayerBlobFilename(t *testing.T) {
+	tests := []struct {
+		digest string
+		want   string
+	}{
+		{
+			digest: "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4",
+			want:   "sha256-a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4.erofs",
+		},
+		{
+			digest: "sha256:abc123",
+			want:   "sha256-abc123.erofs",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.digest, func(t *testing.T) {
+			got := LayerBlobFilename(tc.digest)
+			if got != tc.want {
+				t.Errorf("LayerBlobFilename(%q) = %q, want %q", tc.digest, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -312,8 +312,10 @@ func TestErofsFsverity(t *testing.T) {
 	}
 
 	// Verify fsverity is enabled on the EROFS layer
-
-	layerPath := snap.layerBlobPath(id)
+	layerPath, err := snap.findLayerBlob(id)
+	if err != nil {
+		t.Fatalf("Failed to find layer blob: %v", err)
+	}
 
 	enabled, err := fsverity.IsEnabled(layerPath)
 	if err != nil {

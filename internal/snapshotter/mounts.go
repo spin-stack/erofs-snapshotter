@@ -43,8 +43,8 @@ func (s *snapshotter) mountFsMeta(snap storage.Snapshot) (mount.Mount, bool) {
 	// This matches the layer order expected by EROFS multidev mode.
 	var deviceOptions []string
 	for _, parentID := range snap.ParentIDs {
-		blob := s.layerBlobPath(parentID)
-		if _, err := os.Stat(blob); err != nil {
+		blob, err := s.findLayerBlob(parentID)
+		if err != nil {
 			return mount.Mount{}, false
 		}
 		deviceOptions = append(deviceOptions, "device="+blob)

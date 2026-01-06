@@ -458,9 +458,12 @@ func TestErofsCommitWithoutHostMount(t *testing.T) {
 	}
 
 	// Verify the layer blob was created
-	layerBlob := snap.layerBlobPath(vmID)
-	if _, err := os.Stat(layerBlob); err != nil {
+	layerBlob, err := snap.findLayerBlob(vmID)
+	if err != nil {
 		t.Fatalf("layer blob should exist after commit: %v", err)
+	}
+	if _, err := os.Stat(layerBlob); err != nil {
+		t.Fatalf("layer blob path should be valid: %v", err)
 	}
 
 	t.Logf("Successfully committed VM-only snapshot without pre-existing /rw directory")
@@ -947,7 +950,10 @@ func TestErofsImmutableFlagOnCommit(t *testing.T) {
 	t.Logf("committed snapshot info: %+v", info)
 
 	// Verify the layer blob has immutable flag
-	layerBlob := env.snapshotter.layerBlobPath(snapshotID(env.ctx(), t, env.snapshotter, "layer1-active-commit"))
+	layerBlob, err := env.snapshotter.findLayerBlob(snapshotID(env.ctx(), t, env.snapshotter, "layer1-active-commit"))
+	if err != nil {
+		t.Fatalf("failed to find layer blob: %v", err)
+	}
 	if _, err := os.Stat(layerBlob); err != nil {
 		t.Fatalf("layer blob not found at %s: %v", layerBlob, err)
 	}
@@ -981,7 +987,10 @@ func TestErofsImmutableFlagClearedOnRemove(t *testing.T) {
 	commitKey := env.createLayerWithLabels("layer1-active", "", "test.txt", "content", labels)
 
 	// Get the layer blob path before removal
-	layerBlob := env.snapshotter.layerBlobPath(snapshotID(env.ctx(), t, env.snapshotter, commitKey))
+	layerBlob, err := env.snapshotter.findLayerBlob(snapshotID(env.ctx(), t, env.snapshotter, commitKey))
+	if err != nil {
+		t.Fatalf("failed to find layer blob: %v", err)
+	}
 
 	// Remove the snapshot - this should clear the immutable flag first
 	if err := env.snapshotter.Remove(env.ctx(), commitKey); err != nil {
@@ -994,7 +1003,7 @@ func TestErofsImmutableFlagClearedOnRemove(t *testing.T) {
 	}
 
 	// Verify snapshot is gone
-	_, err := env.snapshotter.Stat(env.ctx(), commitKey)
+	_, err = env.snapshotter.Stat(env.ctx(), commitKey)
 	if err == nil {
 		t.Error("expected snapshot to be removed")
 	}

@@ -377,9 +377,13 @@ const (
 	// EROFS snapshotter layer.
 	ErofsLayerMarker = ".erofslayer"
 
-	// LayerBlobFilename is the filename for EROFS layer blobs within
-	// a snapshot directory.
-	LayerBlobFilename = "layer.erofs"
+	// LayerBlobPattern is the glob pattern for finding EROFS layer blobs
+	// within a snapshot directory. Layer files are named using their
+	// content digest (e.g., sha256-abc123...erofs).
+	LayerBlobPattern = "sha256-*.erofs"
+
+	// layerBlobExtension is the file extension for EROFS layer blobs.
+	layerBlobExtension = ".erofs"
 
 	// erofsMinBlockSizeForFsmeta is the minimum block size required for fsmeta merge.
 	// Layers created with tar index mode use 512-byte chunks which are incompatible
@@ -443,4 +447,14 @@ func CanMergeFsmeta(layerPaths []string) bool {
 		}
 	}
 	return true
+}
+
+// LayerBlobFilename returns the filename for an EROFS layer blob based on its digest.
+// The digest format "sha256:abc123..." is converted to "sha256-abc123....erofs".
+// This allows easy correlation between layer files and container registry manifests.
+func LayerBlobFilename(digest string) string {
+	// Replace ":" with "-" to make it filesystem-safe
+	// sha256:abc123... -> sha256-abc123....erofs
+	safeName := strings.ReplaceAll(digest, ":", "-")
+	return safeName + layerBlobExtension
 }

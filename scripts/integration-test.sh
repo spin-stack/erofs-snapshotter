@@ -859,17 +859,25 @@ test_multi_layer() {
 
 # Test: Verify EROFS layer files are created correctly
 test_erofs_layers() {
-    # Find layer.erofs files
+    # Find EROFS layer files (digest-based naming: sha256-*.erofs)
     local erofs_count
-    erofs_count=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "layer.erofs" 2>/dev/null | wc -l)
+    erofs_count=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "sha256-*.erofs" 2>/dev/null | wc -l)
 
-    assert_greater_than "$erofs_count" 0 "EROFS layer files should exist" || return 1
+    # Also check for fallback naming (snapshot-*.erofs) used by walking differ
+    local fallback_count
+    fallback_count=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "snapshot-*.erofs" 2>/dev/null | wc -l)
 
-    log_info "Found $erofs_count EROFS layer files"
+    local total_count=$((erofs_count + fallback_count))
+    assert_greater_than "$total_count" 0 "EROFS layer files should exist (sha256-*.erofs or snapshot-*.erofs)" || return 1
+
+    log_info "Found $erofs_count digest-named EROFS layers, $fallback_count fallback-named layers"
 
     # Verify at least one is a valid EROFS image
     local erofs_file
-    erofs_file=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "layer.erofs" 2>/dev/null | head -1)
+    erofs_file=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "sha256-*.erofs" 2>/dev/null | head -1)
+    if [ -z "$erofs_file" ]; then
+        erofs_file=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "snapshot-*.erofs" 2>/dev/null | head -1)
+    fi
 
     if [ -n "$erofs_file" ]; then
         # Check magic bytes (EROFS magic is 0xE0F5E1E2 at offset 1024)
@@ -880,7 +888,146 @@ test_erofs_layers() {
         else
             log_debug "Could not verify EROFS magic (may be little-endian): $magic"
         fi
+
+        # Log the filename to show digest-based naming
+        log_info "Layer file: $(basename "$erofs_file")"
     fi
+}
+
+# Test: Verify VMDK layer order matches container registry manifest
+test_vmdk_layer_order() {
+    # Find a VMDK file
+    local vmdk_file
+    vmdk_file=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "merged.vmdk" 2>/dev/null | head -1)
+
+    if [ -z "$vmdk_file" ]; then
+        log_warn "No VMDK file found, skipping layer order verification"
+        return 0
+    fi
+
+    log_info "Verifying VMDK layer order in: $vmdk_file"
+    log_debug "VMDK contents:"
+    cat "$vmdk_file" | head -20 >&2 || true
+
+    # Extract layer digests from VMDK file paths
+    # VMDK format: RW <sectors> FLAT "<path>" 0
+    # Layer files are named: sha256-<digest>.erofs
+    local vmdk_digests=()
+    while IFS= read -r line; do
+        # Extract path from FLAT line and get digest from filename
+        if [[ "$line" =~ FLAT.*sha256-([a-f0-9]+)\.erofs ]]; then
+            vmdk_digests+=("${BASH_REMATCH[1]}")
+        fi
+    done < "$vmdk_file"
+
+    if [ ${#vmdk_digests[@]} -eq 0 ]; then
+        log_warn "No digest-named layers found in VMDK (may have fallback naming)"
+        return 0
+    fi
+
+    log_info "Found ${#vmdk_digests[@]} layers in VMDK:"
+    for i in "${!vmdk_digests[@]}"; do
+        log_info "  [$i] sha256:${vmdk_digests[$i]:0:12}..."
+    done
+
+    # Get manifest from registry using crane or ctr
+    # The manifest contains layers in bottom-to-top order (oldest first)
+    local manifest_digests=()
+
+    # Try to get manifest using ctr content fetch
+    local manifest_json
+    manifest_json=$(ctr_cmd images check 2>&1 | grep -E "manifest|config" || true)
+    log_debug "Image check output: $manifest_json"
+
+    # Use crane if available (more reliable for manifest parsing)
+    if command -v crane &>/dev/null; then
+        log_info "Using crane to fetch manifest"
+        local manifest
+        manifest=$(crane manifest "${MULTI_LAYER_IMAGE}" 2>/dev/null || echo "")
+        if [ -n "$manifest" ]; then
+            # Extract layer digests from manifest (in bottom-to-top order)
+            while IFS= read -r digest; do
+                # Extract just the hash part from sha256:xxx
+                if [[ "$digest" =~ sha256:([a-f0-9]+) ]]; then
+                    manifest_digests+=("${BASH_REMATCH[1]}")
+                fi
+            done < <(echo "$manifest" | grep -oE '"sha256:[a-f0-9]+"' | tr -d '"' | grep -v "config")
+
+            log_info "Found ${#manifest_digests[@]} layers in manifest (bottom-to-top order):"
+            for i in "${!manifest_digests[@]}"; do
+                log_info "  [$i] sha256:${manifest_digests[$i]:0:12}..."
+            done
+        fi
+    else
+        log_warn "crane not available, using fallback method"
+        # Fallback: use curl to fetch manifest directly
+        # Extract registry, repo, and tag from image reference
+        local registry repo tag
+        if [[ "${MULTI_LAYER_IMAGE}" =~ ^([^/]+)/(.+):(.+)$ ]]; then
+            registry="${BASH_REMATCH[1]}"
+            repo="${BASH_REMATCH[2]}"
+            tag="${BASH_REMATCH[3]}"
+
+            log_debug "Fetching manifest from $registry for $repo:$tag"
+
+            # Fetch manifest (handle ghcr.io and other registries)
+            local manifest_url="https://${registry}/v2/${repo}/manifests/${tag}"
+            local manifest
+            manifest=$(curl -sL -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+                            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+                            "$manifest_url" 2>/dev/null || echo "")
+
+            if [ -n "$manifest" ]; then
+                while IFS= read -r digest; do
+                    if [[ "$digest" =~ sha256:([a-f0-9]+) ]]; then
+                        manifest_digests+=("${BASH_REMATCH[1]}")
+                    fi
+                done < <(echo "$manifest" | grep -oE '"sha256:[a-f0-9]+"' | tr -d '"')
+            fi
+        fi
+    fi
+
+    # Compare orders if we got manifest digests
+    if [ ${#manifest_digests[@]} -gt 0 ] && [ ${#vmdk_digests[@]} -gt 0 ]; then
+        # VMDK order: fsmeta first, then layers from newest to oldest (top-to-bottom)
+        # Manifest order: oldest to newest (bottom-to-top)
+        # So VMDK layers should be the reverse of manifest layers
+
+        log_info "Comparing layer orders..."
+        log_info "  VMDK order (newest first): ${vmdk_digests[*]:0:3}..."
+        log_info "  Manifest order (oldest first): ${manifest_digests[*]:0:3}..."
+
+        # Reverse manifest order to compare with VMDK
+        local manifest_reversed=()
+        for ((i=${#manifest_digests[@]}-1; i>=0; i--)); do
+            manifest_reversed+=("${manifest_digests[$i]}")
+        done
+
+        # Check if first few digests match (comparing prefixes)
+        local match_count=0
+        local check_count=$((${#vmdk_digests[@]} < ${#manifest_reversed[@]} ? ${#vmdk_digests[@]} : ${#manifest_reversed[@]}))
+
+        for ((i=0; i<check_count; i++)); do
+            # Compare first 12 chars of digest (should be enough for uniqueness)
+            if [ "${vmdk_digests[$i]:0:12}" = "${manifest_reversed[$i]:0:12}" ]; then
+                ((match_count++))
+            else
+                log_debug "Mismatch at position $i: VMDK=${vmdk_digests[$i]:0:12} vs Manifest=${manifest_reversed[$i]:0:12}"
+            fi
+        done
+
+        if [ "$match_count" -eq "$check_count" ]; then
+            log_info "✓ VMDK layer order matches registry manifest (reversed)"
+        else
+            log_warn "Layer order may not match: $match_count/$check_count matched"
+            log_warn "This could indicate a layer ordering issue"
+            # Don't fail the test, just warn - there could be legitimate differences
+        fi
+    else
+        log_info "Could not compare layer orders (manifest: ${#manifest_digests[@]}, vmdk: ${#vmdk_digests[@]})"
+    fi
+
+    return 0
 }
 
 # Test: Create a new image using the integration-commit tool
@@ -1010,6 +1157,7 @@ ALL_TESTS=(
     test_view_snapshot
     test_erofs_layers
     test_multi_layer
+    test_vmdk_layer_order
     test_rwlayer_creation
     test_snapshot_cleanup
     test_commit

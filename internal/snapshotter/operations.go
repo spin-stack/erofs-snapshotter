@@ -239,9 +239,11 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 
 		// The layer blob is only persisted for committed snapshots.
 		if k == snapshots.KindCommitted {
-			err = setImmutable(s.layerBlobPath(id), false)
-			if err != nil && !errdefs.IsNotImplemented(err) {
-				return fmt.Errorf("clear IMMUTABLE_FL: %w", err)
+			if layerBlob, ferr := s.findLayerBlob(id); ferr == nil {
+				err = setImmutable(layerBlob, false)
+				if err != nil && !errdefs.IsNotImplemented(err) {
+					return fmt.Errorf("clear IMMUTABLE_FL: %w", err)
+				}
 			}
 		}
 		return nil
@@ -280,8 +282,21 @@ func (s *snapshotter) Cleanup(ctx context.Context) (err error) {
 			log.G(ctx).WithError(err).WithField("path", dir).Debug("failed to cleanup block rw mount")
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("cleanup rw %s: %w", dir, err))
 		}
-		if err := setImmutable(filepath.Join(dir, erofs.LayerBlobFilename), false); err != nil && !errdefs.IsNotImplemented(err) {
-			log.G(ctx).WithError(err).WithField("path", dir).Debug("failed to clear immutable flag")
+		// Clear immutable flag on any layer blobs (digest-based or fallback naming)
+		if matches, err := filepath.Glob(filepath.Join(dir, erofs.LayerBlobPattern)); err == nil {
+			for _, match := range matches {
+				if err := setImmutable(match, false); err != nil && !errdefs.IsNotImplemented(err) {
+					log.G(ctx).WithError(err).WithField("path", match).Debug("failed to clear immutable flag")
+				}
+			}
+		}
+		// Also try fallback naming pattern
+		if matches, err := filepath.Glob(filepath.Join(dir, "snapshot-*.erofs")); err == nil {
+			for _, match := range matches {
+				if err := setImmutable(match, false); err != nil && !errdefs.IsNotImplemented(err) {
+					log.G(ctx).WithError(err).WithField("path", match).Debug("failed to clear immutable flag")
+				}
+			}
 		}
 		if err := os.RemoveAll(dir); err != nil {
 			log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to remove directory")

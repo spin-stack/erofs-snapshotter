@@ -8,6 +8,12 @@ import (
 	"github.com/aledbf/nexus-erofs/internal/erofs"
 )
 
+const (
+	// fallbackLayerPrefix is used for layers created by the walking differ fallback
+	// when the original layer digest is not available.
+	fallbackLayerPrefix = "snapshot-"
+)
+
 // Snapshot directory structure constants.
 const (
 	// snapshotsDirName is the name of the directory containing all snapshots.
@@ -55,9 +61,35 @@ func (s *snapshotter) blockUpperPath(id string) string {
 	return filepath.Join(s.blockRwMountPath(id), upperDirName)
 }
 
-// layerBlobPath returns the path to a committed EROFS layer blob.
-func (s *snapshotter) layerBlobPath(id string) string {
-	return filepath.Join(s.root, snapshotsDirName, id, erofs.LayerBlobFilename)
+// findLayerBlob finds the EROFS layer blob in a snapshot directory.
+// Layer blobs are named using their content digest (sha256-xxx.erofs) or
+// the snapshot ID for walking differ fallback (snapshot-xxx.erofs).
+// Returns the path if found, or an error if no layer blob exists.
+func (s *snapshotter) findLayerBlob(id string) (string, error) {
+	dir := filepath.Join(s.root, snapshotsDirName, id)
+
+	// First try digest-based naming (primary path via EROFS differ)
+	matches, err := filepath.Glob(filepath.Join(dir, erofs.LayerBlobPattern))
+	if err != nil {
+		return "", fmt.Errorf("glob layer blob: %w", err)
+	}
+	if len(matches) > 0 {
+		return matches[0], nil
+	}
+
+	// Try fallback naming (walking differ creates these)
+	fallbackPath := filepath.Join(dir, fallbackLayerPrefix+id+".erofs")
+	if _, err := os.Stat(fallbackPath); err == nil {
+		return fallbackPath, nil
+	}
+
+	return "", fmt.Errorf("no layer blob found in %s", dir)
+}
+
+// fallbackLayerBlobPath returns the path for creating a layer blob when the
+// digest is not available (walking differ fallback). Uses the snapshot ID.
+func (s *snapshotter) fallbackLayerBlobPath(id string) string {
+	return filepath.Join(s.root, snapshotsDirName, id, fallbackLayerPrefix+id+".erofs")
 }
 
 // fsMetaPath returns the path to the merged fsmeta.erofs file.
@@ -87,8 +119,8 @@ func (s *snapshotter) snapshotsDir() string {
 
 // lowerPath returns the EROFS layer blob path for a snapshot, validating it exists.
 func (s *snapshotter) lowerPath(id string) (string, error) {
-	layerBlob := s.layerBlobPath(id)
-	if _, err := os.Stat(layerBlob); err != nil {
+	layerBlob, err := s.findLayerBlob(id)
+	if err != nil {
 		return "", fmt.Errorf("failed to find valid erofs layer blob: %w", err)
 	}
 

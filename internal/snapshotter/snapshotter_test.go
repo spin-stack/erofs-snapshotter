@@ -251,9 +251,10 @@ func TestMountFsMetaReturnsFormatErofs(t *testing.T) {
 	}
 
 	// Create required files for mountFsMeta to succeed
+	// Use digest-based naming for layer file (as the differ now creates)
 	vmdkPath := filepath.Join(snapshotDir, "merged.vmdk")
 	fsmetaPath := filepath.Join(snapshotDir, "fsmeta.erofs")
-	layerPath := filepath.Join(snapshotDir, "layer.erofs")
+	layerPath := filepath.Join(snapshotDir, "sha256-a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4.erofs")
 
 	for _, path := range []string{vmdkPath, fsmetaPath, layerPath} {
 		if err := os.WriteFile(path, []byte("fake"), 0644); err != nil {
@@ -315,11 +316,18 @@ func TestSnapshotterPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("layerBlobPath", func(t *testing.T) {
-		got := s.layerBlobPath("123")
-		want := filepath.Join(root, "snapshots", "123", "layer.erofs")
+	t.Run("fallbackLayerBlobPath", func(t *testing.T) {
+		got := s.fallbackLayerBlobPath("123")
+		want := filepath.Join(root, "snapshots", "123", "snapshot-123.erofs")
 		if got != want {
-			t.Errorf("layerBlobPath(123) = %q, want %q", got, want)
+			t.Errorf("fallbackLayerBlobPath(123) = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("findLayerBlob_notFound", func(t *testing.T) {
+		_, err := s.findLayerBlob("nonexistent")
+		if err == nil {
+			t.Error("findLayerBlob(nonexistent) should return error")
 		}
 	})
 

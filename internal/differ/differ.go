@@ -153,7 +153,8 @@ func (s *ErofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts [
 	}
 	defer ra.Close()
 
-	layerBlobPath := path.Join(layer, erofs.LayerBlobFilename)
+	// Use digest-based filename for easy correlation with registry manifests
+	layerBlobPath := path.Join(layer, erofs.LayerBlobFilename(desc.Digest.String()))
 	if native {
 		f, err := os.Create(layerBlobPath)
 		if err != nil {
