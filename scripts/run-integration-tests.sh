@@ -9,6 +9,7 @@
 #   --shell         Start interactive shell instead of tests
 #   --keep          Keep container data after exit for debugging
 #   --test NAME     Run only the specified test (e.g., --test pull_image)
+#   --verbose, -v   Enable verbose output
 #   -h, --help      Show this help message
 #
 # Examples:
@@ -45,14 +46,19 @@ while [[ $# -gt 0 ]]; do
             ;;
         --keep)
             KEEP_DATA=true
+            TEST_ARGS+=("--keep")
             shift
             ;;
         --test)
             TEST_ARGS+=("--test" "$2")
             shift 2
             ;;
+        --verbose|-v)
+            TEST_ARGS+=("--verbose")
+            shift
+            ;;
         -h|--help)
-            head -23 "$0" | tail -n +2 | sed 's/^# //' | sed 's/^#//'
+            head -24 "$0" | tail -n +2 | sed 's/^# //' | sed 's/^#//'
             exit 0
             ;;
         *)

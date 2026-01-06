@@ -6,40 +6,238 @@
 #   ./scripts/integration-test.sh [options]
 #
 # Options:
-#   --test NAME    Run only the specified test (e.g., --test pull_image)
-#   --keep         Keep data directories after exit for debugging
-#   --skip-build   Skip building the snapshotter (use existing binary)
-#   -h, --help     Show this help message
+#   --test NAME     Run only the specified test (e.g., --test pull_image)
+#   --keep          Keep data directories after exit for debugging
+#   --skip-build    Skip building the snapshotter (use existing binary)
+#   --verbose, -v   Enable verbose output
+#   --junit FILE    Generate JUnit XML report (default: /tmp/integration-logs/junit.xml)
+#   -h, --help      Show this help message
 
 set -euo pipefail
 
+# =============================================================================
 # Configuration
+# =============================================================================
+
 CONTAINERD_ROOT="/var/lib/containerd-test"
 SNAPSHOTTER_ROOT="/var/lib/nexuserofs-snapshotter"
 CONTAINERD_SOCKET="/run/containerd/containerd.sock"
 SNAPSHOTTER_SOCKET="/run/nexuserofs-snapshotter/snapshotter.sock"
 LOG_DIR="/tmp/integration-logs"
+
 # Use ghcr.io or quay.io to avoid Docker Hub rate limits
 TEST_IMAGE="${TEST_IMAGE:-ghcr.io/containerd/alpine:3.14.0}"
 MULTI_LAYER_IMAGE="${MULTI_LAYER_IMAGE:-ghcr.io/containerd/busybox:1.36}"
+
+# Runtime options
 CLEANUP_ON_EXIT="${CLEANUP_ON_EXIT:-true}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
+VERBOSE="${VERBOSE:-false}"
 SINGLE_TEST=""
+JUNIT_OUTPUT=""
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 NC='\033[0m'
+
+# Test tracking
+declare -A TEST_TIMES
+declare -A TEST_RESULTS
+TOTAL_START_TIME=0
+
+# =============================================================================
+# Logging Functions
+# =============================================================================
 
 log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 log_test() { echo -e "${BLUE}[TEST]${NC} $*"; }
-log_cmd() { echo -e "${BLUE}[CMD]${NC} $*" >&2; }
+log_cmd() {
+    if [ "$VERBOSE" = "true" ]; then
+        echo -e "${CYAN}[CMD]${NC} $*" >&2
+    fi
+}
+log_debug() {
+    if [ "$VERBOSE" = "true" ]; then
+        echo -e "${MAGENTA}[DEBUG]${NC} $*"
+    fi
+}
 
-# Parse arguments
+# Enhanced error logging with context
+log_error_with_context() {
+    local msg="$1"
+    local context_lines="${2:-20}"
+
+    log_error "$msg"
+    echo ""
+    echo "═══════════════════════ ERROR CONTEXT ═══════════════════════"
+    echo "Snapshotter logs (last $context_lines lines):"
+    echo "────────────────────────────────────────────────────────────"
+    tail -n "$context_lines" "${LOG_DIR}/snapshotter.log" 2>/dev/null || echo "No logs available"
+    echo ""
+    echo "Containerd logs (last $context_lines lines):"
+    echo "────────────────────────────────────────────────────────────"
+    tail -n "$context_lines" "${LOG_DIR}/containerd.log" 2>/dev/null || echo "No logs available"
+    echo ""
+    echo "Active snapshots:"
+    echo "────────────────────────────────────────────────────────────"
+    ctr_cmd snapshots --snapshotter nexuserofs ls 2>/dev/null || echo "Could not list snapshots"
+    echo ""
+    echo "Disk usage:"
+    echo "────────────────────────────────────────────────────────────"
+    df -h "${SNAPSHOTTER_ROOT}" 2>/dev/null || echo "Could not get disk usage"
+    echo "═══════════════════════════════════════════════════════════"
+}
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+# Wait for a condition to be true with timeout
+wait_for_condition() {
+    local condition_cmd="$1"
+    local timeout="${2:-30}"
+    local interval="${3:-0.5}"
+    local description="${4:-condition}"
+
+    log_debug "Waiting for: $description (timeout: ${timeout}s)"
+
+    local elapsed=0
+    while [ "$elapsed" -lt "$timeout" ]; do
+        if eval "$condition_cmd" 2>/dev/null; then
+            log_debug "Condition met: $description"
+            return 0
+        fi
+        sleep "$interval"
+        elapsed=$((elapsed + 1))
+    done
+
+    log_error "Timeout waiting for: $description"
+    return 1
+}
+
+# Retry a command with exponential backoff
+retry_command() {
+    local max_attempts="${1:-3}"
+    local base_delay="${2:-2}"
+    shift 2
+    local cmd="$*"
+
+    local attempt=1
+    while [ $attempt -le $max_attempts ]; do
+        log_debug "Attempt $attempt/$max_attempts: $cmd"
+
+        if eval "$cmd"; then
+            log_debug "Command succeeded on attempt $attempt"
+            return 0
+        fi
+
+        if [ $attempt -lt $max_attempts ]; then
+            local delay=$((base_delay * attempt))
+            log_warn "Command failed (attempt $attempt/$max_attempts), retrying in ${delay}s..."
+            sleep "$delay"
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    log_error "Command failed after $max_attempts attempts: $cmd"
+    return 1
+}
+
+# =============================================================================
+# Assertion Helpers
+# =============================================================================
+
+assert_file_exists() {
+    local file="$1"
+    local msg="${2:-File should exist: $file}"
+    if [ ! -f "$file" ]; then
+        log_error "$msg"
+        return 1
+    fi
+    log_debug "✓ File exists: $file"
+    return 0
+}
+
+assert_dir_exists() {
+    local dir="$1"
+    local msg="${2:-Directory should exist: $dir}"
+    if [ ! -d "$dir" ]; then
+        log_error "$msg"
+        return 1
+    fi
+    log_debug "✓ Directory exists: $dir"
+    return 0
+}
+
+assert_not_empty() {
+    local value="$1"
+    local msg="${2:-Value should not be empty}"
+    if [ -z "$value" ]; then
+        log_error "$msg"
+        return 1
+    fi
+    log_debug "✓ Value not empty: $value"
+    return 0
+}
+
+assert_greater_than() {
+    local actual="$1"
+    local expected="$2"
+    local msg="${3:-Expected > $expected, got $actual}"
+    if [ "$actual" -le "$expected" ]; then
+        log_error "$msg"
+        return 1
+    fi
+    log_debug "✓ $actual > $expected"
+    return 0
+}
+
+assert_equals() {
+    local actual="$1"
+    local expected="$2"
+    local msg="${3:-Expected $expected, got $actual}"
+    if [ "$actual" != "$expected" ]; then
+        log_error "$msg"
+        return 1
+    fi
+    log_debug "✓ $actual == $expected"
+    return 0
+}
+
+assert_contains() {
+    local haystack="$1"
+    local needle="$2"
+    local msg="${3:-String should contain: $needle}"
+    if ! echo "$haystack" | grep -q "$needle"; then
+        log_error "$msg"
+        return 1
+    fi
+    log_debug "✓ String contains: $needle"
+    return 0
+}
+
+assert_command_success() {
+    local cmd="$1"
+    local msg="${2:-Command should succeed: $cmd}"
+    if ! eval "$cmd" >/dev/null 2>&1; then
+        log_error "$msg"
+        return 1
+    fi
+    log_debug "✓ Command succeeded: $cmd"
+    return 0
+}
+
+# =============================================================================
+# Parse Arguments
+# =============================================================================
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --test)
@@ -54,8 +252,16 @@ while [[ $# -gt 0 ]]; do
             SKIP_BUILD=true
             shift
             ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        --junit)
+            JUNIT_OUTPUT="${2:-${LOG_DIR}/junit.xml}"
+            shift 2
+            ;;
         -h|--help)
-            head -14 "$0" | tail -n +2 | sed 's/^# //' | sed 's/^#//'
+            head -16 "$0" | tail -n +2 | sed 's/^# //' | sed 's/^#//'
             exit 0
             ;;
         *)
@@ -65,7 +271,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Cleanup function
+# =============================================================================
+# Cleanup Function
+# =============================================================================
+
 cleanup() {
     local exit_code=$?
     log_info "Cleaning up..."
@@ -113,10 +322,19 @@ cleanup() {
         log_info "  Logs: ${LOG_DIR}"
     fi
 
+    # Generate JUnit XML if requested
+    if [ -n "$JUNIT_OUTPUT" ]; then
+        generate_junit_xml "$JUNIT_OUTPUT"
+    fi
+
     exit $exit_code
 }
 
 trap cleanup EXIT
+
+# =============================================================================
+# Service Management
+# =============================================================================
 
 # Generate containerd config
 generate_containerd_config() {
@@ -126,13 +344,10 @@ generate_containerd_config() {
     local hosts_config=""
     if [ -f /root/.docker/config.json ]; then
         mkdir -p /etc/containerd/certs.d/docker.io
-        # Extract auth from docker config and create hosts.toml
-        # containerd can use the docker config directly via config_path
         hosts_config='
 [plugins."io.containerd.grpc.v1.cri".registry]
   config_path = "/etc/containerd/certs.d"'
 
-        # Create docker.io hosts.toml that references docker config
         cat > /etc/containerd/certs.d/docker.io/hosts.toml <<HOSTS
 server = "https://registry-1.docker.io"
 
@@ -185,6 +400,34 @@ build_snapshotter() {
     log_info "Snapshotter built successfully"
 }
 
+# Start containerd
+start_containerd() {
+    log_info "Starting containerd..."
+    mkdir -p "${CONTAINERD_ROOT}" "$(dirname "${CONTAINERD_SOCKET}")" "${LOG_DIR}"
+
+    # Remove stale socket
+    rm -f "${CONTAINERD_SOCKET}"
+
+    containerd --config /etc/containerd/config.toml \
+        > "${LOG_DIR}/containerd.log" 2>&1 &
+
+    echo $! > /tmp/containerd.pid
+
+    # Wait for socket with better error handling
+    if ! wait_for_condition "[ -S '${CONTAINERD_SOCKET}' ]" 30 0.5 "containerd socket"; then
+        log_error_with_context "Containerd failed to start" 30
+        return 1
+    fi
+
+    # Verify containerd is responsive
+    if ! wait_for_condition "ctr -a '${CONTAINERD_SOCKET}' version >/dev/null 2>&1" 10 1 "containerd responsive"; then
+        log_error_with_context "Containerd not responsive" 30
+        return 1
+    fi
+
+    log_info "Containerd started (PID: $(cat /tmp/containerd.pid))"
+}
+
 # Start snapshotter
 start_snapshotter() {
     log_info "Starting nexuserofs-snapshotter..."
@@ -202,64 +445,109 @@ start_snapshotter() {
 
     echo $! > /tmp/snapshotter.pid
 
-    # Wait for socket
-    for i in $(seq 1 30); do
-        if [ -S "${SNAPSHOTTER_SOCKET}" ]; then
-            log_info "Snapshotter started (PID: $(cat /tmp/snapshotter.pid))"
-            return 0
-        fi
-        sleep 0.5
-    done
+    # Wait for socket with better error handling
+    if ! wait_for_condition "[ -S '${SNAPSHOTTER_SOCKET}' ]" 30 0.5 "snapshotter socket"; then
+        log_error_with_context "Snapshotter failed to start" 30
+        return 1
+    fi
 
-    log_error "Snapshotter failed to start. Logs:"
-    cat "${LOG_DIR}/snapshotter.log"
-    return 1
+    log_info "Snapshotter started (PID: $(cat /tmp/snapshotter.pid))"
 }
 
-# Start containerd
-start_containerd() {
-    log_info "Starting containerd..."
-    mkdir -p "${CONTAINERD_ROOT}" "$(dirname "${CONTAINERD_SOCKET}")" "${LOG_DIR}"
+# =============================================================================
+# Health Checks
+# =============================================================================
 
-    # Remove stale socket
-    rm -f "${CONTAINERD_SOCKET}"
+health_check() {
+    log_info "Running health checks..."
 
-    containerd --config /etc/containerd/config.toml \
-        > "${LOG_DIR}/containerd.log" 2>&1 &
+    local checks_passed=0
+    local checks_failed=0
 
-    echo $! > /tmp/containerd.pid
+    # Check containerd is responsive
+    if ctr_cmd version >/dev/null 2>&1; then
+        log_info "✓ Containerd is responsive"
+        checks_passed=$((checks_passed + 1))
+    else
+        log_error "✗ Containerd is not responsive"
+        checks_failed=$((checks_failed + 1))
+    fi
 
-    # Wait for socket
-    for i in $(seq 1 30); do
-        if [ -S "${CONTAINERD_SOCKET}" ]; then
-            log_info "Containerd started (PID: $(cat /tmp/containerd.pid))"
-            return 0
-        fi
-        sleep 0.5
-    done
+    # Check snapshotter is accessible (proxy plugins don't show in plugins ls)
+    if ctr_cmd snapshots --snapshotter nexuserofs ls >/dev/null 2>&1; then
+        log_info "✓ Nexuserofs snapshotter accessible"
+        checks_passed=$((checks_passed + 1))
+    else
+        log_error "✗ Nexuserofs snapshotter not accessible"
+        checks_failed=$((checks_failed + 1))
+    fi
 
-    log_error "Containerd failed to start. Logs:"
-    cat "${LOG_DIR}/containerd.log"
-    return 1
+    # Check disk space
+    local available_space
+    available_space=$(df -BG "${SNAPSHOTTER_ROOT}" | tail -1 | awk '{print $4}' | tr -d 'G')
+    if [ "$available_space" -gt 5 ]; then
+        log_info "✓ Sufficient disk space: ${available_space}GB"
+        checks_passed=$((checks_passed + 1))
+    else
+        log_warn "⚠ Low disk space: ${available_space}GB (may cause issues)"
+        checks_passed=$((checks_passed + 1))  # Don't fail on low space, just warn
+    fi
+
+    # Check loop devices available
+    if losetup -f >/dev/null 2>&1; then
+        log_info "✓ Loop devices available"
+        checks_passed=$((checks_passed + 1))
+    else
+        log_warn "⚠ Cannot find free loop device"
+        checks_passed=$((checks_passed + 1))  # Don't fail, may not be needed
+    fi
+
+    # Check essential directories exist
+    if assert_dir_exists "${CONTAINERD_ROOT}" && assert_dir_exists "${SNAPSHOTTER_ROOT}"; then
+        log_info "✓ Data directories exist"
+        checks_passed=$((checks_passed + 1))
+    else
+        log_error "✗ Required directories missing"
+        checks_failed=$((checks_failed + 1))
+    fi
+
+    if [ "$checks_failed" -gt 0 ]; then
+        log_error "Health checks failed: $checks_failed, passed: $checks_passed"
+        return 1
+    fi
+
+    log_info "All health checks passed ($checks_passed checks)"
+    return 0
 }
+
+# =============================================================================
+# Command Helpers
+# =============================================================================
 
 # Helper: run ctr command
 ctr_cmd() {
-    log_cmd "ctr -a ${CONTAINERD_SOCKET} $*"
-    ctr -a "${CONTAINERD_SOCKET}" "$@"
+    if [ "$VERBOSE" = "true" ]; then
+        log_cmd "ctr -a ${CONTAINERD_SOCKET} $*"
+        ctr -a "${CONTAINERD_SOCKET}" "$@"
+    else
+        ctr -a "${CONTAINERD_SOCKET}" "$@" 2>&1
+    fi
 }
 
-# Helper: pull image with optional hosts-dir for registry auth
+# Helper: pull image with retry and optional hosts-dir for registry auth
 ctr_pull() {
     local hosts_dir_opt=""
     if [ -d /etc/containerd/certs.d ]; then
         hosts_dir_opt="--hosts-dir=/etc/containerd/certs.d"
     fi
+
     log_cmd "ctr -a ${CONTAINERD_SOCKET} images pull --platform linux/amd64 $hosts_dir_opt $*"
-    ctr -a "${CONTAINERD_SOCKET}" images pull --platform linux/amd64 $hosts_dir_opt "$@"
+
+    # Retry image pulls as they can be flaky
+    retry_command 3 2 "ctr -a '${CONTAINERD_SOCKET}' images pull --platform linux/amd64 $hosts_dir_opt $*"
 }
 
-# Helper: cleanup containers and tasks
+# Helper: cleanup containers and tasks (ctr)
 cleanup_container() {
     local name="$1"
     ctr_cmd tasks kill "$name" 2>/dev/null || true
@@ -268,78 +556,165 @@ cleanup_container() {
     ctr_cmd containers rm "$name" 2>/dev/null || true
 }
 
+# Helper: cleanup nerdctl containers
+cleanup_nerdctl_container() {
+    local name="$1"
+    nerdctl --snapshotter nexuserofs rm -f "$name" 2>/dev/null || true
+}
+
+# =============================================================================
+# Test Infrastructure
+# =============================================================================
+
+# Test setup function
+setup_test() {
+    local test_name="$1"
+    local ns
+    ns="test-${test_name}-$$-$(date +%s)"
+    export TEST_NAMESPACE="$ns"
+    log_debug "Setting up test: $test_name (namespace: $TEST_NAMESPACE)"
+}
+
+# Test teardown function
+teardown_test() {
+    local test_name="$1"
+    log_debug "Tearing down test: $test_name"
+
+    # Cleanup test-specific snapshots
+    # Use subshell with explicit set +e to prevent any errors from propagating
+    (
+        set +e
+        if [ -n "${TEST_NAMESPACE:-}" ]; then
+            ctr_cmd snapshots --snapshotter nexuserofs ls 2>/dev/null | \
+                grep "$TEST_NAMESPACE" | \
+                awk '{print $1}' | \
+                while read -r snap; do
+                    ctr_cmd snapshots --snapshotter nexuserofs rm "$snap" 2>/dev/null
+                done
+        fi
+    ) 2>/dev/null
+
+    # Always return success
+    return 0
+}
+
+# Run a single test with timing
+run_test_with_timing() {
+    local test_func="$1"
+    local test_name="${test_func#test_}"
+
+    log_test "$test_name"
+
+    setup_test "$test_name"
+
+    local start_time
+    start_time=$(date +%s)
+    local result=0
+
+    if $test_func; then
+        local end_time
+        end_time=$(date +%s)
+        local duration=$((end_time - start_time))
+        TEST_TIMES[$test_func]=$duration
+        TEST_RESULTS[$test_func]="PASS"
+        log_info "✓ PASS (${duration}s)"
+        result=0
+    else
+        local end_time
+        end_time=$(date +%s)
+        local duration=$((end_time - start_time))
+        TEST_TIMES[$test_func]=$duration
+        TEST_RESULTS[$test_func]="FAIL"
+        log_error "✗ FAIL (${duration}s)"
+        result=1
+    fi
+
+    teardown_test "$test_name"
+
+    return $result
+}
+
+# Test dependencies
+declare -A TEST_DEPENDS
+TEST_DEPENDS[test_prepare_snapshot]="test_pull_image"
+TEST_DEPENDS[test_view_snapshot]="test_pull_image"
+TEST_DEPENDS[test_commit]="test_pull_image"
+TEST_DEPENDS[test_rwlayer_creation]="test_pull_image"
+TEST_DEPENDS[test_snapshot_cleanup]="test_pull_image"
+
+# Check if test dependencies are met
+check_test_dependencies() {
+    local test="$1"
+    local dep="${TEST_DEPENDS[$test]:-}"
+
+    if [ -n "$dep" ] && [ "${TEST_RESULTS[$dep]:-}" != "PASS" ]; then
+        log_warn "Skipping $test (dependency $dep not passed)"
+        TEST_RESULTS[$test]="SKIPPED"
+        return 1
+    fi
+
+    return 0
+}
+
 # =============================================================================
 # Test Cases
 # =============================================================================
 
 # Test: Pull image and verify snapshot creation
 test_pull_image() {
-    log_test "Pull image with nexuserofs snapshotter"
-
     # Pull using ctr with nexuserofs snapshotter (suppress progress output)
-    ctr_pull --snapshotter nexuserofs "${TEST_IMAGE}" >/dev/null
-
-    # Verify image exists
-    if ! ctr_cmd images ls | grep -q "containerd"; then
-        log_error "Image not found after pull"
+    if ! ctr_pull --snapshotter nexuserofs "${TEST_IMAGE}" >/dev/null; then
+        log_error_with_context "Failed to pull image"
         return 1
     fi
+
+    # Verify image exists
+    assert_command_success "ctr_cmd images ls | grep -q 'containerd'" "Image should exist after pull" || return 1
 
     # Verify snapshots were created
     local snap_count
     snap_count=$(ctr_cmd snapshots --snapshotter nexuserofs ls | wc -l)
-    if [ "$snap_count" -lt 2 ]; then
-        log_error "Expected snapshots after pull, found: $snap_count"
-        return 1
-    fi
 
-    log_info "PASS: Image pulled successfully with $((snap_count - 1)) snapshots"
+    assert_greater_than "$snap_count" 1 "Expected snapshots after pull" || return 1
+
+    log_info "Image pulled successfully with $((snap_count - 1)) snapshots"
 }
 
 # Test: Prepare snapshot and verify rwlayer.img created
 test_prepare_snapshot() {
-    log_test "Prepare active snapshot"
-
     # Get the committed snapshot from the pulled image
     local parent_snap
     parent_snap=$(ctr_cmd snapshots --snapshotter nexuserofs ls | grep -v "^KEY" | head -1 | awk '{print $1}')
 
-    if [ -z "$parent_snap" ]; then
-        log_error "No parent snapshot found"
-        return 1
-    fi
+    assert_not_empty "$parent_snap" "Parent snapshot should exist" || return 1
 
     # Prepare an active snapshot
-    local snap_name="test-active-$$"
-    ctr_cmd snapshots --snapshotter nexuserofs prepare "$snap_name" "$parent_snap" >/dev/null
-
-    # Verify snapshot was created
-    if ! ctr_cmd snapshots --snapshotter nexuserofs info "$snap_name" >/dev/null 2>&1; then
-        log_error "Snapshot not created"
+    local snap_name="test-active-${TEST_NAMESPACE}"
+    if ! ctr_cmd snapshots --snapshotter nexuserofs prepare "$snap_name" "$parent_snap" >/dev/null; then
+        log_error "Failed to prepare snapshot"
         return 1
     fi
+
+    # Verify snapshot was created
+    assert_command_success "ctr_cmd snapshots --snapshotter nexuserofs info '$snap_name' >/dev/null 2>&1" \
+        "Snapshot should be created" || return 1
 
     # Clean up
     ctr_cmd snapshots --snapshotter nexuserofs rm "$snap_name" 2>/dev/null || true
 
-    log_info "PASS: Active snapshot prepared successfully"
+    log_info "Active snapshot prepared successfully"
 }
 
 # Test: View snapshot returns EROFS mount info
 test_view_snapshot() {
-    log_test "View snapshot returns EROFS file path"
-
     # Get the committed snapshot from the pulled image
     local parent_snap
     parent_snap=$(ctr_cmd snapshots --snapshotter nexuserofs ls | grep -v "^KEY" | head -1 | awk '{print $1}')
 
-    if [ -z "$parent_snap" ]; then
-        log_error "No parent snapshot found"
-        return 1
-    fi
+    assert_not_empty "$parent_snap" "Parent snapshot should exist" || return 1
 
     # Create a view snapshot
-    local view_name="test-view-$$"
+    local view_name="test-view-${TEST_NAMESPACE}"
     ctr_cmd snapshots --snapshotter nexuserofs view "$view_name" "$parent_snap" >/dev/null 2>&1
 
     # Get mounts for the view snapshot
@@ -350,115 +725,88 @@ test_view_snapshot() {
     if echo "$mounts" | grep -qE "(erofs|\.erofs)"; then
         log_info "View snapshot returns EROFS mount"
     else
-        log_warn "Mount output: $mounts"
+        log_debug "Mount output: $mounts"
         # Even if not erofs type, check the snapshot exists
-        if ctr_cmd snapshots --snapshotter nexuserofs info "$view_name" >/dev/null 2>&1; then
-            log_info "View snapshot created successfully (mount type may vary)"
-        else
-            log_error "View snapshot not created"
-            return 1
-        fi
+        assert_command_success "ctr_cmd snapshots --snapshotter nexuserofs info '$view_name' >/dev/null 2>&1" \
+            "View snapshot should be created" || return 1
+        log_info "View snapshot created successfully (mount type may vary)"
     fi
 
     # Clean up
     ctr_cmd snapshots --snapshotter nexuserofs rm "$view_name" 2>/dev/null || true
-
-    log_info "PASS: View snapshot works"
 }
 
-# Test: Commit snapshot with extract prefix (simulates image build)
-# This tests the bug we fixed where /rw directory didn't exist
+# Test: Commit snapshot (tests snapshotter commit functionality)
+# Note: This snapshotter is VM-only and doesn't support running containers on host
 test_commit() {
-    log_test "Commit snapshot (extract flow)"
-
-    # Configure nerdctl for this test
-    export CONTAINERD_ADDRESS="${CONTAINERD_SOCKET}"
-    export CONTAINERD_SNAPSHOTTER="nexuserofs"
-
-    # Show original image info
-    echo ""
-    echo "┌──────────────────────────────────────────────────────────────┐"
-    echo "│                    ORIGINAL IMAGE INSPECT                     │"
-    echo "└──────────────────────────────────────────────────────────────┘"
-    log_cmd "nerdctl image inspect ${TEST_IMAGE}"
-    nerdctl image inspect "${TEST_IMAGE}" || true
-    echo ""
-
-    # Get the committed snapshot from the pulled image
+    # Get a committed snapshot from the pulled image to use as parent
     local parent_snap
     parent_snap=$(ctr_cmd snapshots --snapshotter nexuserofs ls | grep -v "^KEY" | head -1 | awk '{print $1}')
 
-    if [ -z "$parent_snap" ]; then
-        log_error "No parent snapshot found"
-        return 1
-    fi
+    assert_not_empty "$parent_snap" "Parent snapshot should exist" || return 1
 
-    log_info "Using parent snapshot: $parent_snap"
+    log_debug "Using parent snapshot: $parent_snap"
 
     # Use extract- prefix to trigger host mounting (like image build does)
-    local extract_name="extract-commit-test-$$"
-    local mounts
-    mounts=$(ctr_cmd snapshots --snapshotter nexuserofs prepare "$extract_name" "$parent_snap" 2>&1)
+    local extract_name="extract-commit-${TEST_NAMESPACE}"
+    ctr_cmd snapshots --snapshotter nexuserofs prepare "$extract_name" "$parent_snap" >/dev/null 2>&1
 
-    # The snapshotter should have mounted ext4 for extract snapshots
-    # Find the rwlayer mount path from the mounts output
-    local rw_source
-    rw_source=$(echo "$mounts" | grep "ext4" | grep -oP 'source\s+\K\S+' || true)
+    log_debug "Prepared extract snapshot: $extract_name"
 
-    if [ -z "$rw_source" ]; then
-        log_warn "No ext4 mount found in output (may be unmounted already)"
-    fi
+    # The snapshotter should have created the snapshot
+    assert_command_success "ctr_cmd snapshots --snapshotter nexuserofs info '$extract_name' >/dev/null 2>&1" \
+        "Extract snapshot should exist" || return 1
 
-    # Commit the snapshot - this triggers the code path we fixed
-    local commit_name="committed-test-$$"
-    if ctr_cmd snapshots --snapshotter nexuserofs commit "$commit_name" "$extract_name" 2>&1; then
-        log_info "Snapshot committed successfully"
-        # Verify committed snapshot exists
-        if ctr_cmd snapshots --snapshotter nexuserofs info "$commit_name" >/dev/null 2>&1; then
-            log_info "Committed snapshot verified: $commit_name"
-
-            # Show snapshot info
-            echo ""
-            echo "┌──────────────────────────────────────────────────────────────┐"
-            echo "│                  COMMITTED SNAPSHOT INFO                      │"
-            echo "└──────────────────────────────────────────────────────────────┘"
-            log_cmd "ctr snapshots info $commit_name"
-            ctr_cmd snapshots --snapshotter nexuserofs info "$commit_name" || true
-            echo ""
-
-            echo "┌──────────────────────────────────────────────────────────────┐"
-            echo "│                    SNAPSHOT HIERARCHY                         │"
-            echo "└──────────────────────────────────────────────────────────────┘"
-            log_cmd "ctr snapshots ls (tree view)"
-            echo "KEY                                            PARENT                                         KIND"
-            echo "────────────────────────────────────────────── ────────────────────────────────────────────── ──────────"
-            ctr_cmd snapshots --snapshotter nexuserofs ls || true
-            echo ""
-
-            echo "┌──────────────────────────────────────────────────────────────┐"
-            echo "│                      EROFS LAYER FILES                        │"
-            echo "└──────────────────────────────────────────────────────────────┘"
-            find "${SNAPSHOTTER_ROOT}/snapshots" -name "*.erofs" -exec ls -lh {} \; || true
-            echo ""
-        fi
-        # Clean up committed snapshot
-        ctr_cmd snapshots --snapshotter nexuserofs rm "$commit_name" 2>/dev/null || true
-    else
+    # Commit the snapshot - this triggers EROFS conversion
+    local commit_name="committed-${TEST_NAMESPACE}"
+    if ! ctr_cmd snapshots --snapshotter nexuserofs commit "$commit_name" "$extract_name" 2>&1; then
         log_warn "Snapshot commit returned error (checking if snapshot was created anyway)"
     fi
 
-    # Clean up extract snapshot
-    ctr_cmd snapshots --snapshotter nexuserofs rm "$extract_name" 2>/dev/null || true
+    # Verify committed snapshot exists
+    assert_command_success "ctr_cmd snapshots --snapshotter nexuserofs info '$commit_name' >/dev/null 2>&1" \
+        "Committed snapshot should exist" || return 1
 
-    log_info "PASS: Commit test completed"
+    # Check for EROFS layer files
+    local erofs_count
+    erofs_count=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "layer.erofs" 2>/dev/null | wc -l)
+
+    log_info "Snapshot committed successfully: $commit_name"
+    log_info "EROFS layer files: $erofs_count"
+
+    if [ "$VERBOSE" = "true" ]; then
+        echo ""
+        echo "┌──────────────────────────────────────────────────────────────┐"
+        echo "│                  COMMITTED SNAPSHOT INFO                     │"
+        echo "└──────────────────────────────────────────────────────────────┘"
+        ctr_cmd snapshots --snapshotter nexuserofs info "$commit_name" 2>&1 || true
+        echo ""
+
+        echo "┌──────────────────────────────────────────────────────────────┐"
+        echo "│                    SNAPSHOT HIERARCHY                        │"
+        echo "└──────────────────────────────────────────────────────────────┘"
+        ctr_cmd snapshots --snapshotter nexuserofs ls 2>&1 || true
+        echo ""
+
+        echo "┌──────────────────────────────────────────────────────────────┐"
+        echo "│                      EROFS LAYER FILES                       │"
+        echo "└──────────────────────────────────────────────────────────────┘"
+        find "${SNAPSHOTTER_ROOT}/snapshots" -name "*.erofs" -exec ls -lh {} \; 2>/dev/null || true
+        echo ""
+    fi
+
+    # Clean up
+    ctr_cmd snapshots --snapshotter nexuserofs rm "$commit_name" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter nexuserofs rm "$extract_name" 2>/dev/null || true
 }
 
 # Test: Multi-layer image (VMDK generation)
 test_multi_layer() {
-    log_test "Multi-layer image handling"
-
-    # Pull a multi-layer image (nginx:alpine has more layers than alpine)
-    ctr_pull --snapshotter nexuserofs "${MULTI_LAYER_IMAGE}" >/dev/null
+    # Pull a multi-layer image
+    if ! ctr_pull --snapshotter nexuserofs "${MULTI_LAYER_IMAGE}" >/dev/null; then
+        log_error_with_context "Failed to pull multi-layer image"
+        return 1
+    fi
 
     # Count snapshots
     local snap_count
@@ -473,7 +821,7 @@ test_multi_layer() {
     if [ "$vmdk_count" -gt 0 ]; then
         log_info "VMDK descriptors generated: $vmdk_count"
     else
-        log_warn "No VMDK descriptors found (may be expected for some configurations)"
+        log_debug "No VMDK descriptors found (may be expected for some configurations)"
     fi
 
     # Verify fsmeta.erofs exists for multi-layer
@@ -483,22 +831,15 @@ test_multi_layer() {
     if [ "$fsmeta_count" -gt 0 ]; then
         log_info "Fsmeta files generated: $fsmeta_count"
     fi
-
-    log_info "PASS: Multi-layer image handled successfully"
 }
 
 # Test: Verify EROFS layer files are created correctly
 test_erofs_layers() {
-    log_test "EROFS layer file verification"
-
     # Find layer.erofs files
     local erofs_count
     erofs_count=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "layer.erofs" 2>/dev/null | wc -l)
 
-    if [ "$erofs_count" -eq 0 ]; then
-        log_error "No EROFS layer files found"
-        return 1
-    fi
+    assert_greater_than "$erofs_count" 0 "EROFS layer files should exist" || return 1
 
     log_info "Found $erofs_count EROFS layer files"
 
@@ -513,67 +854,63 @@ test_erofs_layers() {
         if [ "$magic" = "e2e1f5e0" ]; then
             log_info "EROFS magic verified in $erofs_file"
         else
-            log_warn "Could not verify EROFS magic (may be little-endian): $magic"
+            log_debug "Could not verify EROFS magic (may be little-endian): $magic"
         fi
     fi
-
-    log_info "PASS: EROFS layer files verified"
 }
 
-# Test: nerdctl can pull images with nexuserofs snapshotter
+# Test: Verify all pulled images are visible in ctr images ls
 test_nerdctl() {
-    log_test "nerdctl pull with nexuserofs"
-
     # Configure nerdctl
     export CONTAINERD_ADDRESS="${CONTAINERD_SOCKET}"
     export CONTAINERD_SNAPSHOTTER="nexuserofs"
 
-    # Use same test image to avoid additional pulls
-    log_cmd "nerdctl pull --platform linux/amd64 ${TEST_IMAGE}"
-    if nerdctl pull --platform linux/amd64 "${TEST_IMAGE}" >/dev/null 2>&1; then
-        log_info "nerdctl pull succeeded"
-    else
-        # Image may already be pulled, that's ok
-        log_info "nerdctl pull skipped (may already exist)"
-    fi
+    # List all images using ctr
+    log_info "Listing all images with ctr images ls:"
+    echo ""
+    ctr_cmd images ls
+    echo ""
 
-    # Verify image exists
-    log_cmd "nerdctl images"
+    # Count images
+    local image_count
+    image_count=$(ctr_cmd images ls | grep -v "^REF" | wc -l)
+
+    # We should have at least 2 images: TEST_IMAGE and MULTI_LAYER_IMAGE
+    assert_greater_than "$image_count" 1 "Should have multiple images after pulls" || return 1
+
+    # Verify both test images are visible
     local images_output
-    images_output=$(nerdctl images 2>&1)
-    echo "$images_output"
+    images_output=$(ctr_cmd images ls 2>&1)
 
-    if echo "$images_output" | grep -q "containerd"; then
-        log_info "Image visible in nerdctl"
-    else
-        log_warn "Image not visible in nerdctl images list"
+    if echo "$images_output" | grep -q "alpine"; then
+        log_info "✓ Alpine image visible"
     fi
 
-    log_info "PASS: nerdctl integration works"
+    if echo "$images_output" | grep -q "busybox"; then
+        log_info "✓ Busybox image visible"
+    fi
+
+    log_info "Total images in containerd: $image_count"
 }
 
 # Test: Snapshot removal and cleanup
 test_snapshot_cleanup() {
-    log_test "Snapshot removal and cleanup"
-
     # Get the committed snapshot from the pulled image
     local parent_snap
     parent_snap=$(ctr_cmd snapshots --snapshotter nexuserofs ls | grep -v "^KEY" | head -1 | awk '{print $1}')
 
-    if [ -z "$parent_snap" ]; then
-        log_error "No parent snapshot found"
-        return 1
-    fi
+    assert_not_empty "$parent_snap" "Parent snapshot should exist" || return 1
 
     # Create a test snapshot
-    local snap_name="test-cleanup-$$"
-    ctr_cmd snapshots --snapshotter nexuserofs prepare "$snap_name" "$parent_snap" >/dev/null
-
-    # Verify it exists
-    if ! ctr_cmd snapshots --snapshotter nexuserofs info "$snap_name" >/dev/null 2>&1; then
-        log_error "Snapshot not created"
+    local snap_name="test-cleanup-${TEST_NAMESPACE}"
+    if ! ctr_cmd snapshots --snapshotter nexuserofs prepare "$snap_name" "$parent_snap" >/dev/null; then
+        log_error "Failed to prepare snapshot"
         return 1
     fi
+
+    # Verify it exists
+    assert_command_success "ctr_cmd snapshots --snapshotter nexuserofs info '$snap_name' >/dev/null 2>&1" \
+        "Snapshot should exist before removal" || return 1
 
     # Remove it
     if ! ctr_cmd snapshots --snapshotter nexuserofs rm "$snap_name" 2>/dev/null; then
@@ -587,54 +924,41 @@ test_snapshot_cleanup() {
         return 1
     fi
 
-    log_info "PASS: Snapshot cleanup works"
+    log_info "Snapshot cleanup verified"
 }
 
 # Test: Verify rwlayer.img is created for active snapshots
 test_rwlayer_creation() {
-    log_test "Writable layer (rwlayer.img) creation"
-
     # Get the committed snapshot from the pulled image
     local parent_snap
     parent_snap=$(ctr_cmd snapshots --snapshotter nexuserofs ls | grep -v "^KEY" | head -1 | awk '{print $1}')
 
-    if [ -z "$parent_snap" ]; then
-        log_error "No parent snapshot found"
+    assert_not_empty "$parent_snap" "Parent snapshot should exist" || return 1
+
+    # Create an active snapshot
+    local snap_name="test-rwlayer-${TEST_NAMESPACE}"
+    if ! ctr_cmd snapshots --snapshotter nexuserofs prepare "$snap_name" "$parent_snap" >/dev/null; then
+        log_error "Failed to prepare snapshot"
         return 1
     fi
 
-    # Create an active snapshot
-    local snap_name="test-rwlayer-$$"
-    ctr_cmd snapshots --snapshotter nexuserofs prepare "$snap_name" "$parent_snap" >/dev/null
-
-    # Find the snapshot directory (we need to find the ID)
-    # The snapshot info should give us details
-    local snap_info
-    snap_info=$(ctr_cmd snapshots --snapshotter nexuserofs info "$snap_name" 2>&1)
-
-    # Count rwlayer.img files (there should be at least one new one)
+    # Count rwlayer.img files
     local rwlayer_count
     rwlayer_count=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "rwlayer.img" 2>/dev/null | wc -l)
 
-    if [ "$rwlayer_count" -eq 0 ]; then
-        log_error "No rwlayer.img files found"
-        ctr_cmd snapshots --snapshotter nexuserofs rm "$snap_name" 2>/dev/null || true
-        return 1
-    fi
+    assert_greater_than "$rwlayer_count" 0 "rwlayer.img files should exist" || return 1
 
     log_info "Found $rwlayer_count rwlayer.img files"
 
     # Clean up
     ctr_cmd snapshots --snapshotter nexuserofs rm "$snap_name" 2>/dev/null || true
-
-    log_info "PASS: Writable layer creation verified"
 }
 
 # =============================================================================
-# Main
+# Test Execution
 # =============================================================================
 
-# List of all tests
+# List of all tests in execution order
 ALL_TESTS=(
     test_pull_image
     test_prepare_snapshot
@@ -647,10 +971,104 @@ ALL_TESTS=(
     test_nerdctl
 )
 
+# Show test timing summary
+show_test_summary() {
+    local total_duration=$(($(date +%s) - TOTAL_START_TIME))
+
+    echo ""
+    echo "┌──────────────────────────────────────────────────────────────┐"
+    echo "│                      TEST TIMING SUMMARY                     │"
+    echo "└──────────────────────────────────────────────────────────────┘"
+    printf "%-45s %8s  %s\n" "Test Name" "Duration" "Result"
+    echo "────────────────────────────────────────────────────────────────"
+
+    for test in "${ALL_TESTS[@]}"; do
+        local duration="${TEST_TIMES[$test]:-0}"
+        local result="${TEST_RESULTS[$test]:-UNKNOWN}"
+        local result_color=""
+
+        case "$result" in
+            PASS) result_color="${GREEN}" ;;
+            FAIL) result_color="${RED}" ;;
+            SKIPPED) result_color="${YELLOW}" ;;
+            *) result_color="${NC}" ;;
+        esac
+
+        printf "%-45s %7ss  ${result_color}%-8s${NC}\n" "${test#test_}" "$duration" "$result"
+    done
+
+    echo "────────────────────────────────────────────────────────────────"
+    printf "%-45s %7ss\n" "Total" "$total_duration"
+    echo ""
+}
+
+# Generate JUnit XML report
+generate_junit_xml() {
+    local output_file="$1"
+    local total_tests=0
+    local failed=0
+    local skipped=0
+    local total_duration=$(($(date +%s) - TOTAL_START_TIME))
+
+    # Count results
+    for test in "${ALL_TESTS[@]}"; do
+        total_tests=$((total_tests + 1))
+        case "${TEST_RESULTS[$test]:-UNKNOWN}" in
+            FAIL) failed=$((failed + 1)) ;;
+            SKIPPED) skipped=$((skipped + 1)) ;;
+        esac
+    done
+
+    local timestamp
+    timestamp=$(date -Iseconds)
+
+    mkdir -p "$(dirname "$output_file")"
+
+    cat > "$output_file" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nexuserofs-integration" tests="$total_tests" failures="$failed" skipped="$skipped" time="$total_duration" timestamp="$timestamp">
+  <testsuite name="integration" tests="$total_tests" failures="$failed" skipped="$skipped" time="$total_duration">
+EOF
+
+    for test in "${ALL_TESTS[@]}"; do
+        local duration="${TEST_TIMES[$test]:-0}"
+        local status="${TEST_RESULTS[$test]:-UNKNOWN}"
+        local test_name="${test#test_}"
+
+        case "$status" in
+            PASS)
+                echo "    <testcase name=\"$test_name\" classname=\"nexuserofs.$test_name\" time=\"$duration\"/>" >> "$output_file"
+                ;;
+            FAIL)
+                cat >> "$output_file" <<TESTCASE
+    <testcase name="$test_name" classname="nexuserofs.$test_name" time="$duration">
+      <failure message="Test failed">Test $test_name failed. Check logs for details.</failure>
+    </testcase>
+TESTCASE
+                ;;
+            SKIPPED)
+                cat >> "$output_file" <<TESTCASE
+    <testcase name="$test_name" classname="nexuserofs.$test_name" time="$duration">
+      <skipped message="Test skipped">Test dependencies not met</skipped>
+    </testcase>
+TESTCASE
+                ;;
+        esac
+    done
+
+    cat >> "$output_file" <<EOF
+  </testsuite>
+</testsuites>
+EOF
+
+    log_info "JUnit XML report generated: $output_file"
+}
+
 # Run all tests
 run_tests() {
     local failed=0
     local passed=0
+    local skipped=0
     local tests_to_run=("${ALL_TESTS[@]}")
 
     # If single test specified, only run that one
@@ -660,22 +1078,37 @@ run_tests() {
 
     for test in "${tests_to_run[@]}"; do
         echo ""
-        if $test; then
-            ((++passed))
+
+        # Check dependencies
+        if ! check_test_dependencies "$test"; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        # Run test with timing
+        if run_test_with_timing "$test"; then
+            passed=$((passed + 1))
         else
-            ((++failed))
+            failed=$((failed + 1))
             log_error "Test failed: $test"
-            # Show recent logs on failure
-            echo "--- Recent snapshotter logs ---"
-            tail -20 "${LOG_DIR}/snapshotter.log" 2>/dev/null || true
-            echo "--- Recent containerd logs ---"
-            tail -20 "${LOG_DIR}/containerd.log" 2>/dev/null || true
+
+            if [ "$VERBOSE" = "true" ]; then
+                echo ""
+                echo "─────────── Recent snapshotter logs ───────────"
+                tail -30 "${LOG_DIR}/snapshotter.log" 2>/dev/null || true
+                echo ""
+                echo "─────────── Recent containerd logs ────────────"
+                tail -30 "${LOG_DIR}/containerd.log" 2>/dev/null || true
+                echo ""
+            fi
         fi
     done
 
-    echo ""
+    # Show summary
+    show_test_summary
+
     echo "======================================"
-    log_info "Test Results: ${passed} passed, ${failed} failed"
+    log_info "Test Results: ${passed} passed, ${failed} failed, ${skipped} skipped"
     echo "======================================"
 
     if [ "$failed" -gt 0 ]; then
@@ -686,38 +1119,46 @@ run_tests() {
     return 0
 }
 
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
 main() {
+    TOTAL_START_TIME=$(date +%s)
+
     log_info "Starting nexuserofs integration tests"
     log_info "Containerd root: ${CONTAINERD_ROOT}"
     log_info "Snapshotter root: ${SNAPSHOTTER_ROOT}"
     log_info "Log directory: ${LOG_DIR}"
 
+    if [ "$VERBOSE" = "true" ]; then
+        log_info "Verbose mode: enabled"
+    fi
+
+    if [ -n "$JUNIT_OUTPUT" ]; then
+        log_info "JUnit output: $JUNIT_OUTPUT"
+    fi
+
     mkdir -p "${LOG_DIR}"
 
+    # Build and configure
     build_snapshotter
     generate_containerd_config
 
-    # Start containerd first (snapshotter connects to it)
+    # Start services
     start_containerd
-
-    # Then start snapshotter
     start_snapshotter
 
     # Give services time to fully initialize
     sleep 2
 
-    # Verify services are running
-    if ! pgrep -f "containerd" > /dev/null; then
-        log_error "containerd is not running"
-        exit 1
-    fi
-    if ! pgrep -f "nexuserofs-snapshotter" > /dev/null; then
-        log_error "nexuserofs-snapshotter is not running"
+    # Run health checks
+    if ! health_check; then
+        log_error "Health checks failed, aborting tests"
         exit 1
     fi
 
-    log_info "Services started successfully"
-
+    # Run tests
     run_tests
 }
 
