@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -194,6 +195,27 @@ func run(address, namespace, snapshotterName, sourceImage, targetImage, markerFi
 }
 
 func writeToSnapshot(mounts []mount.Mount, markerFile string) error {
+	// For VM-only snapshotters like nexuserofs, the mounts returned are file paths
+	// meant for VMs to mount, not for host mounting via containerd's mount.All().
+	// We need to find the ext4 rwlayer and mount it manually.
+	//
+	// Expected mounts from nexuserofs for active snapshots:
+	//   [0] type=erofs source=/path/to/fsmeta.erofs options=[ro loop ...]
+	//   [1] type=ext4  source=/path/to/rwlayer.img  options=[rw loop]
+
+	var ext4Path string
+	for _, m := range mounts {
+		if m.Type == "ext4" {
+			ext4Path = m.Source
+			break
+		}
+	}
+	if ext4Path == "" {
+		return fmt.Errorf("no ext4 mount found in mounts: %#v", mounts)
+	}
+
+	fmt.Printf("Found ext4 writable layer: %s\n", ext4Path)
+
 	// Create a temporary mount point
 	mountPoint, err := os.MkdirTemp("", "snapshot-mount-")
 	if err != nil {
@@ -201,13 +223,13 @@ func writeToSnapshot(mounts []mount.Mount, markerFile string) error {
 	}
 	defer os.RemoveAll(mountPoint)
 
-	// Use containerd's mount API - this handles multiple mounts correctly
-	// and works with any snapshotter (overlayfs, btrfs, nexuserofs, etc.)
-	if err := mount.All(mounts, mountPoint); err != nil {
-		return fmt.Errorf("mount snapshot: %w", err)
+	// Mount the ext4 image using loop device
+	cmd := exec.Command("mount", "-o", "loop", ext4Path, mountPoint)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("mount ext4: %s: %w", string(out), err)
 	}
 	defer func() {
-		if err := mount.UnmountAll(mountPoint, 0); err != nil {
+		if err := exec.Command("umount", mountPoint).Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to unmount %s: %v\n", mountPoint, err)
 		}
 	}()
@@ -222,6 +244,9 @@ func writeToSnapshot(mounts []mount.Mount, markerFile string) error {
 	if err := os.WriteFile(markerPath, []byte(content), 0644); err != nil {
 		return fmt.Errorf("write marker file: %w", err)
 	}
+
+	// Sync before unmount
+	_ = exec.Command("sync").Run()
 
 	return nil
 }
