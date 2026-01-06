@@ -363,26 +363,11 @@ func (s *snapshotter) prepareDirectory(snapshotDir string, kind snapshots.Kind) 
 }
 
 func (s *snapshotter) mountFsMeta(snap storage.Snapshot) (mount.Mount, bool) {
-	// fsmeta requires at least 2 layers to be useful
-	if len(snap.ParentIDs) < 2 {
-		return mount.Mount{}, false
-	}
-
-	// Check for VMDK descriptor (generated alongside fsmeta)
-	vmdkFile := s.vmdkPath(snap.ParentIDs[0])
-	fi, err := os.Stat(vmdkFile)
-	if err != nil || fi.Size() == 0 {
-		// VMDK doesn't exist - fall back to individual layer mounts
-		return mount.Mount{}, false
-	}
-
-	// Return VMDK path - it contains references to fsmeta + all layer blobs.
-	// qemubox will detect .vmdk extension and pass it to QEMU as a single device.
-	return mount.Mount{
-		Source:  vmdkFile,
-		Type:    "erofs",
-		Options: []string{"ro"},
-	}, true
+	// fsmeta is generated in rebuild/flatdev mode for use with qemubox via VMDK.
+	// It cannot be mounted directly with device= options (that requires aufs mode).
+	// For direct mounting, we fall back to overlay with individual EROFS layers.
+	// qemubox detects the merged.vmdk file and uses it for a single virtio-blk device.
+	return mount.Mount{}, false
 }
 
 // mounts returns mount specifications for a snapshot.
