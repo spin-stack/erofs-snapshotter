@@ -380,4 +380,64 @@ const (
 	// LayerBlobFilename is the filename for EROFS layer blobs within
 	// a snapshot directory.
 	LayerBlobFilename = "layer.erofs"
+
+	// erofsMinBlockSizeForFsmeta is the minimum block size required for fsmeta merge.
+	// Layers created with tar index mode use 512-byte chunks which are incompatible
+	// with fsmeta merge that requires 4096-byte block size.
+	erofsMinBlockSizeForFsmeta = 4096
+
+	// erofsSuperblocOffset is the offset of the EROFS superblock.
+	erofsSuperblocOffset = 1024
+
+	// erofsMagic is the EROFS magic number.
+	erofsMagic = 0xE0F5E1E2
+
+	// erofsBlkszBitsOffset is the offset of blkszbits field within the superblock.
+	// The superblock structure has: magic (4), checksum (4), feature_compat (4),
+	// blkszbits (1) at offset 12.
+	erofsBlkszBitsOffset = 12
 )
+
+// GetBlockSize reads the block size from an EROFS layer file.
+// Returns the block size in bytes, or an error if the file is not a valid EROFS image.
+func GetBlockSize(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open EROFS file: %w", err)
+	}
+	defer f.Close()
+
+	// Read the superblock (we need magic + blkszbits)
+	buf := make([]byte, 16)
+	if _, err := f.ReadAt(buf, erofsSuperblocOffset); err != nil {
+		return 0, fmt.Errorf("failed to read EROFS superblock: %w", err)
+	}
+
+	// Check magic number (little-endian)
+	magic := uint32(buf[0]) | uint32(buf[1])<<8 | uint32(buf[2])<<16 | uint32(buf[3])<<24
+	if magic != erofsMagic {
+		return 0, fmt.Errorf("invalid EROFS magic: 0x%X (expected 0x%X)", magic, erofsMagic)
+	}
+
+	// Get block size bits (log2 of block size)
+	blkszbits := buf[erofsBlkszBitsOffset]
+	blockSize := 1 << blkszbits
+
+	return blockSize, nil
+}
+
+// CanMergeFsmeta checks if all EROFS layers have block sizes compatible with fsmeta merge.
+// Returns true if all layers have block size >= 4096, false otherwise.
+func CanMergeFsmeta(layerPaths []string) bool {
+	for _, path := range layerPaths {
+		blockSize, err := GetBlockSize(path)
+		if err != nil {
+			// If we can't read the block size, assume it's incompatible
+			return false
+		}
+		if blockSize < erofsMinBlockSizeForFsmeta {
+			return false
+		}
+	}
+	return true
+}

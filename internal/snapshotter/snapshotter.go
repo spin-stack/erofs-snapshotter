@@ -773,6 +773,15 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, snapIDs []string) {
 		blobs = append(blobs, blob)
 	}
 
+	// Check if all layers have block sizes compatible with fsmeta merge.
+	// Layers created with tar index mode use 512-byte chunks which are incompatible
+	// with fsmeta merge that requires 4096-byte block size.
+	if !erofsutils.CanMergeFsmeta(blobs) {
+		log.G(ctx).Debugf("skipping fsmeta generation: one or more layers have incompatible block size")
+		blobs = nil // Signal skip (cleanup placeholder)
+		return
+	}
+
 	// Use rebuild mode to generate flatdev fsmeta with mapped_blkaddr.
 	// The --vmdk-desc option generates both fsmeta and VMDK descriptor in one step.
 	// IMPORTANT: We use final paths (not temp) because mkfs.erofs embeds the fsmeta

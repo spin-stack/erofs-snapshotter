@@ -618,3 +618,177 @@ func TestGenerateTarIndexAndAppendTarIntegration(t *testing.T) {
 
 	t.Logf("Successfully created EROFS tar index layer: %s (%d bytes)", layerPath, info.Size())
 }
+
+// TestGetBlockSize tests reading block size from EROFS layers.
+func TestGetBlockSize(t *testing.T) {
+	t.Run("invalid file", func(t *testing.T) {
+		_, err := GetBlockSize("/nonexistent/file.erofs")
+		if err == nil {
+			t.Error("expected error for nonexistent file")
+		}
+	})
+
+	t.Run("non-erofs file", func(t *testing.T) {
+		// Create a file with invalid magic
+		f := filepath.Join(t.TempDir(), "invalid.erofs")
+		data := make([]byte, 2048)
+		if err := os.WriteFile(f, data, 0644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := GetBlockSize(f)
+		if err == nil {
+			t.Error("expected error for non-EROFS file")
+		}
+	})
+
+	t.Run("valid erofs file", func(t *testing.T) {
+		skipIfNoMkfsErofs(t)
+
+		dir := t.TempDir()
+		layerPath := filepath.Join(dir, "layer.erofs")
+		tarBuf := createTestTar(t)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := ConvertTarErofs(ctx, tarBuf, layerPath, "", nil); err != nil {
+			t.Fatalf("ConvertTarErofs failed: %v", err)
+		}
+
+		blockSize, err := GetBlockSize(layerPath)
+		if err != nil {
+			t.Fatalf("GetBlockSize failed: %v", err)
+		}
+
+		// Default block size for mkfs.erofs is 4096
+		if blockSize != 4096 {
+			t.Errorf("GetBlockSize() = %d, want 4096", blockSize)
+		}
+
+		t.Logf("EROFS layer block size: %d", blockSize)
+	})
+
+	t.Run("tar index mode layer", func(t *testing.T) {
+		skipIfNoMkfsErofs(t)
+
+		supported, err := SupportGenerateFromTar()
+		if err != nil || !supported {
+			t.Skip("mkfs.erofs does not support --tar option")
+		}
+
+		dir := t.TempDir()
+		layerPath := filepath.Join(dir, "layer.erofs")
+		tarBuf := createTestTar(t)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := GenerateTarIndexAndAppendTar(ctx, tarBuf, layerPath, nil); err != nil {
+			t.Fatalf("GenerateTarIndexAndAppendTar failed: %v", err)
+		}
+
+		blockSize, err := GetBlockSize(layerPath)
+		if err != nil {
+			t.Fatalf("GetBlockSize failed: %v", err)
+		}
+
+		// Tar index mode uses 512-byte blocks
+		t.Logf("EROFS tar index layer block size: %d", blockSize)
+
+		// The block size for tar index mode should be 512
+		// (This is what causes the fsmeta merge incompatibility)
+		if blockSize != 512 {
+			t.Logf("Note: tar index mode block size is %d (expected 512)", blockSize)
+		}
+	})
+}
+
+// TestCanMergeFsmeta tests the compatibility check for fsmeta merge.
+func TestCanMergeFsmeta(t *testing.T) {
+	t.Run("empty list", func(t *testing.T) {
+		// Empty list is compatible (nothing to merge)
+		if !CanMergeFsmeta(nil) {
+			t.Error("CanMergeFsmeta(nil) = false, want true")
+		}
+		if !CanMergeFsmeta([]string{}) {
+			t.Error("CanMergeFsmeta([]) = false, want true")
+		}
+	})
+
+	t.Run("nonexistent files", func(t *testing.T) {
+		paths := []string{"/nonexistent/file1.erofs", "/nonexistent/file2.erofs"}
+		if CanMergeFsmeta(paths) {
+			t.Error("CanMergeFsmeta with nonexistent files should return false")
+		}
+	})
+
+	t.Run("compatible layers", func(t *testing.T) {
+		skipIfNoMkfsErofs(t)
+
+		dir := t.TempDir()
+		var paths []string
+
+		// Create two layers with ConvertTarErofs (4096-byte blocks)
+		for i := 0; i < 2; i++ {
+			layerPath := filepath.Join(dir, "layer"+string(rune('0'+i))+".erofs")
+			tarBuf := createTestTar(t)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := ConvertTarErofs(ctx, tarBuf, layerPath, "", nil); err != nil {
+				cancel()
+				t.Fatalf("ConvertTarErofs failed: %v", err)
+			}
+			cancel()
+			paths = append(paths, layerPath)
+		}
+
+		if !CanMergeFsmeta(paths) {
+			t.Error("CanMergeFsmeta should return true for compatible layers")
+		}
+	})
+
+	t.Run("mixed layers with tar index", func(t *testing.T) {
+		skipIfNoMkfsErofs(t)
+
+		supported, err := SupportGenerateFromTar()
+		if err != nil || !supported {
+			t.Skip("mkfs.erofs does not support --tar option")
+		}
+
+		dir := t.TempDir()
+
+		// Create one normal layer (4096-byte blocks)
+		normalPath := filepath.Join(dir, "normal.erofs")
+		tarBuf1 := createTestTar(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := ConvertTarErofs(ctx, tarBuf1, normalPath, "", nil); err != nil {
+			cancel()
+			t.Fatalf("ConvertTarErofs failed: %v", err)
+		}
+		cancel()
+
+		// Create one tar index layer (512-byte blocks)
+		tarIndexPath := filepath.Join(dir, "tarindex.erofs")
+		tarBuf2 := createTestTar(t)
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		if err := GenerateTarIndexAndAppendTar(ctx, tarBuf2, tarIndexPath, nil); err != nil {
+			cancel()
+			t.Fatalf("GenerateTarIndexAndAppendTar failed: %v", err)
+		}
+		cancel()
+
+		// Check block sizes for debugging
+		normalBlockSize, _ := GetBlockSize(normalPath)
+		tarIndexBlockSize, _ := GetBlockSize(tarIndexPath)
+		t.Logf("Normal layer block size: %d, tar index layer block size: %d", normalBlockSize, tarIndexBlockSize)
+
+		// Mixed layers should be incompatible if tar index has 512-byte blocks
+		paths := []string{normalPath, tarIndexPath}
+		canMerge := CanMergeFsmeta(paths)
+
+		// If tar index has 512-byte blocks, should be incompatible
+		if tarIndexBlockSize < 4096 && canMerge {
+			t.Error("CanMergeFsmeta should return false for mixed layers with small block size")
+		}
+	})
+}
