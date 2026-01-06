@@ -729,7 +729,7 @@ func TestCanMergeFsmeta(t *testing.T) {
 		var paths []string
 
 		// Create two layers with ConvertTarErofs (4096-byte blocks)
-		for i := 0; i < 2; i++ {
+		for i := range 2 {
 			layerPath := filepath.Join(dir, "layer"+string(rune('0'+i))+".erofs")
 			tarBuf := createTestTar(t)
 
