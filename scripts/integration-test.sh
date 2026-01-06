@@ -32,7 +32,7 @@ MULTI_LAYER_IMAGE="${MULTI_LAYER_IMAGE:-ghcr.io/containerd/busybox:1.36}"
 # Runtime options
 CLEANUP_ON_EXIT="${CLEANUP_ON_EXIT:-true}"
 REBUILD_BINARIES="${REBUILD_BINARIES:-false}"
-VERBOSE="${VERBOSE:-false}"
+VERBOSE="${VERBOSE:-true}"
 SINGLE_TEST=""
 JUNIT_OUTPUT=""
 
@@ -706,11 +706,11 @@ test_pull_image() {
 
 # Test: Prepare snapshot and verify rwlayer.img created
 test_prepare_snapshot() {
-    # Get the committed snapshot from the pulled image
+    # Get a committed snapshot from the pulled image (prepare requires Committed parent)
     local parent_snap
-    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | head -1 | awk '{print $1}')
+    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
 
-    assert_not_empty "$parent_snap" "Parent snapshot should exist" || return 1
+    assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
 
     # Prepare an active snapshot
     local snap_name="test-active-${TEST_NAMESPACE}"
@@ -731,11 +731,11 @@ test_prepare_snapshot() {
 
 # Test: View snapshot returns EROFS mount info
 test_view_snapshot() {
-    # Get the committed snapshot from the pulled image
+    # Get a committed snapshot from the pulled image (View requires Committed parent)
     local parent_snap
-    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | head -1 | awk '{print $1}')
+    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
 
-    assert_not_empty "$parent_snap" "Parent snapshot should exist" || return 1
+    assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
 
     # Create a view snapshot
     local view_name="test-view-${TEST_NAMESPACE}"
@@ -765,9 +765,9 @@ test_view_snapshot() {
 test_commit() {
     # Get a committed snapshot from the pulled image to use as parent
     local parent_snap
-    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | head -1 | awk '{print $1}')
+    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
 
-    assert_not_empty "$parent_snap" "Parent snapshot should exist" || return 1
+    assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
 
     log_debug "Using parent snapshot: $parent_snap"
 
@@ -940,11 +940,11 @@ test_nerdctl() {
 
 # Test: Snapshot removal and cleanup
 test_snapshot_cleanup() {
-    # Get the committed snapshot from the pulled image
+    # Get a committed snapshot from the pulled image (prepare requires Committed parent)
     local parent_snap
-    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | head -1 | awk '{print $1}')
+    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
 
-    assert_not_empty "$parent_snap" "Parent snapshot should exist" || return 1
+    assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
 
     # Create a test snapshot
     local snap_name="test-cleanup-${TEST_NAMESPACE}"
@@ -974,11 +974,11 @@ test_snapshot_cleanup() {
 
 # Test: Verify rwlayer.img is created for active snapshots
 test_rwlayer_creation() {
-    # Get the committed snapshot from the pulled image
+    # Get a committed snapshot from the pulled image (prepare requires Committed parent)
     local parent_snap
-    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | head -1 | awk '{print $1}')
+    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
 
-    assert_not_empty "$parent_snap" "Parent snapshot should exist" || return 1
+    assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
 
     # Create an active snapshot
     local snap_name="test-rwlayer-${TEST_NAMESPACE}"
