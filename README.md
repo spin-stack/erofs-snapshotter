@@ -196,13 +196,49 @@ stateDiagram-v2
         └── merged.vmdk      # VMDK descriptor for QEMU (requires --vmdk-desc)
 ```
 
+## Code Structure
+
+```
+internal/
+├── cleanup/       # Context cleanup utilities for graceful shutdown
+├── differ/        # EROFS differ (tar→EROFS conversion, layer comparison)
+├── erofs/         # EROFS conversion utilities (mkfs.erofs wrapper)
+├── fsverity/      # fs-verity support for layer integrity
+├── loop/          # Loop device management
+├── mountutils/    # Mount utilities and helpers
+├── preflight/     # System compatibility checks
+├── snapshotter/   # Main snapshotter implementation
+│   ├── snapshotter.go   # Core struct, config, lifecycle (~200 lines)
+│   ├── paths.go         # Path helpers and constants (~100 lines)
+│   ├── mounts.go        # Mount logic (view, active, diff) (~260 lines)
+│   ├── commit.go        # Commit and EROFS conversion (~220 lines)
+│   └── operations.go    # CRUD operations (~310 lines)
+├── store/         # Namespace-aware content store wrapper
+├── stringutil/    # String utilities
+└── testutil/      # Testing utilities
+
+cmd/
+└── nexuserofs-snapshotter/  # Main entry point
+```
+
+### Key Packages
+
+| Package | Purpose |
+|---------|---------|
+| `snapshotter` | Core containerd snapshotter interface implementation |
+| `differ` | Implements containerd differ interface for tar→EROFS conversion |
+| `erofs` | Low-level EROFS operations (mkfs.erofs wrapper, block size detection) |
+| `loop` | Linux loop device setup/teardown with serial number tracking |
+| `mountutils` | Mount helpers, template resolution, unique reference generation |
+| `preflight` | System compatibility checks (kernel version, EROFS support) |
+
 ## Requirements
 
 ### Runtime
 
 - Linux kernel with EROFS support (5.4+)
 - erofs-utils with the following features:
-  - `--tar=f` or `--tar=i`: Convert tar streams directly to EROFS (required)
+  - `--tar=f` : Convert tar streams directly to EROFS (required)
   - `--aufs`: AUFS-style whiteout handling for OCI layers (required)
   - `--vmdk-desc`: Generate VMDK descriptors for multi-layer images (required for fsmeta)
   - `-Enoinline_data`: Disable inline data for better block alignment
@@ -229,7 +265,7 @@ mkfs.erofs --help | grep -q '\-\-vmdk-desc' && echo "vmdk-desc: OK"
 
 ### Build
 
-- Go 1.23+
+- Go 1.25+
 - [Task](https://taskfile.dev)
 
 ## Building
