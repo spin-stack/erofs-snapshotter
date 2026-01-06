@@ -908,13 +908,32 @@ test_erofs_layers() {
 
 # Test: Verify VMDK layer order matches container registry manifest
 test_vmdk_layer_order() {
-    # Find a VMDK file
-    local vmdk_file
-    vmdk_file=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "merged.vmdk" 2>/dev/null | head -1)
+    # Find the VMDK file with multiple layers (from the multi-layer image)
+    # We need to find a VMDK that has more than 1 layer, not just the first one
+    local vmdk_file=""
+    local best_layer_count=0
+
+    while IFS= read -r candidate; do
+        # Count layers in this VMDK (sha256-*.erofs entries, excluding fsmeta)
+        local layer_count
+        layer_count=$(grep -c "sha256-.*\.erofs" "$candidate" 2>/dev/null || echo 0)
+        log_debug "VMDK $candidate has $layer_count layers"
+
+        if [ "$layer_count" -gt "$best_layer_count" ]; then
+            best_layer_count=$layer_count
+            vmdk_file="$candidate"
+        fi
+    done < <(find "${SNAPSHOTTER_ROOT}/snapshots" -name "merged.vmdk" 2>/dev/null)
 
     if [ -z "$vmdk_file" ]; then
-        log_warn "No VMDK file found, skipping layer order verification"
-        return 0
+        log_error "No VMDK file found"
+        return 1
+    fi
+
+    if [ "$best_layer_count" -lt 2 ]; then
+        log_error "No VMDK with multiple layers found (best had $best_layer_count layers)"
+        log_error "Make sure test_multi_layer ran successfully with a multi-layer image"
+        return 1
     fi
 
     log_info "Verifying VMDK layer order in: $vmdk_file"
