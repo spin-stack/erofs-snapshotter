@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 
@@ -138,9 +139,13 @@ func CheckKernelVersion(minVersion string) error {
 	return nil
 }
 
-// CheckErofsSupport checks if the EROFS filesystem is available.
-// Returns nil if EROFS is supported, otherwise returns an error with instructions.
+// CheckErofsSupport checks if EROFS support is available.
+// This includes both the kernel filesystem support and the mkfs.erofs tool.
+// Returns nil if EROFS is fully supported, otherwise returns an error with instructions.
 func CheckErofsSupport() error {
+	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
+		return fmt.Errorf("mkfs.erofs not found in PATH, please install erofs-utils")
+	}
 	if !isErofsRegistered() {
 		return fmt.Errorf("EROFS filesystem not available, please run: modprobe erofs")
 	}

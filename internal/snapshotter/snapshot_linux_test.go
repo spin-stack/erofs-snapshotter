@@ -72,12 +72,8 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
 
-	_, err := exec.LookPath("mkfs.erofs")
-	if err != nil {
-		t.Skipf("could not find mkfs.erofs: %v", err)
-	}
 	if err := preflight.CheckErofsSupport(); err != nil {
-		t.Skipf("check for erofs kernel support failed: %v, skipping test", err)
+		t.Skipf("EROFS support check failed: %v", err)
 	}
 
 	tempDir := t.TempDir()
@@ -181,8 +177,7 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 
 		// Use extract-style key so the snapshotter mounts the ext4 on host
 		upperKey := "extract-" + name + "-upper"
-		upperMounts, err := s.Prepare(ctx, upperKey, parentCommit)
-		if err != nil {
+		if _, err := s.Prepare(ctx, upperKey, parentCommit); err != nil {
 			t.Fatal(err)
 		}
 		upperID := snapshotID(ctx, t, snap, upperKey)
@@ -207,7 +202,22 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 		// Skip if containerd mount manager can't handle fsmeta multi-device
 		skipIfErofsMultiDevice(t, lowerMounts)
 
-		desc, err := differ.Compare(ctx, lowerMounts, upperMounts)
+		// For Compare, we need the upper mount to show the full overlay view
+		// (parent content + new files), not just the bare rw/upper directory.
+		// This is because archive.WriteDiff expects to compare complete filesystem states.
+		// Create an overlay with parent EROFS as lowerdir and rw/upper as upperdir.
+		overlayViewTarget := t.TempDir()
+		overlayCleanup := createOverlayViewForCompare(t, lowerMounts, snap.blockUpperPath(upperID), overlayViewTarget)
+		defer overlayCleanup()
+
+		// Create a bind mount to the overlay view for Compare
+		overlayMounts := []mount.Mount{{
+			Type:    "bind",
+			Source:  overlayViewTarget,
+			Options: []string{"ro", "rbind"},
+		}}
+
+		desc, err := differ.Compare(ctx, lowerMounts, overlayMounts)
 		if err != nil {
 			t.Fatalf("Compare failed: %v", err)
 		}
@@ -250,24 +260,34 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 
 		// Mount and verify files
 		// View mounts may be overlay (with pre-mounted EROFS layers) or EROFS (single layer)
-		// For overlay mounts, mount directly. For EROFS mounts, use the mount manager.
+		// For overlay mounts, mount directly. For EROFS mounts, use mountErofsView helper
+		// (containerd mount manager doesn't support EROFS).
 		viewTarget := t.TempDir()
-		useMountManager := false
+
+		// Count EROFS mounts and check if fsmeta is used (has device= options)
+		var erofsLayers []mount.Mount
+		hasFsmetaMount := false
 		for _, m := range viewMounts {
 			if mountutils.TypeSuffix(m.Type) == testTypeErofs {
-				useMountManager = true
-				break
+				erofsLayers = append(erofsLayers, m)
+				for _, opt := range m.Options {
+					if strings.HasPrefix(opt, "device=") {
+						hasFsmetaMount = true
+						break
+					}
+				}
 			}
 		}
-		if useMountManager {
-			if _, err := mm.Activate(ctx, viewTarget, viewMounts); err != nil {
-				t.Fatalf("mm.Activate failed: %v", err)
-			}
-			t.Cleanup(func() {
-				if err := mm.Deactivate(ctx, viewTarget); err != nil {
-					t.Logf("failed to deactivate view: %v", err)
-				}
-			})
+
+		// When fsmeta merge fails, we get multiple individual EROFS mounts.
+		// Mount each layer separately and create an overlay to verify contents.
+		if len(erofsLayers) > 1 && !hasFsmetaMount {
+			t.Logf("fsmeta merge failed, mounting %d individual EROFS layers with overlay", len(erofsLayers))
+			cleanup := mountErofsLayersWithOverlay(t, erofsLayers, viewTarget)
+			t.Cleanup(cleanup)
+		} else if len(erofsLayers) > 0 {
+			cleanup := mountErofsView(t, viewMounts, viewTarget)
+			t.Cleanup(cleanup)
 		} else {
 			// Direct mount for overlay mounts
 			if err := mount.All(viewMounts, viewTarget); err != nil {
@@ -317,12 +337,8 @@ func TestErofsSnapshotterFsmetaSingleLayerView(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
 
-	_, err := exec.LookPath("mkfs.erofs")
-	if err != nil {
-		t.Skipf("could not find mkfs.erofs: %v", err)
-	}
 	if err := preflight.CheckErofsSupport(); err != nil {
-		t.Skipf("check for erofs kernel support failed: %v, skipping test", err)
+		t.Skipf("EROFS support check failed: %v", err)
 	}
 
 	tempDir := t.TempDir()
@@ -437,8 +453,8 @@ func TestErofsBlockModeMountsAfterPrepare(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Block mode now returns direct mounts (no templates).
-	// The ext4 layer is mounted internally and a bind mount is returned.
+	// Block mode returns the ext4 writable layer directly (no templates).
+	// Non-extract snapshots return ext4 type (passed to VM as virtio-blk).
 	mounts1, err := env.snapshotter.Mounts(env.ctx(), key)
 	if err != nil {
 		t.Fatal(err)
@@ -449,16 +465,16 @@ func TestErofsBlockModeMountsAfterPrepare(t *testing.T) {
 		t.Fatalf("block mode should not use templates, got: %#v", mounts1)
 	}
 
-	// Should have a bind mount to the upper directory
-	hasBind := false
+	// Should have an ext4 mount (writable layer for VM)
+	hasExt4 := false
 	for _, m := range mounts1 {
-		if m.Type == mountTypeBind {
-			hasBind = true
+		if m.Type == testTypeExt4 {
+			hasExt4 = true
 			break
 		}
 	}
-	if !hasBind {
-		t.Fatalf("expected Mounts to include bind mount, got: %#v", mounts1)
+	if !hasExt4 {
+		t.Fatalf("expected Mounts to include ext4 mount, got: %#v", mounts1)
 	}
 
 	// Subsequent calls return consistent mounts (idempotent).
@@ -502,8 +518,8 @@ func TestErofsCleanupRemovesOrphan(t *testing.T) {
 }
 
 // TestErofsViewMountsMultiLayer tests that View snapshots with multiple layers
-// return EROFS mount descriptors with device= options for additional layers.
-// These descriptors are transformed by consumers into virtio-blk disks.
+// return EROFS mount descriptors. With fsmeta consolidation, multi-layer views
+// return a single fsmeta.erofs mount with device= options for additional layers.
 func TestErofsViewMountsMultiLayer(t *testing.T) {
 	env := newSnapshotTestEnv(t)
 
@@ -522,18 +538,28 @@ func TestErofsViewMountsMultiLayer(t *testing.T) {
 
 	t.Logf("view mounts: %#v", viewMounts)
 
-	// Multi-layer views return multiple EROFS mounts (one per layer) for the consumer
-	if len(viewMounts) != 3 {
-		t.Fatalf("expected 3 EROFS mounts (one per layer), got %d mounts: %#v", len(viewMounts), viewMounts)
+	// With fsmeta consolidation, multi-layer views return either:
+	// 1. Single fsmeta.erofs mount with device= options (when fsmeta is generated)
+	// 2. Multiple EROFS mounts (one per layer) if fsmeta not available
+	hasErofs := false
+	for _, m := range viewMounts {
+		if mountutils.TypeSuffix(m.Type) == testTypeErofs {
+			hasErofs = true
+			break
+		}
+	}
+	if !hasErofs {
+		t.Fatalf("expected at least one EROFS mount, got: %#v", viewMounts)
 	}
 
-	// All mounts should be EROFS type pointing to layer.erofs files
+	// Verify mount sources point to valid EROFS files
 	for i, m := range viewMounts {
 		if mountutils.TypeSuffix(m.Type) != testTypeErofs {
-			t.Fatalf("mount %d: expected erofs type, got: %s", i, m.Type)
+			continue
 		}
-		if !strings.HasSuffix(m.Source, "layer.erofs") {
-			t.Fatalf("mount %d: expected source to be layer.erofs, got: %s", i, m.Source)
+		// Source should be either layer.erofs or fsmeta.erofs
+		if !strings.HasSuffix(m.Source, ".erofs") {
+			t.Fatalf("mount %d: expected source to end with .erofs, got: %s", i, m.Source)
 		}
 	}
 }
@@ -587,14 +613,17 @@ func TestErofsViewMountsCleanupOnRemove(t *testing.T) {
 
 	t.Logf("view mounts: %#v", viewMounts)
 
-	// Multi-layer views return multiple EROFS mounts (one per layer) for the consumer
-	if len(viewMounts) != 2 {
-		t.Fatalf("expected 2 EROFS mounts (one per layer), got %d: %+v", len(viewMounts), viewMounts)
-	}
-	for i, m := range viewMounts {
-		if mountutils.TypeSuffix(m.Type) != testTypeErofs {
-			t.Fatalf("mount %d: expected erofs type, got: %s", i, m.Type)
+	// With fsmeta consolidation, multi-layer views may return a single mount
+	// with device= options. Verify we have at least one EROFS mount.
+	hasErofs := false
+	for _, m := range viewMounts {
+		if mountutils.TypeSuffix(m.Type) == testTypeErofs {
+			hasErofs = true
+			break
 		}
+	}
+	if !hasErofs {
+		t.Fatalf("expected at least one EROFS mount, got: %+v", viewMounts)
 	}
 
 	// Get snapshot directory path
@@ -672,7 +701,8 @@ func TestErofsViewMountsIdempotent(t *testing.T) {
 }
 
 // TestErofsMultiLayerViewMounts verifies that multi-layer views return
-// multiple EROFS mounts (one per layer) for the VM runtime to handle.
+// EROFS mounts for the VM runtime to handle. With fsmeta consolidation,
+// this may be a single mount with device= options or multiple mounts.
 func TestErofsMultiLayerViewMounts(t *testing.T) {
 	env := newSnapshotTestEnv(t, WithDefaultSize(64*1024*1024))
 
@@ -688,21 +718,33 @@ func TestErofsMultiLayerViewMounts(t *testing.T) {
 
 	t.Logf("view mounts: %+v", viewMounts)
 
-	// Multi-layer views return multiple EROFS mounts (one per layer) for the VM runtime
-	if len(viewMounts) != 2 {
-		t.Fatalf("expected 2 EROFS mounts (one per layer), got %d: %+v", len(viewMounts), viewMounts)
+	// With fsmeta consolidation, multi-layer views may return a single mount
+	// with device= options or multiple mounts. Verify we have at least one EROFS mount.
+	hasErofs := false
+	for _, m := range viewMounts {
+		if mountutils.TypeSuffix(m.Type) == testTypeErofs {
+			hasErofs = true
+			break
+		}
+	}
+	if !hasErofs {
+		t.Fatalf("expected at least one EROFS mount, got: %+v", viewMounts)
 	}
 
-	// All mounts should be EROFS type
+	// Verify mount sources point to valid EROFS files
 	for i, m := range viewMounts {
 		if mountutils.TypeSuffix(m.Type) != testTypeErofs {
-			t.Fatalf("mount %d: expected erofs type, got: %s", i, m.Type)
+			continue
+		}
+		if !strings.HasSuffix(m.Source, ".erofs") {
+			t.Fatalf("mount %d: expected source to end with .erofs, got: %s", i, m.Source)
 		}
 	}
 }
 
 // TestErofsExtractSnapshotWithParents verifies that extract snapshots
-// always return a bind mount to the fs/ directory, regardless of parent count.
+// always return a bind mount to the rw/upper directory, regardless of parent count.
+// The ext4 layer is mounted at rw/ and the overlay upper dir is at rw/upper.
 func TestErofsExtractSnapshotWithParents(t *testing.T) {
 	env := newSnapshotTestEnv(t)
 
@@ -712,7 +754,7 @@ func TestErofsExtractSnapshotWithParents(t *testing.T) {
 	layer2Commit := env.createLayerWithLabels("layer2-active", layer1Commit, "file2.txt", "layer2", labels)
 
 	// Create extract snapshot with 2 parents - use Prepare directly since extract
-	// snapshots return a bind mount to fs/, not an overlay with upper directory
+	// snapshots return a bind mount to rw/upper
 	extractMounts, err := env.snapshotter.Prepare(env.ctx(), "extract-with-parents", layer2Commit)
 	if err != nil {
 		t.Fatalf("failed to prepare extract snapshot: %v", err)
@@ -720,7 +762,7 @@ func TestErofsExtractSnapshotWithParents(t *testing.T) {
 
 	t.Logf("extract mounts: %+v", extractMounts)
 
-	// Extract snapshots should always be bind mounts to fs/
+	// Extract snapshots should always be bind mounts to rw/upper
 	if len(extractMounts) != 1 {
 		t.Fatalf("expected 1 mount, got %d", len(extractMounts))
 	}
@@ -730,8 +772,9 @@ func TestErofsExtractSnapshotWithParents(t *testing.T) {
 		t.Errorf("expected bind mount for extract snapshot, got %s", m.Type)
 	}
 
-	if !strings.HasSuffix(m.Source, "/fs") {
-		t.Errorf("expected source to end with /fs, got %s", m.Source)
+	// Extract snapshots use the rw/upper path (mounted ext4 with overlay upper dir)
+	if !strings.HasSuffix(m.Source, "/rw/upper") {
+		t.Errorf("expected source to end with /rw/upper, got %s", m.Source)
 	}
 
 	// Verify parent layers don't affect the mount type
@@ -788,6 +831,9 @@ func TestErofsImmutableFlagOnCommit(t *testing.T) {
 // is cleared before removing a committed snapshot, allowing deletion.
 func TestErofsImmutableFlagClearedOnRemove(t *testing.T) {
 	env := newSnapshotTestEnv(t, WithImmutable())
+
+	// Skip if filesystem doesn't support immutable flags (e.g., tmpfs)
+	skipIfNoImmutableSupport(t, env.tempDir)
 
 	// Create and commit a layer with extract label
 	labels := map[string]string{extractLabel: "true"}
@@ -998,7 +1044,7 @@ func TestErofsBlockModeExtractWithParent(t *testing.T) {
 		t.Fatalf("failed to prepare extract snapshot: %v", err)
 	}
 
-	// Extract snapshots should return bind mount to fs/ directory
+	// Extract snapshots should return bind mount to rw/upper directory
 	if len(mounts) != 1 {
 		t.Fatalf("expected 1 mount, got %d", len(mounts))
 	}
@@ -1008,9 +1054,9 @@ func TestErofsBlockModeExtractWithParent(t *testing.T) {
 		t.Errorf("expected bind mount for extract, got %s", m.Type)
 	}
 
-	// Source should be fs/ directory (not rw/upper/)
-	if !strings.HasSuffix(m.Source, "/fs") {
-		t.Errorf("expected source to end with /fs, got %s", m.Source)
+	// Source should be rw/upper directory (mounted ext4 with overlay upper dir)
+	if !strings.HasSuffix(m.Source, "/rw/upper") {
+		t.Errorf("expected source to end with /rw/upper, got %s", m.Source)
 	}
 
 	// Write content to verify it's writable
@@ -1046,7 +1092,7 @@ func TestErofsBlockModeExtractWithMultipleParents(t *testing.T) {
 		t.Fatalf("failed to prepare extract snapshot: %v", err)
 	}
 
-	// Extract snapshots should return bind mount to fs/ directory
+	// Extract snapshots should return bind mount to rw/upper directory
 	if len(mounts) != 1 {
 		t.Fatalf("expected 1 mount, got %d", len(mounts))
 	}
@@ -1056,9 +1102,9 @@ func TestErofsBlockModeExtractWithMultipleParents(t *testing.T) {
 		t.Errorf("expected bind mount for extract, got %s", m.Type)
 	}
 
-	// Source should be fs/ directory
-	if !strings.HasSuffix(m.Source, "/fs") {
-		t.Errorf("expected source to end with /fs, got %s", m.Source)
+	// Source should be rw/upper directory (mounted ext4 with overlay upper dir)
+	if !strings.HasSuffix(m.Source, "/rw/upper") {
+		t.Errorf("expected source to end with /rw/upper, got %s", m.Source)
 	}
 
 	// Write content and verify

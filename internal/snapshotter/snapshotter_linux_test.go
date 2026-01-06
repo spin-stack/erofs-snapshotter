@@ -44,6 +44,7 @@ package erofs
 import (
 	"archive/tar"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -63,6 +64,8 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/aledbf/nexuserofs/internal/fsverity"
+	"github.com/aledbf/nexuserofs/internal/loop"
+	"github.com/aledbf/nexuserofs/internal/mountutils"
 	"github.com/aledbf/nexuserofs/internal/preflight"
 )
 
@@ -76,6 +79,23 @@ const vmOnlySkipMessage = "SKIPPED: EROFS snapshotter is VM-only; returns raw fi
 func skipIfVMOnly(t *testing.T) {
 	t.Helper()
 	t.Skip(vmOnlySkipMessage)
+}
+
+// skipIfNoImmutableSupport skips the test if the filesystem doesn't support
+// the FS_IOC_GETFLAGS ioctl (e.g., tmpfs doesn't support immutable flags).
+func skipIfNoImmutableSupport(t *testing.T, dir string) {
+	t.Helper()
+	// Create a test file to check if FS_IOC_GETFLAGS is supported
+	testFile := filepath.Join(dir, ".immutable-test")
+	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
+		t.Skipf("failed to create test file: %v", err)
+	}
+	defer os.Remove(testFile)
+
+	// Try to get inode flags using lsattr (which uses FS_IOC_GETFLAGS)
+	if _, err := exec.Command("lsattr", testFile).CombinedOutput(); err != nil {
+		t.Skip("filesystem does not support immutable flags (FS_IOC_GETFLAGS)")
+	}
 }
 
 const (
@@ -107,11 +127,8 @@ func newSnapshotTestEnv(t *testing.T, opts ...Opt) *snapshotTestEnv {
 	t.Helper()
 	testutil.RequiresRoot(t)
 
-	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
-		t.Skipf("could not find mkfs.erofs: %v", err)
-	}
 	if err := preflight.CheckErofsSupport(); err != nil {
-		t.Skipf("check for erofs kernel support failed: %v, skipping test", err)
+		t.Skipf("EROFS support check failed: %v", err)
 	}
 
 	tempDir := t.TempDir()
@@ -206,13 +223,8 @@ func (e *snapshotTestEnv) createView(key, parentKey string) []mount.Mount {
 }
 
 func newSnapshotter(t *testing.T, opts ...Opt) func(ctx context.Context, root string) (snapshots.Snapshotter, func() error, error) {
-	_, err := exec.LookPath("mkfs.erofs")
-	if err != nil {
-		t.Skipf("could not find mkfs.erofs: %v", err)
-	}
-
 	if err := preflight.CheckErofsSupport(); err != nil {
-		t.Skipf("check for erofs kernel support failed: %v, skipping test", err)
+		t.Skipf("EROFS support check failed: %v", err)
 	}
 	return func(ctx context.Context, root string) (snapshots.Snapshotter, func() error, error) {
 		//nolint:contextcheck // NewSnapshotter follows containerd interface (no context param)
@@ -408,5 +420,237 @@ func cleanupAllSnapshots(ctx context.Context, s snapshots.Snapshotter) {
 	// Call Cleanup to unmount EROFS layers and release resources
 	if cleaner, ok := s.(interface{ Cleanup(context.Context) error }); ok {
 		_ = cleaner.Cleanup(ctx)
+	}
+}
+
+// mountErofsView mounts EROFS view mounts at the target directory for testing.
+// The containerd mount manager doesn't support EROFS, so we mount directly.
+// Returns a cleanup function to unmount and detach loop devices.
+//
+// This handles both single-device and multi-device EROFS mounts:
+// - Single device: mount -t erofs -o loop /path/to/layer.erofs /target
+// - Multi-device: set up loop devices, then mount with device= options
+func mountErofsView(t *testing.T, mounts []mount.Mount, target string) func() {
+	t.Helper()
+
+	if len(mounts) == 0 {
+		t.Fatal("no mounts to mount")
+	}
+
+	// Find the EROFS mount
+	var erofsMount *mount.Mount
+	for i := range mounts {
+		if mountutils.TypeSuffix(mounts[i].Type) == "erofs" {
+			erofsMount = &mounts[i]
+			break
+		}
+	}
+	if erofsMount == nil {
+		t.Fatalf("no EROFS mount found in: %#v", mounts)
+	}
+
+	// Collect device= options for multi-device EROFS
+	var devices []string
+	var otherOpts []string
+	for _, opt := range erofsMount.Options {
+		if strings.HasPrefix(opt, "device=") {
+			devices = append(devices, strings.TrimPrefix(opt, "device="))
+		} else if opt != "loop" {
+			otherOpts = append(otherOpts, opt)
+		}
+	}
+
+	var loopDevices []*loop.Device
+	var cleanup func()
+
+	if len(devices) == 0 {
+		// Single-device EROFS: use mount -o loop directly
+		args := []string{"-t", "erofs", "-o", strings.Join(append(otherOpts, "loop"), ",")}
+		args = append(args, erofsMount.Source, target)
+		cmd := exec.Command("mount", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("failed to mount EROFS: %v: %s", err, out)
+		}
+		cleanup = func() {
+			exec.Command("umount", target).Run()
+		}
+	} else {
+		// Multi-device EROFS: set up loop devices for each blob
+		// First, set up loop device for the main fsmeta
+		mainDev, err := loop.Setup(erofsMount.Source, loop.Config{ReadOnly: true})
+		if err != nil {
+			t.Fatalf("failed to setup loop device for %s: %v", erofsMount.Source, err)
+		}
+		loopDevices = append(loopDevices, mainDev)
+
+		// Set up loop devices for each device= blob
+		var deviceOpts []string
+		for _, dev := range devices {
+			loopDev, err := loop.Setup(dev, loop.Config{ReadOnly: true})
+			if err != nil {
+				// Cleanup already created loop devices
+				for _, l := range loopDevices {
+					l.Detach()
+				}
+				t.Fatalf("failed to setup loop device for %s: %v", dev, err)
+			}
+			loopDevices = append(loopDevices, loopDev)
+			deviceOpts = append(deviceOpts, fmt.Sprintf("device=%s", loopDev.Path))
+		}
+
+		// Mount with device= options pointing to loop devices
+		allOpts := append(otherOpts, deviceOpts...)
+		args := []string{"-t", "erofs", "-o", strings.Join(allOpts, ",")}
+		args = append(args, mainDev.Path, target)
+		cmd := exec.Command("mount", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			// Cleanup loop devices on failure
+			for _, l := range loopDevices {
+				l.Detach()
+			}
+			t.Fatalf("failed to mount multi-device EROFS: %v: %s", err, out)
+		}
+
+		cleanup = func() {
+			exec.Command("umount", target).Run()
+			for _, l := range loopDevices {
+				l.Detach()
+			}
+		}
+	}
+
+	return cleanup
+}
+
+// createOverlayViewForCompare creates an overlay mount at target that combines
+// parent EROFS layer(s) with the upper directory. This is needed because
+// archive.WriteDiff expects to see the full desired state, not just the new files.
+// Returns a cleanup function to unmount everything.
+func createOverlayViewForCompare(t *testing.T, parentMounts []mount.Mount, upperDir, target string) func() {
+	t.Helper()
+
+	if len(parentMounts) == 0 {
+		t.Fatal("no parent mounts provided")
+	}
+
+	// Mount the parent EROFS layer(s) to use as lowerdir
+	parentMount := t.TempDir()
+	parentCleanup := mountErofsView(t, parentMounts, parentMount)
+
+	// Create workdir for overlay in the same filesystem as upperdir
+	// (overlay requires upperdir and workdir to be on the same filesystem)
+	// The upperDir is inside the mounted ext4 at /rw/upper, so workdir goes at /rw/work
+	workdir := filepath.Join(filepath.Dir(upperDir), "work")
+	if err := os.MkdirAll(workdir, 0755); err != nil {
+		parentCleanup()
+		t.Fatalf("failed to create workdir: %v", err)
+	}
+
+	// Create overlay with parent as lowerdir and rw/upper as upperdir
+	// Note: We use the parent's contents as lowerdir so the diff only sees new/modified files
+	overlayOpts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", parentMount, upperDir, workdir)
+	args := []string{"-t", "overlay", "-o", overlayOpts, "overlay", target}
+	cmd := exec.Command("mount", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		parentCleanup()
+		t.Fatalf("failed to mount overlay for compare: %v: %s", err, out)
+	}
+
+	return func() {
+		exec.Command("umount", target).Run()
+		parentCleanup()
+	}
+}
+
+// mountErofsLayersWithOverlay mounts multiple individual EROFS layers and creates
+// an overlay to combine them. This is used when fsmeta merge fails and we fall back
+// to individual layer mounts.
+// Returns a cleanup function to unmount everything.
+func mountErofsLayersWithOverlay(t *testing.T, layers []mount.Mount, target string) func() {
+	t.Helper()
+
+	if len(layers) == 0 {
+		t.Fatal("no layers to mount")
+	}
+
+	// Mount each EROFS layer at a separate temp directory
+	var layerDirs []string
+	var loopDevices []*loop.Device
+
+	for i, m := range layers {
+		layerDir := filepath.Join(t.TempDir(), fmt.Sprintf("layer%d", i))
+		if err := os.MkdirAll(layerDir, 0755); err != nil {
+			t.Fatalf("failed to create layer dir: %v", err)
+		}
+
+		// Set up loop device for this layer
+		loopDev, err := loop.Setup(m.Source, loop.Config{ReadOnly: true})
+		if err != nil {
+			// Cleanup on failure
+			for _, l := range loopDevices {
+				l.Detach()
+			}
+			t.Fatalf("failed to setup loop device for %s: %v", m.Source, err)
+		}
+		loopDevices = append(loopDevices, loopDev)
+
+		// Mount EROFS layer
+		args := []string{"-t", "erofs", "-o", "ro", loopDev.Path, layerDir}
+		cmd := exec.Command("mount", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			// Cleanup on failure
+			for _, l := range loopDevices {
+				l.Detach()
+			}
+			t.Fatalf("failed to mount EROFS layer %s: %v: %s", m.Source, err, out)
+		}
+		layerDirs = append(layerDirs, layerDir)
+	}
+
+	// Create overlay with all layers as lowerdirs
+	// Layers are ordered newest to oldest (same as ParentIDs), which is the correct order for lowerdir
+	lowerdir := strings.Join(layerDirs, ":")
+
+	// Debug: list contents of each layer
+	for i, dir := range layerDirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Logf("layer %d (%s): error reading: %v", i, dir, err)
+		} else {
+			var names []string
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			t.Logf("layer %d (%s): %v", i, dir, names)
+		}
+	}
+
+	// Create workdir and upperdir for the overlay (required even for read-only)
+	// Actually for read-only overlay we don't need upperdir/workdir, just use lowerdir
+	overlayOpts := fmt.Sprintf("lowerdir=%s", lowerdir)
+	args := []string{"-t", "overlay", "-o", overlayOpts, "overlay", target}
+	cmd := exec.Command("mount", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// Cleanup on failure
+		for _, dir := range layerDirs {
+			exec.Command("umount", dir).Run()
+		}
+		for _, l := range loopDevices {
+			l.Detach()
+		}
+		t.Fatalf("failed to mount overlay: %v: %s", err, out)
+	}
+
+	return func() {
+		// Unmount overlay first
+		exec.Command("umount", target).Run()
+		// Unmount each layer
+		for _, dir := range layerDirs {
+			exec.Command("umount", dir).Run()
+		}
+		// Detach loop devices
+		for _, l := range loopDevices {
+			l.Detach()
+		}
 	}
 }
