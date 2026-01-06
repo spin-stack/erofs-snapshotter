@@ -8,7 +8,7 @@
 # Options:
 #   --test NAME     Run only the specified test (e.g., --test pull_image)
 #   --keep          Keep data directories after exit for debugging
-#   --skip-build    Skip building the snapshotter (use existing binary)
+#   --rebuild       Rebuild binaries from source (default: use pre-built)
 #   --verbose, -v   Enable verbose output
 #   --junit FILE    Generate JUnit XML report (default: /tmp/integration-logs/junit.xml)
 #   -h, --help      Show this help message
@@ -31,7 +31,7 @@ MULTI_LAYER_IMAGE="${MULTI_LAYER_IMAGE:-ghcr.io/containerd/busybox:1.36}"
 
 # Runtime options
 CLEANUP_ON_EXIT="${CLEANUP_ON_EXIT:-true}"
-SKIP_BUILD="${SKIP_BUILD:-false}"
+REBUILD_BINARIES="${REBUILD_BINARIES:-false}"
 VERBOSE="${VERBOSE:-false}"
 SINGLE_TEST=""
 JUNIT_OUTPUT=""
@@ -248,8 +248,8 @@ while [[ $# -gt 0 ]]; do
             CLEANUP_ON_EXIT=false
             shift
             ;;
-        --skip-build)
-            SKIP_BUILD=true
+        --rebuild)
+            REBUILD_BINARIES=true
             shift
             ;;
         -v|--verbose)
@@ -387,14 +387,27 @@ EOF
     log_info "Generated containerd config at /etc/containerd/config.toml"
 }
 
-# Build snapshotter binary and tools
+# Build snapshotter binary and tools (or use pre-built)
 build_snapshotter() {
-    if [ "${SKIP_BUILD}" = "true" ] && [ -x /usr/local/bin/nexus-erofs-snapshotter ]; then
-        log_info "Skipping build, using existing binary"
-        return 0
+    # Check if pre-built binaries exist and we're not forcing rebuild
+    if [ "${REBUILD_BINARIES}" != "true" ]; then
+        if [ -x /usr/local/bin/nexus-erofs-snapshotter ]; then
+            log_info "Using pre-built nexus-erofs-snapshotter"
+            if [ -x /usr/local/bin/integration-commit ]; then
+                log_info "Using pre-built integration-commit"
+            fi
+            return 0
+        fi
     fi
 
-    log_info "Building nexus-erofs-snapshotter..."
+    # Check if Go is available for building
+    if ! command -v go &>/dev/null; then
+        log_error "Go not found and no pre-built binaries available"
+        log_error "Either use a pre-built image or mount a workspace with Go installed"
+        return 1
+    fi
+
+    log_info "Building nexus-erofs-snapshotter from source..."
     cd /workspace
     CGO_ENABLED=0 go build -buildvcs=false -o /usr/local/bin/nexus-erofs-snapshotter ./cmd/nexus-erofs-snapshotter
     log_info "Snapshotter built successfully"

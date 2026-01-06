@@ -1,18 +1,77 @@
 # Dockerfile for integration tests with containerd and nexus-erofs snapshotter
 # Build: docker build -t nexus-erofs-integration -f Dockerfile.integration .
-# Run:   docker run --privileged --rm -v $(pwd):/workspace nexus-erofs-integration
+# Run:   docker run --privileged --rm nexus-erofs-integration
+#
+# Multi-stage build for smaller image size:
+# - Stage 1 (go-builder): Builds Go binaries
+# - Stage 2 (erofs-builder): Builds erofs-utils from source
+# - Stage 3 (runtime): Minimal Ubuntu with only runtime dependencies
 
 ARG GO_VERSION=1.25
 ARG NERDCTL_VERSION=2.2.1
+ARG UBUNTU_VERSION=25.10
 
-FROM golang:${GO_VERSION}
+# =============================================================================
+# Stage 1: Build Go binaries
+# =============================================================================
+FROM golang:${GO_VERSION} AS go-builder
+
+WORKDIR /build
+
+# Copy go.mod and go.sum first for better layer caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the snapshotter and integration-commit tool
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false \
+    -ldflags="-s -w" \
+    -o /out/nexus-erofs-snapshotter \
+    ./cmd/nexus-erofs-snapshotter
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false \
+    -ldflags="-s -w" \
+    -o /out/integration-commit \
+    ./cmd/integration-commit
+
+# =============================================================================
+# Stage 2: Build erofs-utils
+# =============================================================================
+FROM ubuntu:${UBUNTU_VERSION} AS erofs-builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    uuid-dev \
+    liblz4-dev \
+    libzstd-dev \
+    zlib1g-dev \
+    liblzma-dev \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and run the erofs-utils build script
+COPY scripts/build-erofs-utils.sh /tmp/build-erofs-utils.sh
+RUN /tmp/build-erofs-utils.sh /usr/local
+
+# =============================================================================
+# Stage 3: Runtime image
+# =============================================================================
+FROM ubuntu:${UBUNTU_VERSION}
 
 # OCI labels for GitHub Container Registry
 LABEL org.opencontainers.image.source=https://github.com/aledbf/nexus-erofs
 LABEL org.opencontainers.image.description="Integration test environment for nexus-erofs snapshotter"
 LABEL org.opencontainers.image.licenses=Apache-2.0
 
-# Install runtime dependencies
+# Install runtime dependencies only
 RUN apt-get update && apt-get install -y --no-install-recommends \
     e2fsprogs \
     kmod \
@@ -21,20 +80,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     runc \
     fuse3 \
     procps \
-    git \
+    liblz4-1 \
+    libzstd1 \
+    zlib1g \
+    liblzma5 \
+    libuuid1 \
+    xxd \
+    isal \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and run the erofs-utils build script
-COPY scripts/build-erofs-utils.sh /tmp/build-erofs-utils.sh
-RUN /tmp/build-erofs-utils.sh /usr/local && rm /tmp/build-erofs-utils.sh
+# Copy erofs-utils binaries from builder
+COPY --from=erofs-builder /usr/local/bin/mkfs.erofs /usr/local/bin/
+COPY --from=erofs-builder /usr/local/bin/fsck.erofs /usr/local/bin/
+COPY --from=erofs-builder /usr/local/bin/dump.erofs /usr/local/bin/
 
 # Verify erofs-utils installation
 RUN mkfs.erofs --version
 
-# Install nerdctl
+# Copy Go binaries from builder
+COPY --from=go-builder /out/nexus-erofs-snapshotter /usr/local/bin/
+COPY --from=go-builder /out/integration-commit /usr/local/bin/
+
+# Install nerdctl (containerd + ctr + nerdctl bundle)
 ARG NERDCTL_VERSION
-RUN curl -sSL "https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}/nerdctl-full-${NERDCTL_VERSION}-linux-amd64.tar.gz" | \
-    tar -xz -C /usr/local
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && curl -sSL "https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}/nerdctl-full-${NERDCTL_VERSION}-linux-amd64.tar.gz" | \
+       tar -xz -C /usr/local \
+    && apt-get purge -y curl \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create loop devices (up to loop31 for integration tests)
 RUN for i in $(seq 0 31); do \
