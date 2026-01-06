@@ -100,12 +100,11 @@ func (e *snapshotTestEnv) ctx() context.Context {
 // newSnapshotTestEnv creates a new test environment with all prerequisites checked.
 // It skips the test if EROFS support is not available.
 //
-// NOTE: This helper is SKIPPED because the EROFS snapshotter is VM-only.
-// Tests using this helper expect host-mountable filesystems, but the snapshotter
-// returns raw file paths for virtio-blk devices.
+// NOTE: Tests using this helper must use extract-style keys ("extract-" prefix)
+// when calling Prepare() to write files. This ensures the ext4 writable layer
+// is mounted on the host, allowing content to be written.
 func newSnapshotTestEnv(t *testing.T, opts ...Opt) *snapshotTestEnv {
 	t.Helper()
-	skipIfVMOnly(t) // Tests using this helper require host mounting
 	testutil.RequiresRoot(t)
 
 	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
@@ -149,19 +148,21 @@ func newSnapshotTestEnv(t *testing.T, opts ...Opt) *snapshotTestEnv {
 func (e *snapshotTestEnv) createLayer(key, parentKey, filename, content string) string {
 	e.t.Helper()
 
-	if _, err := e.snapshotter.Prepare(e.ctx(), key, parentKey); err != nil {
-		e.t.Fatalf("failed to prepare %s: %v", key, err)
+	// Use extract-style key so the snapshotter mounts the ext4 on host
+	extractKey := "extract-" + key
+	if _, err := e.snapshotter.Prepare(e.ctx(), extractKey, parentKey); err != nil {
+		e.t.Fatalf("failed to prepare %s: %v", extractKey, err)
 	}
 
-	id := snapshotID(e.ctx(), e.t, e.snapshotter, key)
+	id := snapshotID(e.ctx(), e.t, e.snapshotter, extractKey)
 	filePath := filepath.Join(e.snapshotter.blockUpperPath(id), filename)
 	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
 		e.t.Fatalf("failed to write %s: %v", filename, err)
 	}
 
 	commitKey := key + "-commit"
-	if err := e.snapshotter.Commit(e.ctx(), commitKey, key); err != nil {
-		e.t.Fatalf("failed to commit %s: %v", key, err)
+	if err := e.snapshotter.Commit(e.ctx(), commitKey, extractKey); err != nil {
+		e.t.Fatalf("failed to commit %s: %v", extractKey, err)
 	}
 
 	return commitKey
@@ -172,19 +173,21 @@ func (e *snapshotTestEnv) createLayer(key, parentKey, filename, content string) 
 func (e *snapshotTestEnv) createLayerWithLabels(key, parentKey, filename, content string, labels map[string]string) string {
 	e.t.Helper()
 
-	if _, err := e.snapshotter.Prepare(e.ctx(), key, parentKey, snapshots.WithLabels(labels)); err != nil {
-		e.t.Fatalf("failed to prepare %s: %v", key, err)
+	// Use extract-style key so the snapshotter mounts the ext4 on host
+	extractKey := "extract-" + key
+	if _, err := e.snapshotter.Prepare(e.ctx(), extractKey, parentKey, snapshots.WithLabels(labels)); err != nil {
+		e.t.Fatalf("failed to prepare %s: %v", extractKey, err)
 	}
 
-	id := snapshotID(e.ctx(), e.t, e.snapshotter, key)
+	id := snapshotID(e.ctx(), e.t, e.snapshotter, extractKey)
 	filePath := filepath.Join(e.snapshotter.blockUpperPath(id), filename)
 	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
 		e.t.Fatalf("failed to write %s: %v", filename, err)
 	}
 
 	commitKey := key + "-commit"
-	if err := e.snapshotter.Commit(e.ctx(), commitKey, key); err != nil {
-		e.t.Fatalf("failed to commit %s: %v", key, err)
+	if err := e.snapshotter.Commit(e.ctx(), commitKey, extractKey); err != nil {
+		e.t.Fatalf("failed to commit %s: %v", extractKey, err)
 	}
 
 	return commitKey
