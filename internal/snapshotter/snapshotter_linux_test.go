@@ -424,12 +424,8 @@ func cleanupAllSnapshots(ctx context.Context, s snapshots.Snapshotter) {
 }
 
 // mountErofsView mounts EROFS view mounts at the target directory for testing.
-// The containerd mount manager doesn't support EROFS, so we mount directly.
+// Uses mountutils.MountAll which handles both single-device and multi-device EROFS mounts.
 // Returns a cleanup function to unmount and detach loop devices.
-//
-// This handles both single-device and multi-device EROFS mounts:
-// - Single device: mount -t erofs -o loop /path/to/layer.erofs /target
-// - Multi-device: set up loop devices, then mount with device= options
 func mountErofsView(t *testing.T, mounts []mount.Mount, target string) func() {
 	t.Helper()
 
@@ -437,89 +433,16 @@ func mountErofsView(t *testing.T, mounts []mount.Mount, target string) func() {
 		t.Fatal("no mounts to mount")
 	}
 
-	// Find the EROFS mount
-	var erofsMount *mount.Mount
-	for i := range mounts {
-		if mountutils.TypeSuffix(mounts[i].Type) == "erofs" {
-			erofsMount = &mounts[i]
-			break
-		}
-	}
-	if erofsMount == nil {
-		t.Fatalf("no EROFS mount found in: %#v", mounts)
+	cleanup, err := mountutils.MountAll(mounts, target)
+	if err != nil {
+		t.Fatalf("failed to mount EROFS: %v", err)
 	}
 
-	// Collect device= options for multi-device EROFS
-	var devices []string
-	var otherOpts []string
-	for _, opt := range erofsMount.Options {
-		if strings.HasPrefix(opt, "device=") {
-			devices = append(devices, strings.TrimPrefix(opt, "device="))
-		} else if opt != "loop" {
-			otherOpts = append(otherOpts, opt)
+	return func() {
+		if err := cleanup(); err != nil {
+			t.Logf("cleanup error: %v", err)
 		}
 	}
-
-	var loopDevices []*loop.Device
-	var cleanup func()
-
-	if len(devices) == 0 {
-		// Single-device EROFS: use mount -o loop directly
-		args := []string{"-t", "erofs", "-o", strings.Join(append(otherOpts, "loop"), ",")}
-		args = append(args, erofsMount.Source, target)
-		cmd := exec.Command("mount", args...)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("failed to mount EROFS: %v: %s", err, out)
-		}
-		cleanup = func() {
-			exec.Command("umount", target).Run()
-		}
-	} else {
-		// Multi-device EROFS: set up loop devices for each blob
-		// First, set up loop device for the main fsmeta
-		mainDev, err := loop.Setup(erofsMount.Source, loop.Config{ReadOnly: true})
-		if err != nil {
-			t.Fatalf("failed to setup loop device for %s: %v", erofsMount.Source, err)
-		}
-		loopDevices = append(loopDevices, mainDev)
-
-		// Set up loop devices for each device= blob
-		var deviceOpts []string
-		for _, dev := range devices {
-			loopDev, err := loop.Setup(dev, loop.Config{ReadOnly: true})
-			if err != nil {
-				// Cleanup already created loop devices
-				for _, l := range loopDevices {
-					l.Detach()
-				}
-				t.Fatalf("failed to setup loop device for %s: %v", dev, err)
-			}
-			loopDevices = append(loopDevices, loopDev)
-			deviceOpts = append(deviceOpts, fmt.Sprintf("device=%s", loopDev.Path))
-		}
-
-		// Mount with device= options pointing to loop devices
-		allOpts := append(otherOpts, deviceOpts...)
-		args := []string{"-t", "erofs", "-o", strings.Join(allOpts, ",")}
-		args = append(args, mainDev.Path, target)
-		cmd := exec.Command("mount", args...)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			// Cleanup loop devices on failure
-			for _, l := range loopDevices {
-				l.Detach()
-			}
-			t.Fatalf("failed to mount multi-device EROFS: %v: %s", err, out)
-		}
-
-		cleanup = func() {
-			exec.Command("umount", target).Run()
-			for _, l := range loopDevices {
-				l.Detach()
-			}
-		}
-	}
-
-	return cleanup
 }
 
 // createOverlayViewForCompareWithMountedLower creates an overlay mount at target that combines
