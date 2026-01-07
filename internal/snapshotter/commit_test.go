@@ -2,6 +2,7 @@ package snapshotter
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -67,20 +68,10 @@ func TestResolveCommitSource(t *testing.T) {
 
 		// Should be a BlockMountError (indicating block mode was attempted)
 		var blockErr *BlockMountError
-		if !containsBlockMountError(err) {
-			t.Errorf("expected BlockMountError, got: %v", err)
+		if !errors.As(err, &blockErr) {
+			t.Errorf("expected BlockMountError in error chain, got: %v", err)
 		}
-		_ = blockErr // silence unused warning
 	})
-}
-
-// containsBlockMountError checks if err contains a BlockMountError.
-func containsBlockMountError(err error) bool {
-	if err == nil {
-		return false
-	}
-	_, ok := err.(*BlockMountError)
-	return ok
 }
 
 func TestCommitSourceFromOverlay(t *testing.T) {
