@@ -186,8 +186,9 @@ jobs:
             --tmpfs /run:exec \
             --tmpfs /var/lib/containerd-test:exec \
             --tmpfs /var/lib/nexus-erofs-snapshotter:exec \
+            --entrypoint /usr/local/bin/integration.test \
             nexus-erofs-integration:local \
-            /usr/local/bin/integration.test -test.v -test.timeout 10m -test.root
+            -test.v -test.timeout 10m -test.root
 
       - name: Upload logs on failure
         if: failure()
