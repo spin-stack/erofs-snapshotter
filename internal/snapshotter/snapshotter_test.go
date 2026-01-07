@@ -298,18 +298,20 @@ func TestMountFsMetaReturnsFormatErofs(t *testing.T) {
 
 func TestMountFsMetaDeviceOrder(t *testing.T) {
 	// This test verifies that mountFsMeta returns device= options in oldest-first order,
-	// matching the order used when generating fsmeta with mkfs.erofs.
+	// matching containerd's approach (backward iteration through ParentIDs).
+	// See: https://github.com/containerd/containerd/pull/12374
 
 	root := t.TempDir()
 	s := &snapshotter{root: root}
 
 	// Create 3 parent snapshot directories with layer blobs
-	// ParentIDs order: [parent3, parent2, parent1] (newest to oldest)
-	// Expected device order: [parent1, parent2, parent3] (oldest to newest)
+	// ParentIDs order: [parent3, parent2, parent1] (newest to oldest, as containerd provides)
+	// Expected device order after backward iteration: [parent1, parent2, parent3] (oldest to newest)
 	parentIDs := []string{"parent3", "parent2", "parent1"}
-	var expectedOrder []string
 
-	for _, pid := range []string{"parent1", "parent2", "parent3"} { // oldest to newest
+	// Create layer blobs for each parent
+	layerPaths := make(map[string]string)
+	for _, pid := range parentIDs {
 		snapshotDir := filepath.Join(root, "snapshots", pid)
 		if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 			t.Fatal(err)
@@ -319,7 +321,15 @@ func TestMountFsMetaDeviceOrder(t *testing.T) {
 		if err := os.WriteFile(layerPath, []byte("fake"), 0644); err != nil {
 			t.Fatal(err)
 		}
-		expectedOrder = append(expectedOrder, "device="+layerPath)
+		layerPaths[pid] = layerPath
+	}
+
+	// Expected order: backward iteration through parentIDs gives oldest-first
+	// parentIDs = [parent3, parent2, parent1], backward = [parent1, parent2, parent3]
+	expectedOrder := []string{
+		"device=" + layerPaths["parent1"],
+		"device=" + layerPaths["parent2"],
+		"device=" + layerPaths["parent3"],
 	}
 
 	// Create fsmeta and vmdk in the newest parent (parent3)
@@ -335,7 +345,7 @@ func TestMountFsMetaDeviceOrder(t *testing.T) {
 	// Create a snapshot with 3 parents (newest first in ParentIDs)
 	snap := storage.Snapshot{
 		ID:        "child",
-		ParentIDs: parentIDs, // [parent3, parent2, parent1] newest to oldest
+		ParentIDs: parentIDs,
 	}
 
 	mount, ok := s.mountFsMeta(snap)
@@ -359,7 +369,7 @@ func TestMountFsMetaDeviceOrder(t *testing.T) {
 	// Verify order is oldest-first (parent1, parent2, parent3)
 	for i, expected := range expectedOrder {
 		if deviceOpts[i] != expected {
-			t.Errorf("device option %d: got %q, want %q", i, deviceOpts[i], expected)
+			t.Errorf("device option %d:\n  got:  %q\n  want: %q", i, deviceOpts[i], expected)
 		}
 	}
 }

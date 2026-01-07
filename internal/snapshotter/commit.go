@@ -130,19 +130,16 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, snapIDs []string) {
 		}
 	}()
 
-	// Collect blobs in newest-to-oldest order (same as ParentIDs/overlay lowerdir order).
-	for _, snapID := range snapIDs {
-		blob, err := s.findLayerBlob(snapID)
+	// Collect blobs by iterating backwards through snapIDs (newest-first input).
+	// This produces oldest-first order matching containerd's approach.
+	// See: https://github.com/containerd/containerd/pull/12374
+	for i := len(snapIDs) - 1; i >= 0; i-- {
+		blob, err := s.findLayerBlob(snapIDs[i])
 		if err != nil {
 			blobs = nil // Signal failure
 			return
 		}
 		blobs = append(blobs, blob)
-	}
-
-	// Reverse to get oldest-first order (OCI manifest order) for mkfs.erofs.
-	for i, j := 0, len(blobs)-1; i < j; i, j = i+1, j-1 {
-		blobs[i], blobs[j] = blobs[j], blobs[i]
 	}
 
 	// Check if all layers have block sizes compatible with fsmeta merge.
