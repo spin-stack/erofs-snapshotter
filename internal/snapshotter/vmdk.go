@@ -29,14 +29,14 @@ var layerPathRegex = regexp.MustCompile(`^RW\s+(\d+)\s+FLAT\s+"([^"]+)"\s+\d+`)
 
 // ParseVMDK reads a VMDK descriptor file and extracts layer information.
 // Returns layers in the order they appear in the VMDK (fsmeta first, then layers
-// from newest/top to oldest/bottom).
+// from oldest/base to newest/top - matching OCI manifest order).
 //
-// VMDK layer order is the REVERSE of OCI manifest order:
-// - OCI manifest: [layer_0, layer_1, ..., layer_n] (bottom to top, base first)
-// - VMDK:         [fsmeta, layer_n, ..., layer_1, layer_0] (top to bottom, newest first)
+// VMDK layer order matches OCI manifest order:
+// - OCI manifest: [layer_0, layer_1, ..., layer_n] (oldest to newest)
+// - VMDK:         [fsmeta, layer_0, layer_1, ..., layer_n] (oldest to newest)
 //
 // See: https://github.com/opencontainers/image-spec/blob/main/manifest.md
-// See: https://github.com/libyal/libvmdk/blob/main/documentation/VMWare%20Virtual%20Disk%20Format%20(VMDK).asciidoc
+// See: https://man.archlinux.org/man/extra/erofs-utils/mkfs.erofs.1.en
 func ParseVMDK(vmdkPath string) ([]VMDKLayerInfo, error) {
 	f, err := os.Open(vmdkPath)
 	if err != nil {
@@ -80,7 +80,7 @@ func ParseVMDK(vmdkPath string) ([]VMDKLayerInfo, error) {
 
 // ExtractLayerDigests extracts just the digests from VMDK layers, filtering out
 // non-layer entries (like fsmeta.erofs) and returning digests in VMDK order
-// (newest/top layer first).
+// (oldest/base layer first, matching OCI manifest order).
 func ExtractLayerDigests(layers []VMDKLayerInfo) []digest.Digest {
 	var digests []digest.Digest
 	for _, layer := range layers {
@@ -94,8 +94,8 @@ func ExtractLayerDigests(layers []VMDKLayerInfo) []digest.Digest {
 }
 
 // ReverseDigests reverses a slice of digests.
-// Use this to convert between VMDK order (top-to-bottom) and OCI manifest order (bottom-to-top).
-// See: https://github.com/opencontainers/image-spec/blob/main/manifest.md
+// Note: VMDK and OCI manifest now use the same order (oldest first), so this is
+// mainly useful for converting from snapshot chain order (newest first).
 func ReverseDigests(digests []digest.Digest) []digest.Digest {
 	reversed := make([]digest.Digest, len(digests))
 	for i, d := range digests {
@@ -104,8 +104,8 @@ func ReverseDigests(digests []digest.Digest) []digest.Digest {
 	return reversed
 }
 
-// ParseLayerManifest reads a layer manifest file and returns the digests in VMDK order.
-// The manifest file contains one digest per line (sha256:hex...), newest layer first.
+// ParseLayerManifest reads a layer manifest file and returns the digests in VMDK/OCI order.
+// The manifest file contains one digest per line (sha256:hex...), oldest/base layer first.
 // This is the authoritative source for verifying VMDK layer order.
 func ParseLayerManifest(manifestPath string) ([]digest.Digest, error) {
 	f, err := os.Open(manifestPath)

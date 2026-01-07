@@ -1077,16 +1077,16 @@ test_erofs_layers() {
 # Test: test_vmdk_layer_order
 # =============================================================================
 # Goal: Verify that VMDK descriptor files list layers in the correct order
-#       matching the layers.manifest file.
+#       matching the layers.manifest file and OCI manifest conventions.
 #
 # CRITICAL: Wrong layer order = VM will not boot!
-#   - Layers must be ordered: fsmeta first, then newest layer -> base layer
-#   - This matches overlay semantics: upper layers override lower layers
+#   - Layers must be ordered: fsmeta first, then base layer -> newest layer
+#   - This matches OCI manifest order and mkfs.erofs rebuild mode expectations
 #
 # Expectations:
 #   - Find VMDK with multiple layers (from test_multi_layer)
 #   - fsmeta.erofs is in extent 0 (first position)
-#   - VMDK layers are ordered top-to-bottom (newest first, base last)
+#   - VMDK layers are ordered bottom-to-top (base first, newest last)
 #   - All layer files referenced in VMDK exist on disk
 #   - Layer order matches the layers.manifest file (authoritative source)
 # =============================================================================
@@ -1204,7 +1204,7 @@ test_vmdk_layer_order() {
         return 1
     fi
 
-    log_info "VMDK layer order (${#vmdk_digests[@]} layers, should be newest→oldest):"
+    log_info "VMDK layer order (${#vmdk_digests[@]} layers, should be oldest→newest):"
     for i in "${!vmdk_digests[@]}"; do
         log_info "  [$((i+1))] sha256:${vmdk_digests[$i]:0:12}..."
     done
@@ -1213,7 +1213,7 @@ test_vmdk_layer_order() {
     # Step 5: Read layers.manifest file for authoritative layer order
     # =========================================================================
     # The manifest file is generated alongside the VMDK and contains the
-    # definitive layer order (newest-to-oldest) as written by the snapshotter.
+    # definitive layer order (oldest-to-newest, matching OCI manifest order).
     log_info "Reading layer manifest for expected order..."
 
     local manifest_file
@@ -1244,7 +1244,7 @@ test_vmdk_layer_order() {
         return 1
     fi
 
-    log_info "Manifest layer order (${#manifest_digests[@]} layers, newest→oldest):"
+    log_info "Manifest layer order (${#manifest_digests[@]} layers, oldest→newest):"
     for i in "${!manifest_digests[@]}"; do
         log_info "  [$((i+1))] sha256:${manifest_digests[$i]:0:12}..."
     done

@@ -39,11 +39,13 @@ func (s *snapshotter) mountFsMeta(snap storage.Snapshot) (mount.Mount, bool) {
 		return mount.Mount{}, false
 	}
 
-	// Collect device options in newest-to-oldest order (same as ParentIDs order).
-	// This matches the layer order expected by EROFS multidev mode.
+	// Collect device= options by iterating backwards through ParentIDs (newest-first input).
+	// This produces oldest-first order matching containerd's approach and the order
+	// used when generating fsmeta with mkfs.erofs.
+	// See: https://github.com/containerd/containerd/pull/12374
 	var deviceOptions []string
-	for _, parentID := range snap.ParentIDs {
-		blob, err := s.findLayerBlob(parentID)
+	for i := len(snap.ParentIDs) - 1; i >= 0; i-- {
+		blob, err := s.findLayerBlob(snap.ParentIDs[i])
 		if err != nil {
 			return mount.Mount{}, false
 		}

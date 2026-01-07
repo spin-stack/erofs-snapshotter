@@ -155,17 +155,18 @@ ddb.virtualHWVersion = "4"
 func TestParseVMDK_LayerOrderVerification(t *testing.T) {
 	// This test verifies that the VMDK layer order matches expected order
 	// based on container image manifest conventions:
-	// - Manifest: layers listed bottom-to-top (oldest first)
-	// - VMDK: layers listed top-to-bottom (newest first, after fsmeta)
+	// - Both VMDK and OCI manifest use oldest-first order
+	// - VMDK: [fsmeta, layer1, layer2, layer3] (oldest to newest)
+	// - OCI:  [layer1, layer2, layer3]         (oldest to newest)
 
 	// Use real SHA256 hashes for testing (64 hex chars)
-	layer3Digest := "3333333333333333333333333333333333333333333333333333333333333333"
-	layer2Digest := "2222222222222222222222222222222222222222222222222222222222222222"
 	layer1Digest := "1111111111111111111111111111111111111111111111111111111111111111"
+	layer2Digest := "2222222222222222222222222222222222222222222222222222222222222222"
+	layer3Digest := "3333333333333333333333333333333333333333333333333333333333333333"
 
 	// Simulate a 3-layer image:
-	// Manifest order (oldest first): layer1, layer2, layer3
-	// VMDK order (newest first): fsmeta, layer3, layer2, layer1
+	// Both OCI manifest and VMDK use oldest-first order
+	// VMDK order: fsmeta, layer1 (oldest), layer2, layer3 (newest)
 	vmdkContent := `# Disk DescriptorFile
 version=1
 CID=abcd1234
@@ -174,9 +175,9 @@ createType="twoGbMaxExtentFlat"
 
 # Extent description - order matters!
 RW 2464 FLAT "/snapshots/view/fsmeta.erofs" 0
-RW 100 FLAT "/snapshots/3/sha256-` + layer3Digest + `.erofs" 0
-RW 200 FLAT "/snapshots/2/sha256-` + layer2Digest + `.erofs" 0
 RW 300 FLAT "/snapshots/1/sha256-` + layer1Digest + `.erofs" 0
+RW 200 FLAT "/snapshots/2/sha256-` + layer2Digest + `.erofs" 0
+RW 100 FLAT "/snapshots/3/sha256-` + layer3Digest + `.erofs" 0
 
 #DDB
 ddb.virtualHWVersion = "4"
@@ -195,28 +196,23 @@ ddb.virtualHWVersion = "4"
 
 	digests := ExtractLayerDigests(layers)
 
-	// VMDK order should be: layer3 (newest), layer2, layer1 (oldest)
+	// VMDK order should be: layer1 (oldest), layer2, layer3 (newest)
+	// This matches OCI manifest order
 	expectedVMDKOrder := []digest.Digest{
-		digest.Digest("sha256:" + layer3Digest),
-		digest.Digest("sha256:" + layer2Digest),
 		digest.Digest("sha256:" + layer1Digest),
+		digest.Digest("sha256:" + layer2Digest),
+		digest.Digest("sha256:" + layer3Digest),
 	}
 
 	if !reflect.DeepEqual(digests, expectedVMDKOrder) {
 		t.Errorf("VMDK layer order = %v, want %v", digests, expectedVMDKOrder)
 	}
 
-	// When comparing with manifest, we need to reverse the VMDK order
-	// Manifest order: layer1 (oldest), layer2, layer3 (newest)
-	manifestOrder := []digest.Digest{
-		digest.Digest("sha256:" + layer1Digest),
-		digest.Digest("sha256:" + layer2Digest),
-		digest.Digest("sha256:" + layer3Digest),
-	}
-
-	reversedVMDK := ReverseDigests(digests)
-	if !reflect.DeepEqual(reversedVMDK, manifestOrder) {
-		t.Errorf("reversed VMDK order = %v, want manifest order %v", reversedVMDK, manifestOrder)
+	// VMDK order now matches OCI manifest order directly (no reversal needed)
+	// Both use oldest-first ordering
+	manifestOrder := expectedVMDKOrder
+	if !reflect.DeepEqual(digests, manifestOrder) {
+		t.Errorf("VMDK order = %v, want OCI manifest order %v", digests, manifestOrder)
 	}
 }
 

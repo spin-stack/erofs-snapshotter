@@ -95,15 +95,16 @@ func (s *snapshotter) commitBlock(ctx context.Context, layerBlob string, id stri
 // > "The array MUST have the base layer at index 0. Subsequent layers MUST then
 // > follow in stack order (i.e. from layers[0] to layers[len(layers)-1])."
 //
-// VMDK extents are listed in sequential disk order (first extent = first sectors):
-// https://github.com/libyal/libvmdk/blob/main/documentation/VMWare%20Virtual%20Disk%20Format%20(VMDK).asciidoc
+// mkfs.erofs rebuild mode expects layers in OCI manifest order (base/oldest first):
+// https://man.archlinux.org/man/extra/erofs-utils/mkfs.erofs.1.en
+// > "To merge these layers: mkfs.erofs merged.erofs layer0.erofs ... layerN-1.erofs"
 //
-// For overlay filesystems, layers are applied top-to-bottom (newest first) when resolving files.
-// mkfs.erofs multidev mode expects layers in top-to-bottom order (newest first).
+// The snapIDs slice comes in newest-first order (from snapshot chain walk).
+// We must REVERSE it to get oldest-first order for mkfs.erofs.
 //
-// Therefore: VMDK layer order = REVERSE of OCI manifest order
-// - VMDK: [fsmeta, layer_n, layer_n-1, ..., layer_0] (top to bottom)
-// - OCI:  [layer_0, layer_1, ..., layer_n]           (bottom to top)
+// VMDK layer order = OCI manifest order (after fsmeta):
+// - VMDK: [fsmeta, layer_0, layer_1, ..., layer_n] (oldest to newest)
+// - OCI:  [layer_0, layer_1, ..., layer_n]         (oldest to newest)
 func (s *snapshotter) generateFsMeta(ctx context.Context, snapIDs []string) {
 	var blobs []string
 
@@ -129,10 +130,11 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, snapIDs []string) {
 		}
 	}()
 
-	// Collect blobs in newest-to-oldest order (same as ParentIDs/overlay lowerdir order).
-	// mkfs.erofs multidev mode expects layers ordered from top (newest) to bottom (oldest).
-	for _, snapID := range snapIDs {
-		blob, err := s.findLayerBlob(snapID)
+	// Collect blobs by iterating backwards through snapIDs (newest-first input).
+	// This produces oldest-first order matching containerd's approach.
+	// See: https://github.com/containerd/containerd/pull/12374
+	for i := len(snapIDs) - 1; i >= 0; i-- {
+		blob, err := s.findLayerBlob(snapIDs[i])
 		if err != nil {
 			blobs = nil // Signal failure
 			return
@@ -161,7 +163,7 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, snapIDs []string) {
 		return
 	}
 
-	// Write layer manifest file with digests in VMDK order (newest-to-oldest).
+	// Write layer manifest file with digests in VMDK/OCI order (oldest-to-newest).
 	// This allows external tools to verify VMDK layer order without parsing the snapshot chain.
 	manifestFile := s.manifestPath(snapIDs[0])
 	if err := s.writeLayerManifest(manifestFile, blobs); err != nil {
@@ -174,8 +176,8 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, snapIDs []string) {
 	}).Infof("merged fsmeta and vmdk for %v generated", snapIDs[0])
 }
 
-// writeLayerManifest writes layer digests to a manifest file in VMDK order.
-// Format: one digest per line (sha256:hex...), newest layer first.
+// writeLayerManifest writes layer digests to a manifest file in VMDK/OCI order.
+// Format: one digest per line (sha256:hex...), oldest/base layer first.
 // This is the authoritative source for VMDK layer order verification.
 func (s *snapshotter) writeLayerManifest(manifestFile string, blobs []string) error {
 	var digests []digest.Digest
