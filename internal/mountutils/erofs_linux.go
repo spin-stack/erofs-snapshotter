@@ -27,6 +27,13 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 )
 
+const (
+	// fsTypeErofs is the filesystem type for EROFS mounts.
+	fsTypeErofs = "erofs"
+	// fsTypeExt4 is the filesystem type for ext4 mounts.
+	fsTypeExt4 = "ext4"
+)
+
 // MountAll mounts all provided mounts to the target directory.
 // It extends the standard mount.All by adding support for EROFS multi-device mounts.
 //
@@ -41,7 +48,7 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 	// Find EROFS mounts with device= options
 	erofsIdx := -1
 	for i, m := range mounts {
-		if TypeSuffix(m.Type) == "erofs" && hasDeviceOption(m.Options) {
+		if TypeSuffix(m.Type) == fsTypeErofs && hasDeviceOption(m.Options) {
 			erofsIdx = i
 			break
 		}
@@ -136,11 +143,57 @@ func hasDeviceOption(options []string) bool {
 // HasErofsMultiDevice returns true if any mount is an EROFS with device= options.
 func HasErofsMultiDevice(mounts []mount.Mount) bool {
 	for _, m := range mounts {
-		if TypeSuffix(m.Type) == "erofs" && hasDeviceOption(m.Options) {
+		if TypeSuffix(m.Type) == fsTypeErofs && hasDeviceOption(m.Options) {
 			return true
 		}
 	}
 	return false
+}
+
+// HasActiveSnapshotMounts returns true if the mounts represent an active snapshot
+// with both EROFS lower layers and an ext4 writable layer. This combination
+// requires special handling to create an overlay on the host for diff operations.
+func HasActiveSnapshotMounts(mounts []mount.Mount) bool {
+	hasErofs := false
+	hasExt4 := false
+	for _, m := range mounts {
+		switch TypeSuffix(m.Type) {
+		case fsTypeErofs:
+			hasErofs = true
+		case fsTypeExt4:
+			hasExt4 = true
+		}
+	}
+	return hasErofs && hasExt4
+}
+
+// MountExt4 mounts an ext4 filesystem image to the target directory using a loop device.
+// Returns a cleanup function that unmounts and detaches the loop device.
+func MountExt4(source, target string) (cleanup func() error, err error) {
+	// Set up loop device for the ext4 image
+	loopDev, err := loop.Setup(source, loop.Config{ReadOnly: false})
+	if err != nil {
+		return nopCleanup, fmt.Errorf("failed to setup loop device for ext4 %s: %w", source, err)
+	}
+
+	// Mount the loop device
+	cmd := exec.Command("mount", "-t", "ext4", loopDev.Path, target)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		_ = loopDev.Detach()
+		return nopCleanup, fmt.Errorf("failed to mount ext4: %w: %s", err, out)
+	}
+
+	return func() error {
+		// Unmount first
+		if out, err := exec.Command("umount", target).CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to unmount ext4 %s: %w: %s", target, err, out)
+		}
+		// Then detach loop device
+		if err := loopDev.Detach(); err != nil {
+			return fmt.Errorf("failed to detach loop device: %w", err)
+		}
+		return nil
+	}, nil
 }
 
 func nopCleanup() error { return nil }
