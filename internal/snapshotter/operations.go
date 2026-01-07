@@ -258,9 +258,11 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 		// The layer blob is only persisted for committed snapshots.
 		if k == snapshots.KindCommitted {
 			if layerBlob, ferr := s.findLayerBlob(id); ferr == nil {
-				err = setImmutable(layerBlob, false)
-				if err != nil && !errdefs.IsNotImplemented(err) {
-					return fmt.Errorf("clear IMMUTABLE_FL: %w", err)
+				// Use local variable to avoid polluting the named return 'err'.
+				// If err is set here and is errdefs.IsNotImplemented, the defer
+				// would skip cleanupAfterRemove because err != nil.
+				if immErr := setImmutable(layerBlob, false); immErr != nil && !errdefs.IsNotImplemented(immErr) {
+					return fmt.Errorf("clear IMMUTABLE_FL: %w", immErr)
 				}
 			}
 		}

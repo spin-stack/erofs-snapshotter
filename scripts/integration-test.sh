@@ -28,9 +28,8 @@ LOG_DIR="/tmp/integration-logs"
 
 # Use ghcr.io or quay.io to avoid Docker Hub rate limits
 TEST_IMAGE="${TEST_IMAGE:-ghcr.io/containerd/alpine:3.14.0}"
-# Use nginx:alpine for multi-layer test - it has 6-7 layers (~25MB)
-# busybox and alpine only have 1 layer which doesn't test VMDK properly
-MULTI_LAYER_IMAGE="${MULTI_LAYER_IMAGE:-docker.io/library/nginx:1.27-alpine}"
+# Multi-layer image for VMDK tests - using quay.io to avoid Docker Hub rate limits
+MULTI_LAYER_IMAGE="${MULTI_LAYER_IMAGE:-quay.io/prometheus/node-exporter:latest}"
 
 # Runtime options
 CLEANUP_ON_EXIT="${CLEANUP_ON_EXIT:-true}"

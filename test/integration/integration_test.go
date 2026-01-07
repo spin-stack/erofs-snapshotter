@@ -52,7 +52,8 @@ const (
 	defaultTestImage = "ghcr.io/containerd/alpine:3.14.0"
 
 	// multiLayerImage is an image with multiple layers for VMDK tests.
-	multiLayerImage = "docker.io/library/nginx:1.27-alpine"
+	// Using quay.io to avoid Docker Hub rate limits in CI.
+	multiLayerImage = "quay.io/prometheus/node-exporter:latest"
 
 	// snapshotterName is the name of the snapshotter under test.
 	snapshotterName = "nexus-erofs"
@@ -1208,7 +1209,7 @@ func testVMDKFormat(t *testing.T, env *Environment) {
 	})
 
 	if vmdkPath == "" {
-		t.Skip("no VMDK file found")
+		t.Fatal("no VMDK file found - multi_layer test should have created one")
 	}
 
 	assert.VMDKValid(vmdkPath)
@@ -1222,8 +1223,11 @@ func testVMDKLayerOrder(t *testing.T, env *Environment) {
 	// Find VMDK with multiple layers
 	vmdkPath, maxLayers := findVMDKWithMostLayers(snapshotsDir)
 
-	if vmdkPath == "" || maxLayers < 2 {
-		t.Skip("no multi-layer VMDK found")
+	if vmdkPath == "" {
+		t.Fatal("no VMDK file found - multi_layer test should have created one")
+	}
+	if maxLayers < 2 {
+		t.Fatalf("VMDK has only %d layers, expected at least 2 for layer order verification", maxLayers)
 	}
 
 	// Parse VMDK
@@ -1343,7 +1347,7 @@ func testCommitLifecycle(t *testing.T, env *Environment) {
 	}
 
 	if rwlayerPath == "" {
-		t.Skip("no ext4 mount returned, skipping lifecycle test")
+		t.Fatal("no ext4 mount returned - Prepare() should return ext4 writable layer")
 	}
 
 	// Mount ext4, write data, unmount
