@@ -86,15 +86,27 @@ jobs:
           sudo unshare -m sh -c "
             mount --make-rprivate /
             env PATH=$PATH GOPATH=$GOPATH GOCACHE=$GOCACHE GOMODCACHE=$GOMODCACHE \
-              go test -v -race -coverprofile=coverage.txt -covermode=atomic ./... -test.root
+              go test -v -race -coverprofile=${{ github.workspace }}/coverage.txt -covermode=atomic ./... -test.root
           "
+          # Fix ownership so codecov can read the file
+          sudo chown $USER:$USER ${{ github.workspace }}/coverage.txt
+
+      - name: Verify coverage file
+        run: |
+          echo "=== Coverage file info ==="
+          ls -la ${{ github.workspace }}/coverage.txt
+          echo "=== Coverage file size ==="
+          wc -l ${{ github.workspace }}/coverage.txt
+          echo "=== Coverage file head ==="
+          head -20 ${{ github.workspace }}/coverage.txt
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage.txt
+          files: ${{ github.workspace }}/coverage.txt
           fail_ci_if_error: false
+          verbose: true
 
   build:
     runs-on: ubuntu-latest
