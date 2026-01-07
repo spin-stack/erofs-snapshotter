@@ -30,7 +30,6 @@ import (
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/contrib/diffservice"
-	"github.com/containerd/containerd/v2/contrib/snapshotservice"
 	"github.com/containerd/containerd/v2/core/mount/manager"
 	"github.com/containerd/log"
 	"github.com/urfave/cli/v2"
@@ -39,6 +38,7 @@ import (
 	"google.golang.org/grpc/grpclog"
 
 	"github.com/aledbf/nexus-erofs/internal/differ"
+	"github.com/aledbf/nexus-erofs/internal/grpcservice"
 	"github.com/aledbf/nexus-erofs/internal/preflight"
 	"github.com/aledbf/nexus-erofs/internal/snapshotter"
 	"github.com/aledbf/nexus-erofs/internal/store"
@@ -213,8 +213,8 @@ func run(cliCtx *cli.Context) error {
 	// Create gRPC server
 	rpc := grpc.NewServer()
 
-	// Register snapshot service
-	snapshotsapi.RegisterSnapshotsServer(rpc, snapshotservice.FromSnapshotter(sn))
+	// Register snapshot service (using our fixed service that supports rebase)
+	snapshotsapi.RegisterSnapshotsServer(rpc, grpcservice.FromSnapshotter(sn))
 
 	// Register diff service
 	diffapi.RegisterDiffServer(rpc, diffservice.FromApplierAndComparer(df, df))
