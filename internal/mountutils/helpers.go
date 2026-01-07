@@ -28,6 +28,9 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 )
 
+// fsTypeErofs is the filesystem type string for EROFS mounts.
+const fsTypeErofs = "erofs"
+
 // NeedsMountManager returns true if any mount requires the mount manager to resolve.
 // This includes mounts with template syntax (e.g., "{{ mount 0 }}"), formatted mounts
 // (format/, mkfs/, mkdir/), and mounts with loop options (which require loop device setup).
@@ -134,7 +137,7 @@ func hasDeviceOption(options []string) bool {
 // This indicates a multi-device fsmeta mount that requires special handling.
 func HasErofsMultiDevice(mounts []mount.Mount) bool {
 	for _, m := range mounts {
-		if TypeSuffix(m.Type) == "erofs" && hasDeviceOption(m.Options) {
+		if TypeSuffix(m.Type) == fsTypeErofs && hasDeviceOption(m.Options) {
 			return true
 		}
 	}
@@ -149,7 +152,7 @@ func HasActiveSnapshotMounts(mounts []mount.Mount) bool {
 	hasExt4 := false
 	for _, m := range mounts {
 		switch TypeSuffix(m.Type) {
-		case "erofs":
+		case fsTypeErofs:
 			hasErofs = true
 		case "ext4":
 			hasExt4 = true

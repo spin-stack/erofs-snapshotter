@@ -124,16 +124,17 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	// Run async to avoid blocking Prepare/View - fsmeta generation is expensive
 	// but not required for basic snapshot operations.
 	if !isExtractKey(key) && len(snap.ParentIDs) > 0 {
+		parentIDs := snap.ParentIDs // capture for goroutine
 		s.bgWg.Add(1)
-		go func() {
+		//nolint:contextcheck // intentionally using fresh context with timeout for background work
+		go func(ids []string) {
 			defer s.bgWg.Done()
-			// Use a timeout to prevent hanging indefinitely if mkfs.erofs hangs.
-			// The timeout is independent of the parent context to allow completion
-			// even if the original request is cancelled.
+			// Use a fresh context with timeout - intentionally independent of parent
+			// context to allow completion even if the original request is cancelled.
 			bgCtx, cancel := context.WithTimeout(context.Background(), fsmetaTimeout)
 			defer cancel()
-			s.generateFsMeta(bgCtx, snap.ParentIDs)
-		}()
+			s.generateFsMeta(bgCtx, ids)
+		}(parentIDs)
 	}
 
 	// For active snapshots, create the writable ext4 layer file.
