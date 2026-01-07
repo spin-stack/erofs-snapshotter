@@ -30,9 +30,6 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 )
 
-// fsTypeErofs is the filesystem type for EROFS mounts.
-const fsTypeErofs = "erofs"
-
 // MountAll mounts all provided mounts to the target directory.
 // It extends the standard mount.All by adding support for EROFS multi-device mounts.
 //
@@ -47,7 +44,7 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 	// Find EROFS mounts with device= options
 	erofsIdx := -1
 	for i, m := range mounts {
-		if TypeSuffix(m.Type) == fsTypeErofs && hasDeviceOption(m.Options) {
+		if TypeSuffix(m.Type) == "erofs" && hasDeviceOption(m.Options) {
 			erofsIdx = i
 			break
 		}

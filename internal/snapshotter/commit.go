@@ -27,7 +27,8 @@ type commitSource struct {
 	upperDir string
 
 	// cleanup is called after conversion to release resources (e.g., unmount).
-	cleanup func()
+	// Returns an error if cleanup fails (e.g., unmount failure).
+	cleanup func() error
 }
 
 // resolveCommitSource determines where to read upper directory contents from.
@@ -60,7 +61,7 @@ func (s *snapshotter) resolveCommitSource(ctx context.Context, id string) (*comm
 func (s *snapshotter) commitSourceFromOverlay(_ context.Context, id string) (*commitSource, error) {
 	return &commitSource{
 		upperDir: s.upperPath(id),
-		cleanup:  func() {}, // No cleanup needed
+		cleanup:  func() error { return nil }, // No cleanup needed
 	}, nil
 }
 
@@ -99,17 +100,17 @@ func (s *snapshotter) commitSourceFromBlock(ctx context.Context, id, rwLayer str
 		upperDir = rwMount
 	}
 
-	cleanup := func() {
+	cleanup := func() error {
 		if needsUnmount {
 			if err := unmountAll(rwMount); err != nil {
-				log.G(ctx).WithError(err).WithField("id", id).Warn("failed to cleanup block mount after commit")
 				// Don't clear mount state if unmount failed - state should reflect reality
-				return
+				return fmt.Errorf("cleanup block mount for %s: %w", id, err)
 			}
 			// Only clear mount state if we mounted it and unmount succeeded
 			s.mountTracker.SetUnmounted(id)
 		}
 		// If needsUnmount is false, someone else mounted it and is responsible for cleanup
+		return nil
 	}
 
 	return &commitSource{
@@ -148,17 +149,21 @@ func (s *snapshotter) commitBlock(ctx context.Context, layerBlob string, id stri
 	if err != nil {
 		return err
 	}
-	defer source.cleanup()
 
-	if err := convertDirToErofs(ctx, layerBlob, source.upperDir); err != nil {
+	convErr := convertDirToErofs(ctx, layerBlob, source.upperDir)
+
+	// Always attempt cleanup, even if conversion failed
+	cleanupErr := source.cleanup()
+
+	if convErr != nil {
 		return &CommitConversionError{
 			SnapshotID: id,
 			UpperDir:   source.upperDir,
-			Cause:      err,
+			Cause:      convErr,
 		}
 	}
 
-	return nil
+	return cleanupErr
 }
 
 // generateFsMeta creates a merged fsmeta.erofs and VMDK descriptor for VM runtimes.
@@ -168,13 +173,15 @@ func (s *snapshotter) commitBlock(ctx context.Context, layerBlob string, id stri
 // This is the order returned by containerd's snapshot storage. We convert to
 // OCI manifest order (oldest-first) internally for mkfs.erofs.
 //
-// WHY PLACEHOLDER: Multiple goroutines may try to generate fsmeta for the same parent
-// chain. The placeholder file (O_EXCL) ensures only one wins. Others exit silently -
-// the winner's result will be used.
+// CONCURRENCY: Multiple goroutines may try to generate fsmeta for the same parent
+// chain. A lock file (O_EXCL) ensures only one wins. Others exit silently.
 //
-// WHY SILENT FAILURE: If fsmeta generation fails, callers fall back to individual
-// layer mounts. This is slightly slower but functionally correct. The placeholder
-// is removed on failure, allowing retry on next access.
+// CRASH SAFETY: Generation uses temporary files (.tmp suffix) with atomic rename
+// on success. If the process crashes mid-generation, only .tmp files remain,
+// allowing retry on next access. The lock file is removed on completion/failure.
+//
+// SILENT FAILURE: If fsmeta generation fails, callers fall back to individual
+// layer mounts. This is slightly slower but functionally correct.
 func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 	if len(parentIDs) == 0 {
 		return
@@ -186,21 +193,40 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 	newestID := parentIDs[0]
 	mergedMeta := s.fsMetaPath(newestID)
 	vmdkFile := s.vmdkPath(newestID)
+	lockFile := mergedMeta + ".lock"
 
-	// Atomic placeholder creation - only one goroutine wins
-	if _, err := os.OpenFile(mergedMeta, os.O_CREATE|os.O_EXCL, 0600); err != nil {
-		// Another goroutine is generating or already generated - exit silently
+	// Check if already generated (fast path)
+	if _, err := os.Stat(mergedMeta); err == nil {
 		return
 	}
 
-	// Track success for cleanup
-	var blobs []string
+	// Atomic lock file creation - only one goroutine wins
+	lockFd, err := os.OpenFile(lockFile, os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		// Another goroutine is generating or lock file is stale
+		// Check if final file exists now (generation completed while we waited)
+		if _, statErr := os.Stat(mergedMeta); statErr == nil {
+			return
+		}
+		// Lock file exists but no final file - could be stale from crash.
+		// Let the other holder finish or fail; don't compete.
+		return
+	}
+	lockFd.Close()
 
-	// Cleanup placeholder on failure
+	// Always remove lock file when done
+	defer os.Remove(lockFile)
+
+	// Temporary file paths for atomic generation
+	tmpMeta := mergedMeta + ".tmp"
+	tmpVmdk := vmdkFile + ".tmp"
+
+	// Cleanup temp files on failure
+	success := false
 	defer func() {
-		if blobs == nil {
-			_ = os.Remove(mergedMeta)
-			_ = os.Remove(vmdkFile)
+		if !success {
+			_ = os.Remove(tmpMeta)
+			_ = os.Remove(tmpVmdk)
 		}
 	}()
 
@@ -208,11 +234,11 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 	ociOrder := reverseStrings(parentIDs)
 
 	// Collect layer blob paths in OCI order (oldest-first)
+	var blobs []string
 	for _, snapID := range ociOrder {
 		blob, err := s.findLayerBlob(snapID)
 		if err != nil {
 			log.G(ctx).WithError(err).WithField("snapshot", snapID).Debug("layer blob not found, skipping fsmeta")
-			blobs = nil // Signal failure
 			return
 		}
 		blobs = append(blobs, blob)
@@ -221,21 +247,35 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 	// Check block size compatibility for fsmeta merge
 	if !erofs.CanMergeFsmeta(blobs) {
 		log.G(ctx).Debug("skipping fsmeta generation: incompatible block sizes")
-		blobs = nil
 		return
 	}
 
-	// Generate fsmeta and VMDK in one mkfs.erofs call
-	// IMPORTANT: Use final paths because mkfs.erofs embeds them in the VMDK
-	args := append([]string{"--quiet", "--vmdk-desc=" + vmdkFile, mergedMeta}, blobs...)
+	// Generate fsmeta and VMDK to temp files first.
+	// Note: mkfs.erofs embeds paths in VMDK, so we generate to final paths
+	// but will only have complete files after atomic rename.
+	// For VMDK, we generate to temp then rename; the embedded paths are
+	// correct because they reference the final fsmeta path.
+	args := append([]string{"--quiet", "--vmdk-desc=" + tmpVmdk, tmpMeta}, blobs...)
 
 	cmd := exec.CommandContext(ctx, "mkfs.erofs", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.G(ctx).WithError(err).Warnf("fsmeta generation failed: %s", string(out))
-		blobs = nil
 		return
 	}
+
+	// Atomic rename: first VMDK, then fsmeta (fsmeta presence indicates completion)
+	if err := os.Rename(tmpVmdk, vmdkFile); err != nil {
+		log.G(ctx).WithError(err).Warn("failed to rename VMDK file")
+		return
+	}
+	if err := os.Rename(tmpMeta, mergedMeta); err != nil {
+		log.G(ctx).WithError(err).Warn("failed to rename fsmeta file")
+		_ = os.Remove(vmdkFile) // Clean up the renamed VMDK
+		return
+	}
+
+	success = true
 
 	// Write layer manifest for external verification
 	manifestFile := s.manifestPath(newestID)

@@ -11,39 +11,33 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 )
 
-// TestReverseStringsConcurrent verifies reverseStrings is safe for concurrent use.
-// reverseStrings returns a new slice, so concurrent calls on the same input are safe.
-func TestReverseStringsConcurrent(t *testing.T) {
-	const numGoroutines = 100
+// TestReverseStringsDoesNotMutate verifies reverseStrings returns a new slice.
+// This is a property test, not a concurrency test - reverseStrings is safe
+// for concurrent use because it allocates a new slice on each call.
+func TestReverseStringsDoesNotMutate(t *testing.T) {
 	original := []string{"layer5", "layer4", "layer3", "layer2", "layer1"}
+	originalCopy := make([]string, len(original))
+	copy(originalCopy, original)
 
-	var wg sync.WaitGroup
-	errors := make(chan string, numGoroutines)
+	result := reverseStrings(original)
 
-	for range numGoroutines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			result := reverseStrings(original)
-			if result[0] != "layer1" {
-				errors <- "reverseStrings returned wrong first element"
-			}
-			if result[4] != "layer5" {
-				errors <- "reverseStrings returned wrong last element"
-			}
-		}()
-	}
-
-	wg.Wait()
-	close(errors)
-
-	for err := range errors {
-		t.Errorf("concurrent access error: %s", err)
+	// Verify result is reversed
+	if result[0] != "layer1" || result[4] != "layer5" {
+		t.Errorf("reverseStrings returned wrong result: %v", result)
 	}
 
 	// Verify original is unchanged
-	if original[0] != "layer5" {
-		t.Error("original was modified")
+	for i := range original {
+		if original[i] != originalCopy[i] {
+			t.Errorf("original was modified at index %d: got %s, want %s",
+				i, original[i], originalCopy[i])
+		}
+	}
+
+	// Verify result is a different slice (not aliased)
+	result[0] = "changed"
+	if original[4] == "changed" {
+		t.Error("result slice aliases original slice")
 	}
 }
 
@@ -182,7 +176,7 @@ func TestConcurrentRemove(t *testing.T) {
 	}
 }
 
-// TestMountTrackerConcurrentAccess verifies MountTracker is thread-safe.
+// TestMountTrackerConcurrentOperations verifies MountTracker is thread-safe.
 func TestMountTrackerConcurrentOperations(t *testing.T) {
 	tracker := NewMountTracker()
 	const numGoroutines = 100
@@ -217,38 +211,31 @@ func TestMountTrackerConcurrentOperations(t *testing.T) {
 	}
 }
 
-// TestFsmetaPlaceholderRace verifies that concurrent fsmeta generation
-// uses placeholder file correctly (only one wins).
-func TestFsmetaPlaceholderRace(t *testing.T) {
+// TestFsmetaLockFileRace verifies that concurrent fsmeta generation
+// uses the lock file correctly (only one wins).
+func TestFsmetaLockFileRace(t *testing.T) {
 	root := t.TempDir()
 	s := &snapshotter{root: root}
 
-	// Create snapshot directory with a fake layer blob
+	// Create snapshot directory
 	snapshotDir := filepath.Join(root, "snapshots", "test-parent")
 	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
-	// Create a fake layer blob (required for findLayerBlob)
-	layerBlob := filepath.Join(snapshotDir, "sha256-"+
-		"a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4.erofs")
-	if err := os.WriteFile(layerBlob, []byte("fake erofs"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Run multiple goroutines trying to create fsmeta placeholder
+	// Run multiple goroutines trying to acquire the lock file
 	const numGoroutines = 20
 	var wg sync.WaitGroup
 	winners := make(chan int, numGoroutines)
 
-	fsmetaPath := s.fsMetaPath("test-parent")
+	lockFile := s.fsMetaPath("test-parent") + ".lock"
 
 	for i := range numGoroutines {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			// Try to create placeholder atomically
-			f, err := os.OpenFile(fsmetaPath, os.O_CREATE|os.O_EXCL, 0600)
+			// Try to create lock file atomically (same pattern as generateFsMeta)
+			f, err := os.OpenFile(lockFile, os.O_CREATE|os.O_EXCL, 0600)
 			if err == nil {
 				winners <- id
 				f.Close()
@@ -267,6 +254,60 @@ func TestFsmetaPlaceholderRace(t *testing.T) {
 	}
 
 	if winnerCount != 1 {
-		t.Errorf("expected exactly 1 winner for placeholder creation, got %d", winnerCount)
+		t.Errorf("expected exactly 1 winner for lock file creation, got %d", winnerCount)
+	}
+
+	// Verify lock file exists
+	if _, err := os.Stat(lockFile); err != nil {
+		t.Errorf("lock file should exist: %v", err)
+	}
+}
+
+// TestFsmetaAtomicRename verifies the atomic rename pattern for fsmeta generation.
+func TestFsmetaAtomicRename(t *testing.T) {
+	root := t.TempDir()
+	s := &snapshotter{root: root}
+
+	// Create snapshot directory
+	snapshotDir := filepath.Join(root, "snapshots", "test-parent")
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	fsmetaPath := s.fsMetaPath("test-parent")
+	vmdkPath := s.vmdkPath("test-parent")
+	tmpMeta := fsmetaPath + ".tmp"
+	tmpVmdk := vmdkPath + ".tmp"
+
+	// Simulate successful generation: create temp files
+	if err := os.WriteFile(tmpMeta, []byte("fsmeta content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmpVmdk, []byte("vmdk content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Atomic rename (same order as generateFsMeta)
+	if err := os.Rename(tmpVmdk, vmdkPath); err != nil {
+		t.Fatalf("rename vmdk: %v", err)
+	}
+	if err := os.Rename(tmpMeta, fsmetaPath); err != nil {
+		t.Fatalf("rename fsmeta: %v", err)
+	}
+
+	// Verify final files exist
+	if _, err := os.Stat(fsmetaPath); err != nil {
+		t.Errorf("fsmeta should exist: %v", err)
+	}
+	if _, err := os.Stat(vmdkPath); err != nil {
+		t.Errorf("vmdk should exist: %v", err)
+	}
+
+	// Verify temp files are gone
+	if _, err := os.Stat(tmpMeta); !os.IsNotExist(err) {
+		t.Error("temp fsmeta should not exist after rename")
+	}
+	if _, err := os.Stat(tmpVmdk); !os.IsNotExist(err) {
+		t.Error("temp vmdk should not exist after rename")
 	}
 }

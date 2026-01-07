@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -17,6 +18,10 @@ import (
 
 	"github.com/aledbf/nexus-erofs/internal/erofs"
 )
+
+// fsmetaTimeout is the maximum time allowed for fsmeta generation.
+// This includes reading layer blobs and running mkfs.erofs.
+const fsmetaTimeout = 5 * time.Minute
 
 // isExtractKey returns true if the key indicates an extract/unpack operation.
 // Snapshot keys use forward slashes as separators (e.g., "default/1/extract-12345"),
@@ -122,7 +127,12 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		s.bgWg.Add(1)
 		go func() {
 			defer s.bgWg.Done()
-			s.generateFsMeta(context.WithoutCancel(ctx), snap.ParentIDs)
+			// Use a timeout to prevent hanging indefinitely if mkfs.erofs hangs.
+			// The timeout is independent of the parent context to allow completion
+			// even if the original request is cancelled.
+			bgCtx, cancel := context.WithTimeout(context.Background(), fsmetaTimeout)
+			defer cancel()
+			s.generateFsMeta(bgCtx, snap.ParentIDs)
 		}()
 	}
 
