@@ -1575,12 +1575,10 @@ func findVMDKWithMostLayers(snapshotsDir string) (string, int) {
 func TestParallelUnpackWithRebase(t *testing.T) {
 	testutil.RequiresRoot(t)
 
-	// Check prerequisites
 	if err := checkPrerequisites(); err != nil {
 		t.Skipf("prerequisites not met: %v", err)
 	}
 
-	// Create environment with rebase capability enabled
 	env := NewEnvironment(t, WithCapabilities("rebase"))
 	t.Cleanup(func() {
 		env.Stop()
@@ -1588,7 +1586,6 @@ func TestParallelUnpackWithRebase(t *testing.T) {
 		env.dumpLogs("containerd")
 	})
 
-	// Start services
 	if err := env.Start(); err != nil {
 		t.Fatalf("start environment: %v", err)
 	}
@@ -1600,35 +1597,38 @@ func TestParallelUnpackWithRebase(t *testing.T) {
 
 	t.Log("=== Testing Parallel Unpack with Rebase Capability ===")
 
-	// Step 1: Pull multi-layer image (parallel unpacking will be used)
-	t.Log("--- Step 1: Pull multi-layer image with parallel unpacking ---")
+	// Pull multi-layer image (parallel unpacking will be used)
+	t.Log("--- Pull multi-layer image with parallel unpacking ---")
 	if err := pullImage(ctx, c, multiLayerImage); err != nil {
 		t.Fatalf("pull image: %v", err)
 	}
-	t.Log("image pulled successfully")
 
-	// Step 2: Find the top committed snapshot
-	t.Log("--- Step 2: Find top committed snapshot ---")
+	// Create view to trigger VMDK generation
+	t.Log("--- Create view snapshot ---")
 	topSnap := assert.FindCommittedSnapshot(ctx)
-
-	// Step 3: Create a view to trigger VMDK generation
-	t.Log("--- Step 3: Create view snapshot ---")
 	viewKey := fmt.Sprintf("test-rebase-view-%d", time.Now().UnixNano())
-	mounts, err := ss.View(ctx, viewKey, topSnap)
-	if err != nil {
+	if _, err := ss.View(ctx, viewKey, topSnap); err != nil {
 		t.Fatalf("create view: %v", err)
 	}
-	t.Cleanup(func() {
-		ss.Remove(ctx, viewKey) //nolint:errcheck
-	})
-	t.Logf("view created with %d mounts", len(mounts))
+	t.Cleanup(func() { ss.Remove(ctx, viewKey) }) //nolint:errcheck
 
-	// Step 4: Wait for VMDK generation (async)
-	t.Log("--- Step 4: Wait for VMDK generation ---")
+	// Wait for VMDK and verify layer order
+	t.Log("--- Verify layer order ---")
 	snapshotsDir := filepath.Join(env.SnapshotterRoot(), "snapshots")
+	if err := verifyRebaseLayerOrder(t, snapshotsDir, assert); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("SUCCESS: Layer order is correct with parallel unpacking + rebase")
+}
+
+// verifyRebaseLayerOrder waits for VMDK generation and verifies layer order.
+func verifyRebaseLayerOrder(t *testing.T, snapshotsDir string, assert *Assertions) error {
+	t.Helper()
+
 	var vmdkPath string
 	var layerCount int
-	err = waitFor(func() bool {
+	err := waitFor(func() bool {
 		vmdkPath, layerCount = findVMDKWithMostLayers(snapshotsDir)
 		return layerCount >= 2
 	}, 30*time.Second, "waiting for multi-layer VMDK")
@@ -1636,85 +1636,67 @@ func TestParallelUnpackWithRebase(t *testing.T) {
 	if err != nil {
 		vmdkPath, layerCount = findVMDKWithMostLayers(snapshotsDir)
 		assert.DumpFiles(snapshotsDir)
-		t.Fatalf("no multi-layer VMDK generated (found: %s with %d layers)", vmdkPath, layerCount)
+		return fmt.Errorf("no multi-layer VMDK generated (found: %s with %d layers)", vmdkPath, layerCount)
 	}
 	t.Logf("VMDK generated: %s (%d layers)", vmdkPath, layerCount)
 
-	// Step 5: Verify layer order matches manifest
-	t.Log("--- Step 5: Verify layer order ---")
-
-	// Parse VMDK layers
-	vmdkLayers, err := parseVMDKLayers(vmdkPath)
+	// Parse and compare layer order
+	vmdkDigests, err := extractVMDKDigests(vmdkPath)
 	if err != nil {
-		t.Fatalf("parse VMDK: %v", err)
-	}
-	t.Logf("VMDK contains %d extents", len(vmdkLayers))
-
-	// Verify fsmeta is first
-	if len(vmdkLayers) > 0 && !strings.Contains(vmdkLayers[0], "fsmeta.erofs") {
-		t.Errorf("first extent should be fsmeta.erofs, got: %s", filepath.Base(vmdkLayers[0]))
+		return fmt.Errorf("extract VMDK digests: %w", err)
 	}
 
-	// Read manifest file
 	manifestPath := filepath.Join(filepath.Dir(vmdkPath), "layers.manifest")
 	manifestDigests, err := readLayersManifest(manifestPath)
 	if err != nil {
-		t.Fatalf("read manifest: %v", err)
-	}
-	t.Logf("manifest contains %d layer digests", len(manifestDigests))
-
-	// Extract VMDK digests (skip fsmeta)
-	var vmdkDigests []string
-	for _, layer := range vmdkLayers {
-		if d := extractDigest(layer); d != "" {
-			vmdkDigests = append(vmdkDigests, d)
-		}
+		return fmt.Errorf("read manifest: %w", err)
 	}
 
-	// Verify counts match
-	if len(vmdkDigests) != len(manifestDigests) {
-		t.Errorf("layer count mismatch: VMDK=%d, manifest=%d", len(vmdkDigests), len(manifestDigests))
-		t.Logf("VMDK digests: %v", truncateDigests(vmdkDigests))
-		t.Logf("manifest digests: %v", truncateDigests(manifestDigests))
-	}
-
-	// Verify order matches (oldest-first in both)
-	orderCorrect := true
-	for i := 0; i < len(vmdkDigests) && i < len(manifestDigests); i++ {
-		if vmdkDigests[i] != manifestDigests[i] {
-			t.Errorf("layer order mismatch at position %d:", i)
-			t.Errorf("  VMDK:     %s", vmdkDigests[i][:min(12, len(vmdkDigests[i]))])
-			t.Errorf("  manifest: %s", manifestDigests[i][:min(12, len(manifestDigests[i]))])
-			orderCorrect = false
-		}
-	}
-
-	if orderCorrect && len(vmdkDigests) == len(manifestDigests) && len(vmdkDigests) >= 2 {
-		t.Log("SUCCESS: Layer order is correct with parallel unpacking + rebase")
-	} else if len(vmdkDigests) < 2 {
-		t.Errorf("FAIL: Expected at least 2 layers, got %d (rebase may not be working)", len(vmdkDigests))
-	}
-
-	// Log layer details for debugging
-	t.Log("--- Layer Details ---")
-	for i, d := range vmdkDigests {
-		if i < len(manifestDigests) && d == manifestDigests[i] {
-			t.Logf("  [%d] OK: %s...", i, d[:min(12, len(d))])
-		} else {
-			t.Logf("  [%d] MISMATCH: vmdk=%s...", i, d[:min(12, len(d))])
-		}
-	}
+	return compareLayerOrder(t, vmdkDigests, manifestDigests)
 }
 
-// truncateDigests returns digests truncated to first 12 chars for logging.
-func truncateDigests(digests []string) []string {
-	result := make([]string, len(digests))
-	for i, d := range digests {
-		if len(d) > 12 {
-			result[i] = d[:12] + "..."
-		} else {
-			result[i] = d
+// extractVMDKDigests parses a VMDK and extracts layer digests.
+func extractVMDKDigests(vmdkPath string) ([]string, error) {
+	vmdkLayers, err := parseVMDKLayers(vmdkPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Verify fsmeta is first
+	if len(vmdkLayers) > 0 && !strings.Contains(vmdkLayers[0], "fsmeta.erofs") {
+		return nil, fmt.Errorf("first extent should be fsmeta.erofs, got: %s", filepath.Base(vmdkLayers[0]))
+	}
+
+	var digests []string
+	for _, layer := range vmdkLayers {
+		if d := extractDigest(layer); d != "" {
+			digests = append(digests, d)
 		}
 	}
-	return result
+	return digests, nil
+}
+
+// compareLayerOrder verifies VMDK and manifest layer orders match.
+func compareLayerOrder(t *testing.T, vmdkDigests, manifestDigests []string) error {
+	t.Helper()
+
+	if len(vmdkDigests) != len(manifestDigests) {
+		return fmt.Errorf("layer count mismatch: VMDK=%d, manifest=%d", len(vmdkDigests), len(manifestDigests))
+	}
+
+	if len(vmdkDigests) < 2 {
+		return fmt.Errorf("expected at least 2 layers, got %d (rebase may not be working)", len(vmdkDigests))
+	}
+
+	for i := 0; i < len(vmdkDigests); i++ {
+		if vmdkDigests[i] != manifestDigests[i] {
+			t.Logf("layer order mismatch at position %d: VMDK=%s, manifest=%s",
+				i, vmdkDigests[i][:min(12, len(vmdkDigests[i]))],
+				manifestDigests[i][:min(12, len(manifestDigests[i]))])
+			return fmt.Errorf("layer order mismatch at position %d", i)
+		}
+		t.Logf("  [%d] OK: %s...", i, vmdkDigests[i][:min(12, len(vmdkDigests[i]))])
+	}
+
+	return nil
 }
