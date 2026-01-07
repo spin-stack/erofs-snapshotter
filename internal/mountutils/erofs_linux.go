@@ -30,13 +30,6 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 )
 
-const (
-	// fsTypeErofs is the filesystem type for EROFS mounts.
-	fsTypeErofs = "erofs"
-	// fsTypeExt4 is the filesystem type for ext4 mounts.
-	fsTypeExt4 = "ext4"
-)
-
 // MountAll mounts all provided mounts to the target directory.
 // It extends the standard mount.All by adding support for EROFS multi-device mounts.
 //
@@ -131,43 +124,6 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 		// Then detach loop devices
 		return cleanupLoops()
 	}, nil
-}
-
-// hasDeviceOption returns true if options contain any device= option.
-func hasDeviceOption(options []string) bool {
-	for _, opt := range options {
-		if strings.HasPrefix(opt, "device=") {
-			return true
-		}
-	}
-	return false
-}
-
-// HasErofsMultiDevice returns true if any mount is an EROFS with device= options.
-func HasErofsMultiDevice(mounts []mount.Mount) bool {
-	for _, m := range mounts {
-		if TypeSuffix(m.Type) == fsTypeErofs && hasDeviceOption(m.Options) {
-			return true
-		}
-	}
-	return false
-}
-
-// HasActiveSnapshotMounts returns true if the mounts represent an active snapshot
-// with both EROFS lower layers and an ext4 writable layer. This combination
-// requires special handling to create an overlay on the host for diff operations.
-func HasActiveSnapshotMounts(mounts []mount.Mount) bool {
-	hasErofs := false
-	hasExt4 := false
-	for _, m := range mounts {
-		switch TypeSuffix(m.Type) {
-		case fsTypeErofs:
-			hasErofs = true
-		case fsTypeExt4:
-			hasExt4 = true
-		}
-	}
-	return hasErofs && hasExt4
 }
 
 // MountExt4 mounts an ext4 filesystem image to the target directory using a loop device.

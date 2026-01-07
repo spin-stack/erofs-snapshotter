@@ -67,9 +67,10 @@ func (s *snapshotter) blockUpperPath(id string) string {
 // findLayerBlob finds the EROFS layer blob in a snapshot directory.
 // Layer blobs are named using their content digest (sha256-xxx.erofs) or
 // the snapshot ID for walking differ fallback (snapshot-xxx.erofs).
-// Returns the path if found, or an error if no layer blob exists.
+// Returns the path if found, or LayerBlobNotFoundError if no blob exists.
 func (s *snapshotter) findLayerBlob(id string) (string, error) {
 	dir := filepath.Join(s.root, snapshotsDirName, id)
+	patterns := []string{erofs.LayerBlobPattern, fallbackLayerPrefix + "*.erofs"}
 
 	// First try digest-based naming (primary path via EROFS differ)
 	matches, err := filepath.Glob(filepath.Join(dir, erofs.LayerBlobPattern))
@@ -86,7 +87,11 @@ func (s *snapshotter) findLayerBlob(id string) (string, error) {
 		return fallbackPath, nil
 	}
 
-	return "", fmt.Errorf("no layer blob found in %s", dir)
+	return "", &LayerBlobNotFoundError{
+		SnapshotID: id,
+		Dir:        dir,
+		Searched:   patterns,
+	}
 }
 
 // fallbackLayerBlobPath returns the path for creating a layer blob when the

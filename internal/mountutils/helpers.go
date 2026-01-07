@@ -28,6 +28,9 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 )
 
+// fsTypeErofs is the filesystem type string for EROFS mounts.
+const fsTypeErofs = "erofs"
+
 // NeedsMountManager returns true if any mount requires the mount manager to resolve.
 // This includes mounts with template syntax (e.g., "{{ mount 0 }}"), formatted mounts
 // (format/, mkfs/, mkdir/), and mounts with loop options (which require loop device setup).
@@ -116,6 +119,44 @@ func TypeSuffix(t string) string {
 func UniqueRef() string {
 	t := time.Now()
 	var b [3]byte
-	_, _ = rand.Read(b[:]) // Ignore read failures, just decreases uniqueness
+	_, _ = rand.Read(b[:])
 	return fmt.Sprintf("%d-%s", t.UnixNano(), base64.URLEncoding.EncodeToString(b[:]))
+}
+
+// hasDeviceOption returns true if options contain any device= option.
+func hasDeviceOption(options []string) bool {
+	for _, opt := range options {
+		if strings.HasPrefix(opt, "device=") {
+			return true
+		}
+	}
+	return false
+}
+
+// HasErofsMultiDevice returns true if any mount is an EROFS with device= options.
+// This indicates a multi-device fsmeta mount that requires special handling.
+func HasErofsMultiDevice(mounts []mount.Mount) bool {
+	for _, m := range mounts {
+		if TypeSuffix(m.Type) == fsTypeErofs && hasDeviceOption(m.Options) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasActiveSnapshotMounts returns true if the mounts represent an active snapshot
+// with both EROFS lower layers and an ext4 writable layer. This combination
+// requires special handling to create an overlay on the host for diff operations.
+func HasActiveSnapshotMounts(mounts []mount.Mount) bool {
+	hasErofs := false
+	hasExt4 := false
+	for _, m := range mounts {
+		switch TypeSuffix(m.Type) {
+		case fsTypeErofs:
+			hasErofs = true
+		case "ext4":
+			hasExt4 = true
+		}
+	}
+	return hasErofs && hasExt4
 }

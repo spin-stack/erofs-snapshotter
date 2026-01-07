@@ -808,6 +808,158 @@ func TestGetBlockSize(t *testing.T) {
 	})
 }
 
+// TestConvertErofsIntegration tests the actual conversion of a directory to EROFS.
+// This is an integration test that requires mkfs.erofs to be installed.
+func TestConvertErofsIntegration(t *testing.T) {
+	skipIfNoMkfsErofs(t)
+
+	// Create source directory with some content
+	srcDir := t.TempDir()
+
+	// Create a subdirectory
+	subDir := filepath.Join(srcDir, "subdir")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatalf("failed to create subdir: %v", err)
+	}
+
+	// Create a file
+	testFile := filepath.Join(srcDir, "testfile.txt")
+	if err := os.WriteFile(testFile, []byte("Hello, EROFS!"), 0644); err != nil {
+		t.Fatalf("failed to create testfile: %v", err)
+	}
+
+	// Create a file in subdirectory
+	subFile := filepath.Join(subDir, "subfile.txt")
+	if err := os.WriteFile(subFile, []byte("Nested content"), 0644); err != nil {
+		t.Fatalf("failed to create subfile: %v", err)
+	}
+
+	// Create a symlink
+	linkPath := filepath.Join(srcDir, "link")
+	if err := os.Symlink("testfile.txt", linkPath); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	// Output path
+	outputDir := t.TempDir()
+	layerPath := filepath.Join(outputDir, "layer.erofs")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err := ConvertErofs(ctx, layerPath, srcDir, nil)
+	if err != nil {
+		t.Fatalf("ConvertErofs failed: %v", err)
+	}
+
+	// Verify the output file exists and has content
+	info, err := os.Stat(layerPath)
+	if err != nil {
+		t.Fatalf("failed to stat output file: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Error("output file is empty")
+	}
+
+	// Verify it's a valid EROFS image by checking the magic number
+	f, err := os.Open(layerPath)
+	if err != nil {
+		t.Fatalf("failed to open output file: %v", err)
+	}
+	defer f.Close()
+
+	// EROFS magic is at offset 1024, value 0xe0f5e1e2
+	magic := make([]byte, 4)
+	if _, err := f.ReadAt(magic, 1024); err != nil {
+		t.Fatalf("failed to read magic: %v", err)
+	}
+
+	// EROFS magic in little-endian: 0xe2e1f5e0
+	expectedMagic := []byte{0xe2, 0xe1, 0xf5, 0xe0}
+	if !bytes.Equal(magic, expectedMagic) {
+		t.Errorf("invalid EROFS magic: got %x, want %x", magic, expectedMagic)
+	}
+
+	t.Logf("Successfully created EROFS image from directory: %s (%d bytes)", layerPath, info.Size())
+}
+
+// TestConvertErofsWithCompression tests directory conversion with compression.
+func TestConvertErofsWithCompression(t *testing.T) {
+	skipIfNoMkfsErofs(t)
+
+	srcDir := t.TempDir()
+
+	// Create a larger file to better test compression
+	testFile := filepath.Join(srcDir, "largefile.txt")
+	content := bytes.Repeat([]byte("This is compressible content. "), 1000)
+	if err := os.WriteFile(testFile, content, 0644); err != nil {
+		t.Fatalf("failed to create testfile: %v", err)
+	}
+
+	outputDir := t.TempDir()
+	layerPath := filepath.Join(outputDir, "layer.erofs")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Test with lz4hc compression
+	err := ConvertErofs(ctx, layerPath, srcDir, []string{"-zlz4hc"})
+	if err != nil {
+		t.Fatalf("ConvertErofs with compression failed: %v", err)
+	}
+
+	info, err := os.Stat(layerPath)
+	if err != nil {
+		t.Fatalf("failed to stat output file: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Error("output file is empty")
+	}
+
+	t.Logf("Successfully created compressed EROFS image: %s (%d bytes)", layerPath, info.Size())
+}
+
+// TestConvertErofsEmptyDirectory tests conversion of an empty directory.
+func TestConvertErofsEmptyDirectory(t *testing.T) {
+	skipIfNoMkfsErofs(t)
+
+	srcDir := t.TempDir()
+	outputDir := t.TempDir()
+	layerPath := filepath.Join(outputDir, "empty.erofs")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err := ConvertErofs(ctx, layerPath, srcDir, nil)
+	if err != nil {
+		t.Fatalf("ConvertErofs on empty directory failed: %v", err)
+	}
+
+	// Verify the output file exists
+	info, err := os.Stat(layerPath)
+	if err != nil {
+		t.Fatalf("failed to stat output file: %v", err)
+	}
+
+	t.Logf("Successfully created EROFS image from empty directory: %s (%d bytes)", layerPath, info.Size())
+}
+
+// TestConvertErofsNonexistentSource tests error handling for nonexistent source.
+func TestConvertErofsNonexistentSource(t *testing.T) {
+	skipIfNoMkfsErofs(t)
+
+	outputDir := t.TempDir()
+	layerPath := filepath.Join(outputDir, "layer.erofs")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err := ConvertErofs(ctx, layerPath, "/nonexistent/path", nil)
+	if err == nil {
+		t.Error("expected error for nonexistent source directory")
+	}
+}
+
 // TestCanMergeFsmeta tests the compatibility check for fsmeta merge.
 func TestCanMergeFsmeta(t *testing.T) {
 	t.Run("empty list", func(t *testing.T) {

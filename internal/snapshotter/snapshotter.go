@@ -23,10 +23,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/log"
+	"github.com/moby/sys/mountinfo"
 
 	"github.com/aledbf/nexus-erofs/internal/erofs"
 	"github.com/aledbf/nexus-erofs/internal/fsverity"
@@ -74,6 +76,22 @@ type snapshotter struct {
 	enableFsverity  bool
 	setImmutable    bool
 	defaultWritable int64
+
+	// bgWg tracks background operations (fsmeta generation) for clean shutdown.
+	bgWg sync.WaitGroup
+}
+
+// isMounted checks if a path is currently mounted.
+// Returns false if the path doesn't exist or on any error.
+func isMounted(target string) bool {
+	if _, err := os.Stat(target); err != nil {
+		return false
+	}
+	mounted, err := mountinfo.Mounted(target)
+	if err != nil {
+		return false
+	}
+	return mounted
 }
 
 // extractLabel is the label key used to mark snapshots for layer extraction.
@@ -142,7 +160,9 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 }
 
 // Close releases all resources held by the snapshotter.
+// It waits for any background operations (fsmeta generation) to complete.
 func (s *snapshotter) Close() error {
+	s.bgWg.Wait() // Wait for background operations to complete
 	s.cleanupBlockMounts()
 	return s.ms.Close()
 }

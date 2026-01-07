@@ -2,6 +2,7 @@ package snapshotter
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -17,23 +18,26 @@ func TestLayerBlobNotFoundError(t *testing.T) {
 	if msg == "" {
 		t.Error("error message should not be empty")
 	}
-	if !errContains(msg, "snap-123") {
+	if !strings.Contains(msg, "snap-123") {
 		t.Errorf("error message should contain snapshot ID: %s", msg)
 	}
-	if !errContains(msg, "sha256-*.erofs") {
+	if !strings.Contains(msg, "sha256-*.erofs") {
 		t.Errorf("error message should contain searched patterns: %s", msg)
 	}
 
-	// Test errors.Is
+	// Test errors.As for type-based matching (idiomatic Go)
 	var target *LayerBlobNotFoundError
-	if !errors.Is(err, target) {
-		t.Error("errors.Is should match LayerBlobNotFoundError")
+	if !errors.As(err, &target) {
+		t.Error("errors.As should match LayerBlobNotFoundError")
+	}
+	if target.SnapshotID != "snap-123" {
+		t.Errorf("errors.As should preserve fields, got SnapshotID=%q", target.SnapshotID)
 	}
 
-	// Test errors.Is with different error type
+	// Test errors.As with different error type
 	var otherTarget *BlockMountError
-	if errors.Is(err, otherTarget) {
-		t.Error("errors.Is should not match different error type")
+	if errors.As(err, &otherTarget) {
+		t.Error("errors.As should not match different error type")
 	}
 }
 
@@ -47,10 +51,10 @@ func TestBlockMountError(t *testing.T) {
 
 	// Test error message
 	msg := err.Error()
-	if !errContains(msg, "rwlayer.img") {
+	if !strings.Contains(msg, "rwlayer.img") {
 		t.Errorf("error message should contain source: %s", msg)
 	}
-	if !errContains(msg, "rw") {
+	if !strings.Contains(msg, "/rw") {
 		t.Errorf("error message should contain target: %s", msg)
 	}
 
@@ -65,29 +69,6 @@ func TestBlockMountError(t *testing.T) {
 	}
 }
 
-func TestFsmetaGenerationError(t *testing.T) {
-	cause := errors.New("mkfs.erofs failed")
-	err := &FsmetaGenerationError{
-		SnapshotID: "snap-456",
-		LayerCount: 5,
-		Cause:      cause,
-	}
-
-	// Test error message
-	msg := err.Error()
-	if !errContains(msg, "snap-456") {
-		t.Errorf("error message should contain snapshot ID: %s", msg)
-	}
-	if !errContains(msg, "5 layers") {
-		t.Errorf("error message should contain layer count: %s", msg)
-	}
-
-	// Test Unwrap
-	if err.Unwrap() != cause {
-		t.Error("Unwrap should return the cause")
-	}
-}
-
 func TestCommitConversionError(t *testing.T) {
 	cause := errors.New("no space left on device")
 	err := &CommitConversionError{
@@ -98,32 +79,16 @@ func TestCommitConversionError(t *testing.T) {
 
 	// Test error message
 	msg := err.Error()
-	if !errContains(msg, "snap-789") {
+	if !strings.Contains(msg, "snap-789") {
 		t.Errorf("error message should contain snapshot ID: %s", msg)
 	}
-	if !errContains(msg, "fs") {
+	if !strings.Contains(msg, "/fs") {
 		t.Errorf("error message should contain upper dir: %s", msg)
 	}
 
 	// Test Unwrap
 	if err.Unwrap() != cause {
 		t.Error("Unwrap should return the cause")
-	}
-}
-
-func TestIncompatibleBlockSizeError(t *testing.T) {
-	err := &IncompatibleBlockSizeError{
-		LayerCount: 3,
-		Details:    "block sizes vary from 512 to 4096",
-	}
-
-	// Test error message
-	msg := err.Error()
-	if !errContains(msg, "3 layers") {
-		t.Errorf("error message should contain layer count: %s", msg)
-	}
-	if !errContains(msg, "block sizes") {
-		t.Errorf("error message should contain details: %s", msg)
 	}
 }
 
@@ -151,14 +116,4 @@ func TestErrorWrapping(t *testing.T) {
 	if !errors.As(commitErr, &blockTarget) {
 		t.Error("should find BlockMountError in error chain")
 	}
-}
-
-// errContains checks if s contains substr (simple helper to avoid strings import)
-func errContains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

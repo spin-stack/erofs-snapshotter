@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -17,6 +18,10 @@ import (
 
 	"github.com/aledbf/nexus-erofs/internal/erofs"
 )
+
+// fsmetaTimeout is the maximum time allowed for fsmeta generation.
+// This includes reading layer blobs and running mkfs.erofs.
+const fsmetaTimeout = 5 * time.Minute
 
 // isExtractKey returns true if the key indicates an extract/unpack operation.
 // Snapshot keys use forward slashes as separators (e.g., "default/1/extract-12345"),
@@ -116,8 +121,20 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 
 	// Generate VMDK for VM runtimes - always generate when there are parent layers.
 	// ParentIDs come from the snapshot chain in newest-first order.
+	// Run async to avoid blocking Prepare/View - fsmeta generation is expensive
+	// but not required for basic snapshot operations.
 	if !isExtractKey(key) && len(snap.ParentIDs) > 0 {
-		s.generateFsMeta(ctx, NewNewestFirst(snap.ParentIDs))
+		parentIDs := snap.ParentIDs // capture for goroutine
+		s.bgWg.Add(1)
+		//nolint:contextcheck // intentionally using fresh context with timeout for background work
+		go func(ids []string) {
+			defer s.bgWg.Done()
+			// Use a fresh context with timeout - intentionally independent of parent
+			// context to allow completion even if the original request is cancelled.
+			bgCtx, cancel := context.WithTimeout(context.Background(), fsmetaTimeout)
+			defer cancel()
+			s.generateFsMeta(bgCtx, ids)
+		}(parentIDs)
 	}
 
 	// For active snapshots, create the writable ext4 layer file.

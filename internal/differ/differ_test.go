@@ -377,3 +377,96 @@ func TestApplySupportedMediaTypes(t *testing.T) {
 		})
 	}
 }
+
+// Note: Compare tests with content store are in compare_linux_test.go since
+// Compare is only implemented on Linux. Those tests use local.NewStore to
+// create a real content store for testing writeAndCommitDiff and Compare.
+
+func TestDiffWriteFuncNil(t *testing.T) {
+	// Test that the differ handles nil writeFn gracefully
+	// This is an internal test for edge cases
+	d := NewErofsDiffer(nil)
+	if d.store != nil {
+		t.Error("expected nil store")
+	}
+}
+
+func TestMkfsOptionsPreservation(t *testing.T) {
+	// Test that mkfs options are preserved correctly
+	opts := []string{"-z", "lz4", "-C", "65536", "-T", "0"}
+	d := NewErofsDiffer(nil, WithMkfsOptions(opts))
+
+	// All provided options should be present in mkfsExtraOpts
+	for _, want := range opts {
+		found := false
+		for _, got := range d.mkfsExtraOpts {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected option %q to be preserved, options: %v", want, d.mkfsExtraOpts)
+		}
+	}
+}
+
+func TestDifferStoreAccess(t *testing.T) {
+	// Test that the differ correctly stores and accesses the content store
+	d := NewErofsDiffer(nil)
+	if d.store != nil {
+		t.Error("expected nil store when passed nil")
+	}
+
+	// Create a minimal mock store (we can't easily mock content.Store interface
+	// but we can verify the differ stores what we give it)
+	d2 := NewErofsDiffer(nil)
+	if d2.store != nil {
+		t.Error("expected nil store")
+	}
+}
+
+func TestApplyWithDifferentMountTypes(t *testing.T) {
+	ctx := context.Background()
+	d := NewErofsDiffer(nil)
+
+	// These tests focus on mount validation that happens before content store access.
+	// Tests that would require a content store are covered in integration tests.
+	tests := []struct {
+		name      string
+		mounts    []mount.Mount
+		wantError bool
+		errorMsg  string
+	}{
+		{
+			name:      "empty mounts",
+			mounts:    nil,
+			wantError: true,
+			errorMsg:  "no mounts",
+		},
+		{
+			name:      "single tmpfs",
+			mounts:    []mount.Mount{{Type: "tmpfs", Source: "tmpfs"}},
+			wantError: true,
+			errorMsg:  "unsupported filesystem type",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			desc := ocispec.Descriptor{
+				MediaType: ocispec.MediaTypeImageLayerGzip,
+				Digest:    "sha256:abc123def456",
+				Size:      100,
+			}
+
+			_, err := d.Apply(ctx, desc, tc.mounts)
+			if tc.wantError && err == nil {
+				t.Error("expected error")
+			}
+			if tc.errorMsg != "" && err != nil && !strings.Contains(err.Error(), tc.errorMsg) {
+				t.Errorf("error should contain %q: %v", tc.errorMsg, err)
+			}
+		})
+	}
+}

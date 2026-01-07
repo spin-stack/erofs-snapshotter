@@ -27,21 +27,11 @@ import (
 
 // MountAll mounts all provided mounts to the target directory.
 // On non-Linux platforms, EROFS mounts are not supported.
-func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err error) {
+func MountAll(_ []mount.Mount, _ string) (cleanup func() error, err error) {
 	return func() error { return nil }, fmt.Errorf("EROFS mounts not supported on %s", runtime.GOOS)
 }
 
-// HasErofsMultiDevice returns true if any mount is an EROFS with device= options.
-func HasErofsMultiDevice(mounts []mount.Mount) bool {
-	return false
-}
-
-// HasActiveSnapshotMounts returns true if the mounts represent an active snapshot.
-func HasActiveSnapshotMounts(mounts []mount.Mount) bool {
-	return false
-}
-
 // MountExt4 mounts an ext4 filesystem image to the target directory.
-func MountExt4(source, target string) (cleanup func() error, err error) {
+func MountExt4(_, _ string) (cleanup func() error, err error) {
 	return func() error { return nil }, fmt.Errorf("ext4 mounts not supported on %s", runtime.GOOS)
 }

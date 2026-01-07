@@ -296,3 +296,139 @@ func TestUniqueRef(t *testing.T) {
 		}
 	}
 }
+
+func TestHasErofsMultiDevice(t *testing.T) {
+	tests := []struct {
+		name   string
+		mounts []mount.Mount
+		want   bool
+	}{
+		{
+			name:   "empty mounts",
+			mounts: nil,
+			want:   false,
+		},
+		{
+			name: "single bind mount",
+			mounts: []mount.Mount{
+				{Type: "bind", Source: "/path"},
+			},
+			want: false,
+		},
+		{
+			name: "erofs without device option",
+			mounts: []mount.Mount{
+				{Type: "erofs", Source: "/path/layer.erofs", Options: []string{"ro", "loop"}},
+			},
+			want: false,
+		},
+		{
+			name: "erofs with device option",
+			mounts: []mount.Mount{
+				{Type: "erofs", Source: "/path/fsmeta.erofs", Options: []string{"ro", "loop", "device=/path/blob.erofs"}},
+			},
+			want: true,
+		},
+		{
+			name: "format/erofs with device option",
+			mounts: []mount.Mount{
+				{Type: "format/erofs", Source: "/path/fsmeta.erofs", Options: []string{"ro", "device=/path/blob1.erofs", "device=/path/blob2.erofs"}},
+			},
+			want: true,
+		},
+		{
+			name: "multiple mounts with erofs multi-device",
+			mounts: []mount.Mount{
+				{Type: "erofs", Source: "/path/fsmeta.erofs", Options: []string{"ro", "device=/path/blob.erofs"}},
+				{Type: "ext4", Source: "/path/rwlayer.img", Options: []string{"rw"}},
+			},
+			want: true,
+		},
+		{
+			name: "overlay mount (not erofs)",
+			mounts: []mount.Mount{
+				{Type: "overlay", Source: "overlay", Options: []string{"lowerdir=/lower", "upperdir=/upper"}},
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := HasErofsMultiDevice(tc.mounts)
+			if got != tc.want {
+				t.Errorf("HasErofsMultiDevice() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasActiveSnapshotMounts(t *testing.T) {
+	tests := []struct {
+		name   string
+		mounts []mount.Mount
+		want   bool
+	}{
+		{
+			name:   "empty mounts",
+			mounts: nil,
+			want:   false,
+		},
+		{
+			name: "erofs only",
+			mounts: []mount.Mount{
+				{Type: "erofs", Source: "/path/layer.erofs"},
+			},
+			want: false,
+		},
+		{
+			name: "ext4 only",
+			mounts: []mount.Mount{
+				{Type: "ext4", Source: "/path/rwlayer.img"},
+			},
+			want: false,
+		},
+		{
+			name: "erofs and ext4 (active snapshot)",
+			mounts: []mount.Mount{
+				{Type: "erofs", Source: "/path/layer.erofs", Options: []string{"ro", "loop"}},
+				{Type: "ext4", Source: "/path/rwlayer.img", Options: []string{"rw", "loop"}},
+			},
+			want: true,
+		},
+		{
+			name: "format/erofs and ext4 (active snapshot with fsmeta)",
+			mounts: []mount.Mount{
+				{Type: "format/erofs", Source: "/path/fsmeta.erofs", Options: []string{"ro", "device=/path/blob.erofs"}},
+				{Type: "ext4", Source: "/path/rwlayer.img", Options: []string{"rw"}},
+			},
+			want: true,
+		},
+		{
+			name: "multiple erofs and ext4",
+			mounts: []mount.Mount{
+				{Type: "erofs", Source: "/path/layer1.erofs"},
+				{Type: "erofs", Source: "/path/layer2.erofs"},
+				{Type: "ext4", Source: "/path/rwlayer.img"},
+			},
+			want: true,
+		},
+		{
+			name: "bind and overlay (not active snapshot)",
+			mounts: []mount.Mount{
+				{Type: "bind", Source: "/path"},
+				{Type: "overlay", Source: "overlay"},
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := HasActiveSnapshotMounts(tc.mounts)
+			if got != tc.want {
+				t.Errorf("HasActiveSnapshotMounts() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
