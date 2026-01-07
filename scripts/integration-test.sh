@@ -1894,18 +1894,44 @@ test_full_cleanup_no_leaks() {
     fi
 
     # Force remove any remaining snapshots
-    local snapshots
-    snapshots=$(ctr_cmd snapshots --snapshotter nexus-erofs ls 2>/dev/null | grep -v "^KEY" | awk '{print $1}' || true)
+    # Loop multiple times because parent-child dependencies require children to be removed first.
+    # If parents are listed before children, the first pass will fail on parents but succeed on children.
+    # Subsequent passes will then succeed on the now-childless parents.
+    log_info "Removing remaining snapshots..."
+    local max_iterations=10
+    local iteration=0
+    local last_count=-1
 
-    if [ -n "$snapshots" ]; then
-        log_info "Removing remaining snapshots..."
+    while [ $iteration -lt $max_iterations ]; do
+        local snapshots
+        snapshots=$(ctr_cmd snapshots --snapshotter nexus-erofs ls 2>/dev/null | grep -v "^KEY" | awk '{print $1}' || true)
+
+        local current_count
+        current_count=$(echo "$snapshots" | grep -c . 2>/dev/null || echo 0)
+
+        # No more snapshots
+        if [ "$current_count" -eq 0 ] || [ -z "$snapshots" ]; then
+            break
+        fi
+
+        # No progress made in last iteration - we're stuck
+        if [ "$current_count" -eq "$last_count" ]; then
+            log_warn "No progress in snapshot removal after $iteration iterations"
+            break
+        fi
+
+        log_debug "Removal pass $((iteration + 1)): $current_count snapshots remaining"
+        last_count=$current_count
+
         echo "$snapshots" | while read -r snap; do
             if [ -n "$snap" ]; then
                 log_debug "Removing snapshot: $snap"
                 ctr_cmd snapshots --snapshotter nexus-erofs rm "$snap" 2>/dev/null || true
             fi
         done
-    fi
+
+        iteration=$((iteration + 1))
+    done
 
     # Wait a moment for cleanup to complete
     sleep 1
