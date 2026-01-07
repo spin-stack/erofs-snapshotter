@@ -68,29 +68,6 @@ func TestBlockMountError(t *testing.T) {
 	}
 }
 
-func TestFsmetaGenerationError(t *testing.T) {
-	cause := errors.New("mkfs.erofs failed")
-	err := &FsmetaGenerationError{
-		SnapshotID: "snap-456",
-		LayerCount: 5,
-		Cause:      cause,
-	}
-
-	// Test error message
-	msg := err.Error()
-	if !errContains(msg, "snap-456") {
-		t.Errorf("error message should contain snapshot ID: %s", msg)
-	}
-	if !errContains(msg, "5 layers") {
-		t.Errorf("error message should contain layer count: %s", msg)
-	}
-
-	// Test Unwrap
-	if err.Unwrap() != cause {
-		t.Error("Unwrap should return the cause")
-	}
-}
-
 func TestCommitConversionError(t *testing.T) {
 	cause := errors.New("no space left on device")
 	err := &CommitConversionError{
@@ -111,22 +88,6 @@ func TestCommitConversionError(t *testing.T) {
 	// Test Unwrap
 	if err.Unwrap() != cause {
 		t.Error("Unwrap should return the cause")
-	}
-}
-
-func TestIncompatibleBlockSizeError(t *testing.T) {
-	err := &IncompatibleBlockSizeError{
-		LayerCount: 3,
-		Details:    "block sizes vary from 512 to 4096",
-	}
-
-	// Test error message
-	msg := err.Error()
-	if !errContains(msg, "3 layers") {
-		t.Errorf("error message should contain layer count: %s", msg)
-	}
-	if !errContains(msg, "block sizes") {
-		t.Errorf("error message should contain details: %s", msg)
 	}
 }
 

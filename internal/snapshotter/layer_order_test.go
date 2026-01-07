@@ -4,44 +4,17 @@ import (
 	"testing"
 )
 
-func TestLayerOrderString(t *testing.T) {
-	tests := []struct {
-		order    LayerOrder
-		expected string
-	}{
-		{OrderNewestFirst, "newest-first"},
-		{OrderOldestFirst, "oldest-first"},
-		{LayerOrder(99), "unknown"},
-	}
-
-	for _, tt := range tests {
-		got := tt.order.String()
-		if got != tt.expected {
-			t.Errorf("LayerOrder(%d).String() = %q, want %q", tt.order, got, tt.expected)
-		}
-	}
-}
-
-func TestLayerOrderOpposite(t *testing.T) {
-	if OrderNewestFirst.Opposite() != OrderOldestFirst {
-		t.Error("NewestFirst.Opposite() should be OldestFirst")
-	}
-	if OrderOldestFirst.Opposite() != OrderNewestFirst {
-		t.Error("OldestFirst.Opposite() should be NewestFirst")
-	}
-}
-
 func TestLayerSequenceReverse(t *testing.T) {
 	original := LayerSequence{
-		IDs:   []string{"layer3", "layer2", "layer1", "base"},
-		Order: OrderNewestFirst,
+		IDs:           []string{"layer3", "layer2", "layer1", "base"},
+		IsNewestFirst: true,
 	}
 
 	reversed := original.Reverse()
 
 	// Check order changed
-	if reversed.Order != OrderOldestFirst {
-		t.Errorf("reversed.Order = %v, want %v", reversed.Order, OrderOldestFirst)
+	if reversed.IsNewestFirst != false {
+		t.Errorf("reversed.IsNewestFirst = %v, want false", reversed.IsNewestFirst)
 	}
 
 	// Check IDs reversed
@@ -56,8 +29,8 @@ func TestLayerSequenceReverse(t *testing.T) {
 	}
 
 	// Original should be unchanged
-	if original.Order != OrderNewestFirst {
-		t.Error("original.Order should be unchanged")
+	if original.IsNewestFirst != true {
+		t.Error("original.IsNewestFirst should be unchanged")
 	}
 	if original.IDs[0] != "layer3" {
 		t.Error("original.IDs should be unchanged")
@@ -66,14 +39,14 @@ func TestLayerSequenceReverse(t *testing.T) {
 
 func TestLayerSequenceDoubleReverse(t *testing.T) {
 	original := LayerSequence{
-		IDs:   []string{"a", "b", "c"},
-		Order: OrderNewestFirst,
+		IDs:           []string{"a", "b", "c"},
+		IsNewestFirst: true,
 	}
 
 	doubleReversed := original.Reverse().Reverse()
 
-	if doubleReversed.Order != original.Order {
-		t.Errorf("double reverse order = %v, want %v", doubleReversed.Order, original.Order)
+	if doubleReversed.IsNewestFirst != original.IsNewestFirst {
+		t.Errorf("double reverse IsNewestFirst = %v, want %v", doubleReversed.IsNewestFirst, original.IsNewestFirst)
 	}
 
 	for i, id := range doubleReversed.IDs {
@@ -81,60 +54,6 @@ func TestLayerSequenceDoubleReverse(t *testing.T) {
 			t.Errorf("double reverse IDs[%d] = %q, want %q", i, id, original.IDs[i])
 		}
 	}
-}
-
-func TestLayerSequenceToOldestFirst(t *testing.T) {
-	t.Run("from newest-first", func(t *testing.T) {
-		seq := NewNewestFirst([]string{"c", "b", "a"})
-		result := seq.ToOldestFirst()
-
-		if result.Order != OrderOldestFirst {
-			t.Errorf("Order = %v, want OldestFirst", result.Order)
-		}
-		if result.IDs[0] != "a" {
-			t.Errorf("first ID = %q, want 'a' (oldest)", result.IDs[0])
-		}
-	})
-
-	t.Run("from oldest-first", func(t *testing.T) {
-		seq := NewOldestFirst([]string{"a", "b", "c"})
-		result := seq.ToOldestFirst()
-
-		if result.Order != OrderOldestFirst {
-			t.Errorf("Order = %v, want OldestFirst", result.Order)
-		}
-		// Should be a copy, not reverse
-		if result.IDs[0] != "a" {
-			t.Errorf("first ID = %q, want 'a'", result.IDs[0])
-		}
-	})
-}
-
-func TestLayerSequenceToNewestFirst(t *testing.T) {
-	t.Run("from oldest-first", func(t *testing.T) {
-		seq := NewOldestFirst([]string{"a", "b", "c"})
-		result := seq.ToNewestFirst()
-
-		if result.Order != OrderNewestFirst {
-			t.Errorf("Order = %v, want NewestFirst", result.Order)
-		}
-		if result.IDs[0] != "c" {
-			t.Errorf("first ID = %q, want 'c' (newest)", result.IDs[0])
-		}
-	})
-
-	t.Run("from newest-first", func(t *testing.T) {
-		seq := NewNewestFirst([]string{"c", "b", "a"})
-		result := seq.ToNewestFirst()
-
-		if result.Order != OrderNewestFirst {
-			t.Errorf("Order = %v, want NewestFirst", result.Order)
-		}
-		// Should be a copy, not reverse
-		if result.IDs[0] != "c" {
-			t.Errorf("first ID = %q, want 'c'", result.IDs[0])
-		}
-	})
 }
 
 func TestLayerSequenceLen(t *testing.T) {
@@ -165,30 +84,17 @@ func TestNewNewestFirst(t *testing.T) {
 	ids := []string{"c", "b", "a"}
 	seq := NewNewestFirst(ids)
 
-	if seq.Order != OrderNewestFirst {
-		t.Errorf("Order = %v, want NewestFirst", seq.Order)
+	if !seq.IsNewestFirst {
+		t.Error("NewNewestFirst should set IsNewestFirst=true")
 	}
 	if len(seq.IDs) != 3 {
 		t.Errorf("IDs length = %d, want 3", len(seq.IDs))
 	}
 }
 
-func TestNewOldestFirst(t *testing.T) {
-	ids := []string{"a", "b", "c"}
-	seq := NewOldestFirst(ids)
-
-	if seq.Order != OrderOldestFirst {
-		t.Errorf("Order = %v, want OldestFirst", seq.Order)
-	}
-	if len(seq.IDs) != 3 {
-		t.Errorf("IDs length = %d, want 3", len(seq.IDs))
-	}
-}
-
-func TestLayerSequenceCopyOnConvert(t *testing.T) {
-	// Ensure ToOldestFirst/ToNewestFirst return copies, not references
+func TestLayerSequenceCopyOnReverse(t *testing.T) {
 	original := NewNewestFirst([]string{"a", "b", "c"})
-	result := original.ToNewestFirst()
+	result := original.Reverse()
 
 	// Modify result
 	result.IDs[0] = "modified"

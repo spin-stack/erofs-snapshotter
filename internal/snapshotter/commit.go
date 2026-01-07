@@ -196,11 +196,6 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs LayerSequenc
 		return
 	}
 
-	// Validate input ordering - we expect newest-first from snapshot chain
-	if parentIDs.Order != OrderNewestFirst {
-		log.G(ctx).Warn("generateFsMeta received unexpected layer order, expected newest-first")
-	}
-
 	t1 := time.Now()
 
 	// Use the newest snapshot's directory for output files
@@ -226,15 +221,11 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs LayerSequenc
 	}()
 
 	// Convert to oldest-first order for mkfs.erofs
-	ociOrder := parentIDs.ToOldestFirst()
+	ociOrder := parentIDs.Reverse()
 
-	log.G(ctx).WithFields(log.Fields{
-		"layers":     ociOrder.Len(),
-		"inputOrder": parentIDs.Order,
-		"erofsOrder": ociOrder.Order,
-	}).Debug("collecting layer blobs for fsmeta generation")
+	log.G(ctx).WithField("layers", ociOrder.Len()).Debug("collecting layer blobs for fsmeta generation")
 
-	// Collect layer blob paths in OCI order
+	// Collect layer blob paths in OCI order (oldest-first)
 	for _, snapID := range ociOrder.IDs {
 		blob, err := s.findLayerBlob(snapID)
 		if err != nil {

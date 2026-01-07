@@ -1457,9 +1457,17 @@ func testFullCleanup(t *testing.T, env *Environment) {
 	if info, err := os.Stat(snapshotsDir); err == nil && info.IsDir() {
 		entries, _ := os.ReadDir(snapshotsDir)
 		if len(entries) > 0 {
-			t.Errorf("%d leaked files in snapshots directory", len(entries))
+			t.Errorf("%d leaked files in snapshots directory: %s", len(entries), snapshotsDir)
 			for _, e := range entries {
-				t.Logf("  leaked: %s", e.Name())
+				leakedPath := filepath.Join(snapshotsDir, e.Name())
+				t.Logf("  leaked: %s", leakedPath)
+				// List contents to help debug
+				if e.IsDir() {
+					subEntries, _ := os.ReadDir(leakedPath)
+					for _, sub := range subEntries {
+						t.Logf("    - %s", sub.Name())
+					}
+				}
 			}
 		}
 	}

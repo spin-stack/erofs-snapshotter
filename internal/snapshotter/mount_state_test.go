@@ -5,134 +5,54 @@ import (
 	"testing"
 )
 
-func TestMountStateString(t *testing.T) {
-	tests := []struct {
-		state    MountState
-		expected string
-	}{
-		{MountStateUnknown, "unknown"},
-		{MountStateUnmounted, "unmounted"},
-		{MountStateMounted, "mounted"},
-		{MountStateMountedByUs, "mounted-by-us"},
-		{MountState(99), "invalid(99)"},
-	}
-
-	for _, tt := range tests {
-		got := tt.state.String()
-		if got != tt.expected {
-			t.Errorf("MountState(%d).String() = %q, want %q", tt.state, got, tt.expected)
-		}
-	}
-}
-
-func TestMountStateIsMounted(t *testing.T) {
-	tests := []struct {
-		state    MountState
-		expected bool
-	}{
-		{MountStateUnknown, false},
-		{MountStateUnmounted, false},
-		{MountStateMounted, true},
-		{MountStateMountedByUs, true},
-	}
-
-	for _, tt := range tests {
-		got := tt.state.IsMounted()
-		if got != tt.expected {
-			t.Errorf("MountState(%d).IsMounted() = %v, want %v", tt.state, got, tt.expected)
-		}
-	}
-}
-
-func TestMountStateNeedsCleanup(t *testing.T) {
-	tests := []struct {
-		state    MountState
-		expected bool
-	}{
-		{MountStateUnknown, false},
-		{MountStateUnmounted, false},
-		{MountStateMounted, false},
-		{MountStateMountedByUs, true},
-	}
-
-	for _, tt := range tests {
-		got := tt.state.NeedsCleanup()
-		if got != tt.expected {
-			t.Errorf("MountState(%d).NeedsCleanup() = %v, want %v", tt.state, got, tt.expected)
-		}
-	}
-}
-
 func TestMountTrackerBasicOperations(t *testing.T) {
 	tracker := NewMountTracker()
 
-	// Initially unknown
-	if state := tracker.Get("snap-1"); state != MountStateUnknown {
-		t.Errorf("initial state = %v, want Unknown", state)
+	// Initially not mounted
+	if tracker.IsMounted("snap-1") {
+		t.Error("initial state should be unmounted")
 	}
 
 	// Set mounted
 	tracker.SetMounted("snap-1")
-	if state := tracker.Get("snap-1"); state != MountStateMountedByUs {
-		t.Errorf("after SetMounted = %v, want MountedByUs", state)
-	}
-
-	// IsMounted should return true
 	if !tracker.IsMounted("snap-1") {
-		t.Error("IsMounted should return true for mounted snapshot")
-	}
-
-	// NeedsCleanup should return true
-	if !tracker.NeedsCleanup("snap-1") {
-		t.Error("NeedsCleanup should return true for MountedByUs")
+		t.Error("IsMounted should return true after SetMounted")
 	}
 
 	// Set unmounted
 	tracker.SetUnmounted("snap-1")
-	if state := tracker.Get("snap-1"); state != MountStateUnknown {
-		t.Errorf("after SetUnmounted = %v, want Unknown (removed from map)", state)
-	}
-
-	// IsMounted should return false
 	if tracker.IsMounted("snap-1") {
-		t.Error("IsMounted should return false after unmount")
+		t.Error("IsMounted should return false after SetUnmounted")
 	}
 }
 
-func TestMountTrackerGetAllMounted(t *testing.T) {
+func TestMountTrackerMultipleSnapshots(t *testing.T) {
 	tracker := NewMountTracker()
 
-	// Mount several snapshots
 	tracker.SetMounted("snap-1")
 	tracker.SetMounted("snap-2")
-	tracker.Set("snap-3", MountStateMounted) // External mount
-	tracker.SetMounted("snap-4")
-	tracker.SetUnmounted("snap-2") // Unmount one
+	tracker.SetMounted("snap-3")
 
-	mounted := tracker.GetAllMounted()
-
-	// Should have 3 mounted (snap-1, snap-3, snap-4)
-	if len(mounted) != 3 {
-		t.Errorf("GetAllMounted returned %d, want 3", len(mounted))
+	if !tracker.IsMounted("snap-1") {
+		t.Error("snap-1 should be mounted")
 	}
-
-	// Verify the correct ones are in the list
-	found := make(map[string]bool)
-	for _, id := range mounted {
-		found[id] = true
+	if !tracker.IsMounted("snap-2") {
+		t.Error("snap-2 should be mounted")
+	}
+	if !tracker.IsMounted("snap-3") {
+		t.Error("snap-3 should be mounted")
 	}
 
-	if !found["snap-1"] {
-		t.Error("snap-1 should be in mounted list")
+	tracker.SetUnmounted("snap-2")
+
+	if !tracker.IsMounted("snap-1") {
+		t.Error("snap-1 should still be mounted")
 	}
-	if found["snap-2"] {
-		t.Error("snap-2 should not be in mounted list (unmounted)")
+	if tracker.IsMounted("snap-2") {
+		t.Error("snap-2 should be unmounted")
 	}
-	if !found["snap-3"] {
-		t.Error("snap-3 should be in mounted list")
-	}
-	if !found["snap-4"] {
-		t.Error("snap-4 should be in mounted list")
+	if !tracker.IsMounted("snap-3") {
+		t.Error("snap-3 should still be mounted")
 	}
 }
 
@@ -142,14 +62,17 @@ func TestMountTrackerClear(t *testing.T) {
 	tracker.SetMounted("snap-1")
 	tracker.SetMounted("snap-2")
 
-	if len(tracker.GetAllMounted()) != 2 {
-		t.Error("should have 2 mounted before clear")
+	if !tracker.IsMounted("snap-1") || !tracker.IsMounted("snap-2") {
+		t.Error("snapshots should be mounted before clear")
 	}
 
 	tracker.Clear()
 
-	if len(tracker.GetAllMounted()) != 0 {
-		t.Error("should have 0 mounted after clear")
+	if tracker.IsMounted("snap-1") {
+		t.Error("snap-1 should not be mounted after clear")
+	}
+	if tracker.IsMounted("snap-2") {
+		t.Error("snap-2 should not be mounted after clear")
 	}
 
 	// New operations should work after clear
@@ -173,7 +96,6 @@ func TestMountTrackerConcurrentAccess(t *testing.T) {
 			snapID := string(rune('a' + id%26))
 			tracker.SetMounted(snapID)
 			_ = tracker.IsMounted(snapID)
-			_ = tracker.Get(snapID)
 		}(i)
 	}
 
@@ -191,36 +113,26 @@ func TestMountTrackerConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
-
-	// After all unmounts, should be empty
-	if len(tracker.GetAllMounted()) != 0 {
-		t.Errorf("expected 0 mounted after concurrent unmounts, got %d", len(tracker.GetAllMounted()))
-	}
 }
 
-func TestMountTrackerSetVariants(t *testing.T) {
+func TestMountTrackerIdempotent(t *testing.T) {
 	tracker := NewMountTracker()
 
-	// Test Set with different states
-	tracker.Set("snap-1", MountStateMounted)
-	if state := tracker.Get("snap-1"); state != MountStateMounted {
-		t.Errorf("Set(Mounted) = %v, want Mounted", state)
+	// Multiple SetMounted calls should be idempotent
+	tracker.SetMounted("snap-1")
+	tracker.SetMounted("snap-1")
+	tracker.SetMounted("snap-1")
+
+	if !tracker.IsMounted("snap-1") {
+		t.Error("snap-1 should be mounted")
 	}
 
-	// MountStateMounted does not need cleanup
-	if tracker.NeedsCleanup("snap-1") {
-		t.Error("MountStateMounted should not need cleanup")
-	}
+	// Multiple SetUnmounted calls should be idempotent
+	tracker.SetUnmounted("snap-1")
+	tracker.SetUnmounted("snap-1")
+	tracker.SetUnmounted("snap-1")
 
-	// MountStateMountedByUs needs cleanup
-	tracker.Set("snap-2", MountStateMountedByUs)
-	if !tracker.NeedsCleanup("snap-2") {
-		t.Error("MountStateMountedByUs should need cleanup")
-	}
-
-	// Setting to Unmounted removes from map
-	tracker.Set("snap-1", MountStateUnmounted)
-	if state := tracker.Get("snap-1"); state != MountStateUnknown {
-		t.Errorf("after Set(Unmounted) = %v, want Unknown", state)
+	if tracker.IsMounted("snap-1") {
+		t.Error("snap-1 should be unmounted")
 	}
 }

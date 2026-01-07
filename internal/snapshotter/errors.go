@@ -10,7 +10,7 @@ import (
 type LayerBlobNotFoundError struct {
 	SnapshotID string
 	Dir        string
-	Searched   []string // Patterns searched
+	Searched   []string
 }
 
 func (e *LayerBlobNotFoundError) Error() string {
@@ -19,7 +19,6 @@ func (e *LayerBlobNotFoundError) Error() string {
 }
 
 // BlockMountError indicates ext4 block mount failure during commit.
-// This occurs when the rwlayer.img cannot be mounted to read upper contents.
 type BlockMountError struct {
 	Source string
 	Target string
@@ -31,23 +30,6 @@ func (e *BlockMountError) Error() string {
 }
 
 func (e *BlockMountError) Unwrap() error {
-	return e.Cause
-}
-
-// FsmetaGenerationError indicates fsmeta creation failure.
-// fsmeta generation is non-critical - callers can fall back to individual layers.
-type FsmetaGenerationError struct {
-	SnapshotID string
-	LayerCount int
-	Cause      error
-}
-
-func (e *FsmetaGenerationError) Error() string {
-	return fmt.Sprintf("generate fsmeta for %s (%d layers): %v",
-		e.SnapshotID, e.LayerCount, e.Cause)
-}
-
-func (e *FsmetaGenerationError) Unwrap() error {
 	return e.Cause
 }
 
@@ -65,14 +47,4 @@ func (e *CommitConversionError) Error() string {
 
 func (e *CommitConversionError) Unwrap() error {
 	return e.Cause
-}
-
-// IncompatibleBlockSizeError indicates layers cannot be merged due to block size mismatch.
-type IncompatibleBlockSizeError struct {
-	LayerCount int
-	Details    string
-}
-
-func (e *IncompatibleBlockSizeError) Error() string {
-	return fmt.Sprintf("cannot merge %d layers: %s", e.LayerCount, e.Details)
 }
