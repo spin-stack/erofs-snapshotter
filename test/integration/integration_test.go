@@ -1170,28 +1170,25 @@ func testMultiLayer(t *testing.T, env *Environment) {
 		ss.Remove(ctx, viewKey) //nolint:errcheck
 	})
 
-	// Wait for VMDK generation by polling
+	// Wait for a multi-layer VMDK to be generated (fsmeta generation is async).
+	// The single-layer alpine image may already have a VMDK, so we need to wait
+	// specifically for a VMDK with 2+ layers from the multi-layer image.
 	snapshotsDir := filepath.Join(env.SnapshotterRoot(), "snapshots")
-	var vmdkPaths []string
+	var multiLayerVMDK string
+	var layerCount int
 	err = waitFor(func() bool {
-		vmdkPaths = nil
-		filepath.Walk(snapshotsDir, func(path string, info os.FileInfo, walkErr error) error { //nolint:errcheck
-			if walkErr == nil && filepath.Base(path) == mergedVMDKFile {
-				vmdkPaths = append(vmdkPaths, path)
-			}
-			return nil
-		})
-		return len(vmdkPaths) > 0
-	}, 5*time.Second, "no VMDK files generated")
+		multiLayerVMDK, layerCount = findVMDKWithMostLayers(snapshotsDir)
+		return layerCount >= 2
+	}, 15*time.Second, "waiting for multi-layer VMDK")
 
 	if err != nil {
-		t.Error("no VMDK files generated for multi-layer image")
+		// Log what we found for debugging
+		multiLayerVMDK, layerCount = findVMDKWithMostLayers(snapshotsDir)
+		t.Errorf("no multi-layer VMDK generated after waiting (found: %s with %d layers)", multiLayerVMDK, layerCount)
 		return
 	}
 
-	for _, p := range vmdkPaths {
-		t.Logf("found VMDK: %s", p)
-	}
+	t.Logf("found multi-layer VMDK: %s (%d layers)", multiLayerVMDK, layerCount)
 }
 
 // testVMDKFormat verifies VMDK descriptor format is valid.
@@ -1199,21 +1196,15 @@ func testVMDKFormat(t *testing.T, env *Environment) {
 	assert := NewAssertions(t, env)
 	snapshotsDir := filepath.Join(env.SnapshotterRoot(), "snapshots")
 
-	// Find a VMDK file
-	var vmdkPath string
-	filepath.Walk(snapshotsDir, func(path string, info os.FileInfo, err error) error { //nolint:errcheck
-		if err == nil && filepath.Base(path) == mergedVMDKFile && vmdkPath == "" {
-			vmdkPath = path
-		}
-		return nil
-	})
+	// Find the VMDK with most layers for validation
+	vmdkPath, layers := findVMDKWithMostLayers(snapshotsDir)
 
 	if vmdkPath == "" {
 		t.Fatal("no VMDK file found - multi_layer test should have created one")
 	}
 
 	assert.VMDKValid(vmdkPath)
-	t.Logf("VMDK format validated: %s", vmdkPath)
+	t.Logf("VMDK format validated: %s (%d layers)", vmdkPath, layers)
 }
 
 // testVMDKLayerOrder verifies VMDK layers are in correct order.
