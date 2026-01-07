@@ -1708,7 +1708,7 @@ test_rwlayer_creation() {
 # This simulates what happens with a real VM without actually running one:
 #   1. Use nerdctl create to create a container (creates proper snapshot)
 #   2. Mount the ext4 rwlayer.img on host
-#   3. Write a test file to /rw/upper/ (where VM overlay writes go)
+#   3. Write a test file to /upper/ (where VM overlay writes go)
 #   4. Unmount ext4
 #   5. Commit using nerdctl commit
 #   6. Verify the new image layer contains the test file
@@ -1776,15 +1776,16 @@ test_commit_lifecycle() {
     log_info "✓ Mounted ext4 at $mount_point"
 
     # Create overlay directories if they don't exist (VM would create these)
-    mkdir -p "$mount_point/rw/upper" "$mount_point/rw/work"
+    # Note: upper and work are at the ROOT of the ext4, not under /rw
+    mkdir -p "$mount_point/upper" "$mount_point/work"
 
     # Write a test file of known size (simulates container writing a file)
     # Use 1MB so we can verify the layer isn't empty (empty layers are ~32 bytes)
-    local test_file_path="$mount_point/rw/upper/integration-test-marker.bin"
+    local test_file_path="$mount_point/upper/integration-test-marker.bin"
     dd if=/dev/urandom of="$test_file_path" bs=1M count=1 status=none 2>/dev/null
     local written_size
     written_size=$(stat -c%s "$test_file_path" 2>/dev/null || stat -f%z "$test_file_path" 2>/dev/null)
-    log_info "✓ Wrote test file: /rw/upper/integration-test-marker.bin (${written_size} bytes)"
+    log_info "✓ Wrote test file: /upper/integration-test-marker.bin (${written_size} bytes)"
 
     # Verify the file was written
     if [ ! -f "$test_file_path" ]; then
