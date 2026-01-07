@@ -409,6 +409,26 @@ func (e *Environment) Stop() {
 		e.snapshotterLog.Close()
 		e.snapshotterLog = nil
 	}
+
+	// Clear immutable flags on EROFS files so TempDir cleanup can remove them
+	e.clearImmutableFlags()
+}
+
+// clearImmutableFlags removes immutable attributes from EROFS files.
+// This is needed because fs-verity sets the immutable flag, which prevents
+// the test's TempDir cleanup from deleting the files.
+func (e *Environment) clearImmutableFlags() {
+	snapshotsDir := filepath.Join(e.snapshotterRoot, "snapshots")
+	filepath.Walk(snapshotsDir, func(path string, info os.FileInfo, err error) error { //nolint:errcheck
+		if err != nil || info.IsDir() {
+			return nil //nolint:nilerr
+		}
+		if strings.HasSuffix(path, ".erofs") {
+			// Use chattr to clear immutable flag (ignore errors)
+			exec.Command("chattr", "-i", path).Run() //nolint:errcheck
+		}
+		return nil
+	})
 }
 
 // Client returns the containerd client.
