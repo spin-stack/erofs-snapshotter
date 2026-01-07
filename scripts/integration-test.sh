@@ -716,6 +716,7 @@ TEST_DEPENDS[test_rwlayer_creation]="test_pull_image"
 TEST_DEPENDS[test_snapshot_cleanup]="test_pull_image"
 TEST_DEPENDS[test_vmdk_layer_order]="test_multi_layer"
 TEST_DEPENDS[test_vmdk_format_valid]="test_multi_layer"
+TEST_DEPENDS[test_commit_lifecycle]="test_pull_image"
 
 # Check if test dependencies are met
 check_test_dependencies() {
@@ -1699,6 +1700,169 @@ test_rwlayer_creation() {
 }
 
 # =============================================================================
+# Test: test_commit_lifecycle
+# =============================================================================
+# Goal: Test the full container lifecycle: start (mount ext4), write file,
+#       stop (unmount), commit, and verify the file exists in the new image.
+#
+# This simulates what happens with a real VM without actually running one:
+#   1. Use nerdctl create to create a container (creates proper snapshot)
+#   2. Mount the ext4 rwlayer.img on host
+#   3. Write a test file to /rw/upper/ (where VM overlay writes go)
+#   4. Unmount ext4
+#   5. Commit using nerdctl commit
+#   6. Verify the new image layer contains the test file
+#
+# This is the REAL test for the commit flow - not the extract- prefix shortcut.
+# =============================================================================
+test_commit_lifecycle() {
+    log_info "Testing full container commit lifecycle..."
+
+    # Get a committed snapshot to use as parent
+    local parent_snap
+    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | tail -1 | awk '{print $1}')
+
+    assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
+    log_info "Using parent snapshot: $parent_snap"
+
+    # Create an active snapshot (simulates container creation)
+    local active_snap="lifecycle-active-${TEST_NAMESPACE}"
+    if ! ctr_cmd snapshots --snapshotter nexus-erofs prepare "$active_snap" "$parent_snap" >/dev/null; then
+        log_error "Failed to prepare active snapshot"
+        return 1
+    fi
+    log_info "✓ Created active snapshot: $active_snap"
+
+    # Get mounts to find the rwlayer.img path
+    local mounts
+    mounts=$(ctr_cmd snapshots --snapshotter nexus-erofs mounts /tmp/mnt "$active_snap" 2>&1)
+    log_debug "Active snapshot mounts: $mounts"
+
+    # Extract rwlayer.img path from mount output (ext4 mount source)
+    local rwlayer_path
+    rwlayer_path=$(echo "$mounts" | grep -oE '/[^ ]+rwlayer\.img' | head -1)
+
+    if [ -z "$rwlayer_path" ]; then
+        log_error "Could not find rwlayer.img path in mount output"
+        log_error "Mount output: $mounts"
+        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        return 1
+    fi
+    log_info "Found rwlayer.img: $rwlayer_path"
+
+    # Create mount point
+    local mount_point="/tmp/lifecycle-ext4-$$"
+    mkdir -p "$mount_point"
+
+    # Mount the ext4 image (simulates VM having mounted it)
+    log_info "Mounting ext4 rwlayer (simulating VM start)..."
+    local loop_dev
+    loop_dev=$(losetup -f --show "$rwlayer_path" 2>/dev/null)
+    if [ -z "$loop_dev" ]; then
+        log_error "Failed to setup loop device for rwlayer.img"
+        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        rmdir "$mount_point" 2>/dev/null || true
+        return 1
+    fi
+    log_debug "Loop device: $loop_dev"
+
+    if ! mount -t ext4 "$loop_dev" "$mount_point" 2>&1; then
+        log_error "Failed to mount ext4"
+        losetup -d "$loop_dev" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        rmdir "$mount_point" 2>/dev/null || true
+        return 1
+    fi
+    log_info "✓ Mounted ext4 at $mount_point"
+
+    # Create overlay directories if they don't exist (VM would create these)
+    mkdir -p "$mount_point/rw/upper" "$mount_point/rw/work"
+
+    # Write a test file of known size (simulates container writing a file)
+    # Use 1MB so we can verify the layer isn't empty (empty layers are ~32 bytes)
+    local test_file_path="$mount_point/rw/upper/integration-test-marker.bin"
+    dd if=/dev/urandom of="$test_file_path" bs=1M count=1 status=none 2>/dev/null
+    local written_size
+    written_size=$(stat -c%s "$test_file_path" 2>/dev/null || stat -f%z "$test_file_path" 2>/dev/null)
+    log_info "✓ Wrote test file: /rw/upper/integration-test-marker.bin (${written_size} bytes)"
+
+    # Verify the file was written
+    if [ ! -f "$test_file_path" ]; then
+        log_error "Test file was not created"
+        umount "$mount_point" 2>/dev/null || true
+        losetup -d "$loop_dev" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        rmdir "$mount_point" 2>/dev/null || true
+        return 1
+    fi
+
+    # Sync and unmount (simulates VM stop)
+    log_info "Unmounting ext4 (simulating VM stop)..."
+    sync
+    if ! umount "$mount_point" 2>&1; then
+        log_error "Failed to unmount ext4"
+        losetup -d "$loop_dev" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        rmdir "$mount_point" 2>/dev/null || true
+        return 1
+    fi
+
+    # Detach loop device
+    losetup -d "$loop_dev" 2>/dev/null || true
+    rmdir "$mount_point" 2>/dev/null || true
+    log_info "✓ Unmounted and detached loop device"
+
+    # Commit the snapshot using ctr snapshots commit
+    # This triggers the diff service to compute the diff and create EROFS layer
+    log_info "Committing snapshot..."
+    local committed_snap="lifecycle-committed-${TEST_NAMESPACE}"
+
+    if ! ctr_cmd snapshots --snapshotter nexus-erofs commit "$committed_snap" "$active_snap" 2>&1; then
+        log_error "Snapshot commit failed"
+        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        return 1
+    fi
+    log_info "✓ Snapshot committed: $committed_snap"
+
+    # Find the EROFS layer file for the committed snapshot
+    # The committed layer should be at least 500KB (we wrote 1MB, compression varies)
+    local min_layer_size=500000  # 500KB minimum
+
+    # Look for the most recently created .erofs file (excluding fsmeta)
+    local new_layer
+    new_layer=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "sha256-*.erofs" -type f -printf '%T@ %p\n' 2>/dev/null | \
+        sort -rn | head -1 | cut -d' ' -f2-)
+
+    if [ -z "$new_layer" ]; then
+        log_error "Could not find EROFS layer file for committed snapshot"
+        ctr_cmd snapshots --snapshotter nexus-erofs rm "$committed_snap" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        return 1
+    fi
+
+    local layer_size
+    layer_size=$(stat -c%s "$new_layer" 2>/dev/null || stat -f%z "$new_layer" 2>/dev/null)
+    log_info "New EROFS layer: $(basename "$new_layer") (${layer_size} bytes)"
+
+    if [ "$layer_size" -lt "$min_layer_size" ]; then
+        log_error "CRITICAL: Committed layer is too small (${layer_size} bytes < ${min_layer_size} bytes)"
+        log_error "The 1MB test file was NOT captured in the commit!"
+        log_error "This indicates the diff service is not properly reading the ext4 upper directory."
+        ctr_cmd snapshots --snapshotter nexus-erofs rm "$committed_snap" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        return 1
+    fi
+    log_info "✓ Layer size verified: ${layer_size} bytes (expected >= ${min_layer_size})"
+
+    # Clean up
+    ctr_cmd snapshots --snapshotter nexus-erofs rm "$committed_snap" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+
+    log_info "✓ Full lifecycle test PASSED - commit captured changes correctly"
+    return 0
+}
+
+# =============================================================================
 # Test: test_full_cleanup_no_leaks
 # =============================================================================
 # Goal: Full cleanup - delete everything and verify no leaking files
@@ -1841,6 +2005,7 @@ ALL_TESTS=(
     test_vmdk_format_valid
     test_vmdk_layer_order
     test_rwlayer_creation
+    test_commit_lifecycle
     test_snapshot_cleanup
     test_commit
     test_nerdctl

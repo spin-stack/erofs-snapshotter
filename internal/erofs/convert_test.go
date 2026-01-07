@@ -168,6 +168,22 @@ func TestMountsToLayerWithMarker(t *testing.T) {
 			},
 			want: dir,
 		},
+		{
+			name: "ext4 mount (writable layer)",
+			mounts: []mount.Mount{
+				{Type: "erofs", Source: filepath.Join(dir, "layer.erofs"), Options: []string{"ro", "loop"}},
+				{Type: "ext4", Source: filepath.Join(dir, "rwlayer.img"), Options: []string{"rw", "loop"}},
+			},
+			want: dir, // ext4 source parent dir
+		},
+		{
+			name: "format/erofs with ext4 (active snapshot)",
+			mounts: []mount.Mount{
+				{Type: "format/erofs", Source: filepath.Join(dir, "fsmeta.erofs"), Options: []string{"ro", "loop", "device=" + filepath.Join(dir, "layer.erofs")}},
+				{Type: "ext4", Source: filepath.Join(dir, "rwlayer.img"), Options: []string{"rw", "loop"}},
+			},
+			want: dir, // ext4 source parent dir
+		},
 	}
 
 	for _, tc := range tests {

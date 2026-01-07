@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -34,6 +35,7 @@ import (
 	"github.com/containerd/log"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sys/unix"
 
 	"github.com/aledbf/nexus-erofs/internal/cleanup"
 	"github.com/aledbf/nexus-erofs/internal/mountutils"
@@ -261,6 +263,11 @@ func withLowerMount(ctx context.Context, lower []mount.Mount, mm mount.Manager, 
 // If mounts require the mount manager (formatted mounts, templates, or EROFS),
 // it activates them through the mount manager first.
 func withUpperMount(ctx context.Context, upper []mount.Mount, mm mount.Manager, f func(root string) error) error {
+	// Handle active snapshot mounts (EROFS + ext4) - create overlay on host
+	if mountutils.HasActiveSnapshotMounts(upper) {
+		return withActiveSnapshotMount(ctx, upper, f)
+	}
+
 	// Handle EROFS multi-device mounts directly - the containerd mount manager
 	// cannot handle EROFS with device= options (fsmeta multi-device).
 	if mountutils.HasErofsMultiDevice(upper) {
@@ -299,6 +306,98 @@ func withUpperMount(ctx context.Context, upper []mount.Mount, mm mount.Manager, 
 		return mount.WithReadonlyTempMount(ctx, info.System, f)
 	}
 	return mount.WithReadonlyTempMount(ctx, upper, f)
+}
+
+// withActiveSnapshotMount handles active snapshot mounts (EROFS + ext4) by creating
+// an overlay on the host. The EROFS layers form the lowerdir, and the ext4's /rw/upper
+// forms the upperdir. This allows Compare to see the changes made in the container.
+func withActiveSnapshotMount(ctx context.Context, mounts []mount.Mount, f func(root string) error) error {
+	// Separate EROFS and ext4 mounts
+	var erofsMounts []mount.Mount
+	var ext4Mount *mount.Mount
+	for i := range mounts {
+		m := &mounts[i]
+		switch mountutils.TypeSuffix(m.Type) {
+		case "erofs":
+			erofsMounts = append(erofsMounts, *m)
+		case "ext4":
+			ext4Mount = m
+		}
+	}
+
+	if ext4Mount == nil {
+		return fmt.Errorf("active snapshot mount missing ext4 writable layer")
+	}
+
+	// Create temp directories for mounting
+	tempBase, err := os.MkdirTemp("", "erofs-active-")
+	if err != nil {
+		return fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tempBase)
+
+	erofsDir := filepath.Join(tempBase, "erofs")
+	ext4Dir := filepath.Join(tempBase, "ext4")
+	overlayDir := filepath.Join(tempBase, "overlay")
+
+	for _, d := range []string{erofsDir, ext4Dir, overlayDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			return fmt.Errorf("failed to create dir %s: %w", d, err)
+		}
+	}
+
+	// Mount EROFS layers
+	erofsCleanup, err := mountutils.MountAll(erofsMounts, erofsDir)
+	if err != nil {
+		return fmt.Errorf("failed to mount EROFS: %w", err)
+	}
+	defer func() {
+		if cerr := erofsCleanup(); cerr != nil {
+			log.G(ctx).WithError(cerr).Warn("failed to cleanup EROFS mount")
+		}
+	}()
+
+	// Mount ext4 writable layer
+	ext4Cleanup, err := mountutils.MountExt4(ext4Mount.Source, ext4Dir)
+	if err != nil {
+		return fmt.Errorf("failed to mount ext4: %w", err)
+	}
+	defer func() {
+		if cerr := ext4Cleanup(); cerr != nil {
+			log.G(ctx).WithError(cerr).Warn("failed to cleanup ext4 mount")
+		}
+	}()
+
+	// The ext4 contains /rw/upper and /rw/work for overlay
+	upperDir := filepath.Join(ext4Dir, "rw", "upper")
+	workDir := filepath.Join(ext4Dir, "rw", "work")
+
+	// Ensure directories exist (they should from VM usage)
+	if _, err := os.Stat(upperDir); err != nil {
+		// If upper doesn't exist, the container had no changes
+		log.G(ctx).Debug("ext4 upper directory doesn't exist, using empty overlay")
+		if err := os.MkdirAll(upperDir, 0755); err != nil {
+			return fmt.Errorf("failed to create upper dir: %w", err)
+		}
+	}
+	if _, err := os.Stat(workDir); err != nil {
+		if err := os.MkdirAll(workDir, 0755); err != nil {
+			return fmt.Errorf("failed to create work dir: %w", err)
+		}
+	}
+
+	// Create overlay mount
+	overlayOpts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", erofsDir, upperDir, workDir)
+	if err := unix.Mount("overlay", overlayDir, "overlay", 0, overlayOpts); err != nil {
+		return fmt.Errorf("failed to mount overlay: %w", err)
+	}
+	defer func() {
+		if err := unix.Unmount(overlayDir, 0); err != nil {
+			log.G(ctx).WithError(err).Warn("failed to unmount overlay")
+		}
+	}()
+
+	return f(overlayDir)
 }
 
 // withErofsTempMount mounts EROFS mounts (including multi-device fsmeta) to a

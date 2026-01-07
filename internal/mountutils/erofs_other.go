@@ -35,3 +35,13 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 func HasErofsMultiDevice(mounts []mount.Mount) bool {
 	return false
 }
+
+// HasActiveSnapshotMounts returns true if the mounts represent an active snapshot.
+func HasActiveSnapshotMounts(mounts []mount.Mount) bool {
+	return false
+}
+
+// MountExt4 mounts an ext4 filesystem image to the target directory.
+func MountExt4(source, target string) (cleanup func() error, err error) {
+	return func() error { return nil }, fmt.Errorf("ext4 mounts not supported on %s", runtime.GOOS)
+}
