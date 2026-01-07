@@ -262,22 +262,65 @@ func (a *Assertions) FindCommittedSnapshot(ctx context.Context) string {
 	a.t.Helper()
 	ss := a.env.SnapshotService()
 
-	var parentKey string
+	// Collect all committed snapshots and their parents
+	committed := make(map[string]string) // name -> parent
 	if err := ss.Walk(ctx, func(_ context.Context, info snapshots.Info) error {
-		if info.Kind == snapshots.KindCommitted && parentKey == "" {
-			parentKey = info.Name
+		if info.Kind == snapshots.KindCommitted {
+			committed[info.Name] = info.Parent
 		}
 		return nil
 	}); err != nil {
 		a.t.Fatalf("walk snapshots: %v", err)
 	}
 
-	if parentKey == "" {
+	if len(committed) == 0 {
 		a.t.Fatal("no committed snapshot found")
 	}
 
-	a.t.Logf("found committed snapshot: %s", parentKey)
-	return parentKey
+	// Find leaf snapshots (ones that are not a parent of any other committed snapshot)
+	isParent := make(map[string]bool)
+	for _, parent := range committed {
+		if parent != "" {
+			isParent[parent] = true
+		}
+	}
+
+	// Count ancestors for each leaf snapshot to find the deepest one
+	countAncestors := func(name string) int {
+		count := 0
+		for {
+			parent, exists := committed[name]
+			if !exists || parent == "" {
+				break
+			}
+			count++
+			name = parent
+		}
+		return count
+	}
+
+	var topKey string
+	maxAncestors := -1
+	for name := range committed {
+		if !isParent[name] {
+			ancestors := countAncestors(name)
+			if ancestors > maxAncestors {
+				maxAncestors = ancestors
+				topKey = name
+			}
+		}
+	}
+
+	// If no leaves found (shouldn't happen), fall back to any committed snapshot
+	if topKey == "" {
+		for name := range committed {
+			topKey = name
+			break
+		}
+	}
+
+	a.t.Logf("found committed snapshot: %s (depth: %d)", topKey, maxAncestors+1)
+	return topKey
 }
 
 // VMDKValid verifies a VMDK file has valid format.
