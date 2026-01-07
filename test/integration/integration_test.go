@@ -1220,14 +1220,18 @@ func testVMDKFormat(t *testing.T, env *Environment) {
 func testVMDKLayerOrder(t *testing.T, env *Environment) {
 	snapshotsDir := filepath.Join(env.SnapshotterRoot(), "snapshots")
 
-	// Find VMDK with multiple layers
-	vmdkPath, maxLayers := findVMDKWithMostLayers(snapshotsDir)
+	// Wait for a VMDK with at least 2 layers (fsmeta generation is async)
+	var vmdkPath string
+	var maxLayers int
+	err := waitFor(func() bool {
+		vmdkPath, maxLayers = findVMDKWithMostLayers(snapshotsDir)
+		return maxLayers >= 2
+	}, 10*time.Second, "waiting for multi-layer VMDK")
 
-	if vmdkPath == "" {
-		t.Fatal("no VMDK file found - multi_layer test should have created one")
-	}
-	if maxLayers < 2 {
-		t.Fatalf("VMDK has only %d layers, expected at least 2 for layer order verification", maxLayers)
+	if err != nil {
+		// Log what we found for debugging
+		vmdkPath, maxLayers = findVMDKWithMostLayers(snapshotsDir)
+		t.Fatalf("no multi-layer VMDK found after waiting (found: %s with %d layers) - multi_layer test should have created one", vmdkPath, maxLayers)
 	}
 
 	// Parse VMDK
