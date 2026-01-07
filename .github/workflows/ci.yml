@@ -147,7 +147,7 @@ jobs:
 
       - name: Prepare binaries
         run: |
-          chmod +x bin/nexus-erofs-snapshotter bin/integration-commit
+          chmod +x bin/nexus-erofs-snapshotter bin/integration-commit bin/integration.test
           ls -la bin/
 
       - name: Pull integration test image
