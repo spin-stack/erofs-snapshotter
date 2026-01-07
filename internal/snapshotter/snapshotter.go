@@ -31,14 +31,11 @@ import (
 	"github.com/moby/sys/mountinfo"
 
 	"github.com/aledbf/nexus-erofs/internal/erofs"
-	"github.com/aledbf/nexus-erofs/internal/fsverity"
 	"github.com/aledbf/nexus-erofs/internal/stringutil"
 )
 
 // SnapshotterConfig is used to configure the erofs snapshotter instance
 type SnapshotterConfig struct {
-	// enableFsverity enables fsverity for EROFS layers
-	enableFsverity bool
 	// setImmutable enables IMMUTABLE_FL file attribute for EROFS layers
 	setImmutable bool
 	// defaultSize is the size in bytes of the ext4 writable layer (must be > 0)
@@ -47,13 +44,6 @@ type SnapshotterConfig struct {
 
 // Opt is an option to configure the erofs snapshotter
 type Opt func(config *SnapshotterConfig)
-
-// WithFsverity enables fsverity for EROFS layers
-func WithFsverity() Opt {
-	return func(config *SnapshotterConfig) {
-		config.enableFsverity = true
-	}
-}
 
 // WithImmutable enables IMMUTABLE_FL file attribute for EROFS layers
 func WithImmutable() Opt {
@@ -73,7 +63,6 @@ func WithDefaultSize(size int64) Opt {
 type snapshotter struct {
 	root            string
 	ms              *storage.MetaStore
-	enableFsverity  bool
 	setImmutable    bool
 	defaultWritable int64
 
@@ -121,17 +110,6 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		return nil, fmt.Errorf("compatibility check for %q: %w", root, err)
 	}
 
-	// Check fsverity support if enabled
-	if config.enableFsverity {
-		supported, err := fsverity.IsSupported(root)
-		if err != nil {
-			return nil, fmt.Errorf("check fsverity support on %q: %w", root, err)
-		}
-		if !supported {
-			return nil, fmt.Errorf("fsverity is not supported on the filesystem of %q", root)
-		}
-	}
-
 	if config.setImmutable && runtime.GOOS != "linux" {
 		return nil, fmt.Errorf("setting IMMUTABLE_FL is only supported on Linux")
 	}
@@ -148,7 +126,6 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 	s := &snapshotter{
 		root:            root,
 		ms:              ms,
-		enableFsverity:  config.enableFsverity,
 		setImmutable:    config.setImmutable,
 		defaultWritable: config.defaultSize,
 	}

@@ -45,20 +45,12 @@ type MountManagerResolver func() mount.Manager
 
 // ErofsDiff implements diff.Applier and diff.Comparer for EROFS layers.
 type ErofsDiff struct {
-	store         content.Store
-	mkfsExtraOpts []string
-	mmResolver    MountManagerResolver
+	store      content.Store
+	mmResolver MountManagerResolver
 }
 
 // DifferOpt is an option for configuring the erofs differ
 type DifferOpt func(d *ErofsDiff)
-
-// WithMkfsOptions sets extra options for mkfs.erofs
-func WithMkfsOptions(opts []string) DifferOpt {
-	return func(d *ErofsDiff) {
-		d.mkfsExtraOpts = opts
-	}
-}
 
 // WithMountManager sets the mount manager used to resolve formatted mounts.
 // Use this when the mount manager is already available at initialization time.
@@ -90,9 +82,6 @@ func NewErofsDiffer(store content.Store, opts ...DifferOpt) *ErofsDiff {
 	for _, opt := range opts {
 		opt(d)
 	}
-
-	// Add default block size on darwin if not already specified
-	d.mkfsExtraOpts = addDefaultMkfsOpts(d.mkfsExtraOpts)
 
 	return d
 }
@@ -187,7 +176,7 @@ func (s *ErofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts [
 	// Use full conversion mode (--tar=f): converts tar to EROFS with 4096-byte blocks
 	// This creates layers compatible with fsmeta merge for multi-layer images
 	u := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+desc.Digest))
-	err = erofs.ConvertTarErofs(ctx, rc, layerBlobPath, u.String(), s.mkfsExtraOpts)
+	err = erofs.ConvertTarErofs(ctx, rc, layerBlobPath, u.String(), defaultMkfsOpts())
 	if err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("failed to convert tar to erofs: %w", err)
 	}
@@ -216,20 +205,19 @@ func (rc *readCounter) Read(p []byte) (n int, err error) {
 	return
 }
 
-// addDefaultMkfsOpts adds default options for mkfs.erofs
-func addDefaultMkfsOpts(mkfsExtraOpts []string) []string {
-	if runtime.GOOS != "darwin" {
-		return mkfsExtraOpts
+// defaultMkfsOpts returns the hardcoded mkfs.erofs options optimized for VM use.
+//
+// IMPORTANT: No compression is used because compressed layers (datalayout 3)
+// are incompatible with fsmeta merge. Since this snapshotter always generates
+// VMDK descriptors for multi-layer images, we must use uncompressed layers.
+//
+// Block size: Default 4KB blocks are used for optimal random read performance.
+func defaultMkfsOpts() []string {
+	// On macOS, explicitly set block size to 4096 to prevent
+	// platform-specific defaults that could cause issues.
+	if runtime.GOOS == "darwin" {
+		return []string{"-b4096"}
 	}
 
-	// Check if -b argument is already present
-	for _, opt := range mkfsExtraOpts {
-		if strings.HasPrefix(opt, "-b") {
-			return mkfsExtraOpts
-		}
-	}
-
-	// Add -b4096 as the first option to prevent unusable block
-	// size from being used on macOS.
-	return append([]string{"-b4096"}, mkfsExtraOpts...)
+	return nil
 }

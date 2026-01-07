@@ -26,25 +26,6 @@ func TestNewErofsDiffer(t *testing.T) {
 		}
 	})
 
-	t.Run("applies WithMkfsOptions", func(t *testing.T) {
-		opts := []string{"-z", "lz4", "-C", "65536"}
-		d := NewErofsDiffer(nil, WithMkfsOptions(opts))
-
-		// The options should be present (possibly with additional darwin options)
-		for _, want := range opts {
-			found := false
-			for _, got := range d.mkfsExtraOpts {
-				if got == want {
-					found = true
-					break
-				}
-			}
-			if !found {
-				t.Errorf("expected option %q in mkfsExtraOpts", want)
-			}
-		}
-	})
-
 	t.Run("applies WithMountManager", func(t *testing.T) {
 		mm := &mockMountManager{}
 		d := NewErofsDiffer(nil, WithMountManager(mm))
@@ -71,75 +52,30 @@ func TestNewErofsDiffer(t *testing.T) {
 			t.Error("resolver should have been called")
 		}
 	})
-
-	t.Run("combines multiple options", func(t *testing.T) {
-		mm := &mockMountManager{}
-		d := NewErofsDiffer(nil,
-			WithMkfsOptions([]string{"-z", "lz4"}),
-			WithMountManager(mm),
-		)
-		if d.mmResolver == nil {
-			t.Error("expected mount manager resolver")
-		}
-		found := false
-		for _, opt := range d.mkfsExtraOpts {
-			if opt == "-z" {
-				found = true
-			}
-		}
-		if !found {
-			t.Error("expected -z option")
-		}
-	})
 }
 
-func TestAddDefaultMkfsOpts(t *testing.T) {
-	tests := []struct {
-		name       string
-		input      []string
-		wantPrefix string // check if -b is first on darwin
-		skipOnOS   string
-	}{
-		{
-			name:       "adds -b4096 as first option on darwin",
-			input:      nil,
-			wantPrefix: "-b4096",
-			skipOnOS:   "linux",
-		},
-		{
-			name:       "adds -b4096 before existing options on darwin",
-			input:      []string{"-z", "lz4"},
-			wantPrefix: "-b4096",
-			skipOnOS:   "linux",
-		},
-		{
-			name:       "respects existing -b option on darwin",
-			input:      []string{"-b1024", "-z", "lz4"},
-			wantPrefix: "-b1024",
-			skipOnOS:   "linux",
-		},
-		{
-			name:       "no change on linux",
-			input:      []string{"-z", "lz4"},
-			wantPrefix: "-z",
-			skipOnOS:   "darwin",
-		},
+func TestDefaultMkfsOpts(t *testing.T) {
+	opts := defaultMkfsOpts()
+
+	// No compression should be used (compressed layers are incompatible with fsmeta merge)
+	for _, opt := range opts {
+		if strings.HasPrefix(opt, "-z") {
+			t.Errorf("compression options are incompatible with fsmeta merge, got: %v", opts)
+		}
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if runtime.GOOS == tc.skipOnOS {
-				t.Skipf("skipping on %s", tc.skipOnOS)
-			}
+	// On darwin, should have -b4096 as first option
+	if runtime.GOOS == "darwin" {
+		if len(opts) == 0 || opts[0] != "-b4096" {
+			t.Errorf("expected -b4096 as first option on darwin, got: %v", opts)
+		}
+	}
 
-			got := addDefaultMkfsOpts(tc.input)
-			if len(got) == 0 && tc.wantPrefix != "" {
-				t.Fatal("expected non-empty result")
-			}
-			if len(got) > 0 && !strings.HasPrefix(got[0], tc.wantPrefix[:2]) {
-				t.Errorf("first option = %q, want prefix %q", got[0], tc.wantPrefix[:2])
-			}
-		})
+	// On linux, should return nil (no special options needed)
+	if runtime.GOOS == "linux" {
+		if opts != nil {
+			t.Errorf("expected nil options on linux, got: %v", opts)
+		}
 	}
 }
 
@@ -388,26 +324,6 @@ func TestDiffWriteFuncNil(t *testing.T) {
 	d := NewErofsDiffer(nil)
 	if d.store != nil {
 		t.Error("expected nil store")
-	}
-}
-
-func TestMkfsOptionsPreservation(t *testing.T) {
-	// Test that mkfs options are preserved correctly
-	opts := []string{"-z", "lz4", "-C", "65536", "-T", "0"}
-	d := NewErofsDiffer(nil, WithMkfsOptions(opts))
-
-	// All provided options should be present in mkfsExtraOpts
-	for _, want := range opts {
-		found := false
-		for _, got := range d.mkfsExtraOpts {
-			if got == want {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("expected option %q to be preserved, options: %v", want, d.mkfsExtraOpts)
-		}
 	}
 }
 

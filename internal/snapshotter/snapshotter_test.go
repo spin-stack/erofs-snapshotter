@@ -204,16 +204,6 @@ func TestEnsureMarkerFile(t *testing.T) {
 }
 
 func TestSnapshotterOptions(t *testing.T) {
-	t.Run("WithFsverity", func(t *testing.T) {
-		config := &SnapshotterConfig{}
-		opt := WithFsverity()
-		opt(config)
-
-		if !config.enableFsverity {
-			t.Error("expected fsverity to be enabled")
-		}
-	})
-
 	t.Run("WithImmutable", func(t *testing.T) {
 		config := &SnapshotterConfig{}
 		opt := WithImmutable()

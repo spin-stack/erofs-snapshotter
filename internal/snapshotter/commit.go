@@ -16,7 +16,6 @@ import (
 	"github.com/opencontainers/go-digest"
 
 	"github.com/aledbf/nexus-erofs/internal/erofs"
-	"github.com/aledbf/nexus-erofs/internal/fsverity"
 )
 
 // commitSource represents the source directory for EROFS conversion.
@@ -397,14 +396,6 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		if cerr := s.commitBlock(ctx, layerBlob, id); cerr != nil {
 			return fmt.Errorf("fallback conversion failed: %w", cerr)
 		}
-	}
-
-	// Enable fs-verity for integrity protection
-	if s.enableFsverity {
-		if err := fsverity.Enable(layerBlob); err != nil {
-			return fmt.Errorf("enable fsverity: %w", err)
-		}
-		log.G(ctx).WithField("blob", layerBlob).Debug("fs-verity enabled")
 	}
 
 	// Set immutable flag to prevent accidental deletion

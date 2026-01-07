@@ -109,21 +109,10 @@ func main() {
 				EnvVars: []string{"nexus-erofs_DEFAULT_SIZE"},
 			},
 			&cli.BoolFlag{
-				Name:    "enable-fsverity",
-				Usage:   "Enable fsverity for layer validation",
-				Value:   false,
-				EnvVars: []string{"nexus-erofs_ENABLE_FSVERITY"},
-			},
-			&cli.BoolFlag{
 				Name:    "set-immutable",
 				Usage:   "Set immutable flag on committed layers",
 				Value:   true,
 				EnvVars: []string{"nexus-erofs_SET_IMMUTABLE"},
-			},
-			&cli.StringSliceFlag{
-				Name:    "mkfs-options",
-				Usage:   "Extra options for mkfs.erofs",
-				EnvVars: []string{"nexus-erofs_MKFS_OPTIONS"},
 			},
 		},
 		Action: run,
@@ -173,9 +162,6 @@ func run(cliCtx *cli.Context) error {
 	if size := cliCtx.Int64("default-size"); size > 0 {
 		snapshotterOpts = append(snapshotterOpts, snapshotter.WithDefaultSize(size))
 	}
-	if cliCtx.Bool("enable-fsverity") {
-		snapshotterOpts = append(snapshotterOpts, snapshotter.WithFsverity())
-	}
 	if cliCtx.Bool("set-immutable") {
 		snapshotterOpts = append(snapshotterOpts, snapshotter.WithImmutable())
 	}
@@ -201,9 +187,6 @@ func run(cliCtx *cli.Context) error {
 
 	// Build differ options
 	var differOpts []differ.DifferOpt
-	if opts := cliCtx.StringSlice("mkfs-options"); len(opts) > 0 {
-		differOpts = append(differOpts, differ.WithMkfsOptions(opts))
-	}
 
 	dbPath := filepath.Join(root, "mounts.db")
 	db, err := bolt.Open(dbPath, 0600, nil)

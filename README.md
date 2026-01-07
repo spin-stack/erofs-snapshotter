@@ -372,14 +372,18 @@ version = 2
 | `--containerd-namespace` | `default` | containerd namespace to use |
 | `--log-level` | `info` | Log level (debug, info, warn, error) |
 | `--default-size` | `64M` | Size of ext4 writable layer (bytes) |
-| `--enable-fsverity` | `false` | Enable fsverity for layer validation |
 | `--set-immutable` | `true` | Set immutable flag on committed layers |
-| `--mkfs-options` | | Extra options for mkfs.erofs (e.g., `-zlz4hc,12`) |
 | `--version` | | Show version information |
 
-### Layer Conversion and fsmeta
+### Layer Conversion
 
-Layers are created using full conversion mode (`--tar=f`), which converts tar archives to EROFS format with 4096-byte blocks. This ensures compatibility with fsmeta merge, allowing multi-layer images to be consolidated into a single mount with a VMDK descriptor for efficient VM handling.
+Layers are created using full conversion mode (`--tar=f`) **without compression**. This is required because:
+
+- **fsmeta compatibility**: Compressed EROFS layers use "datalayout 3" which is incompatible with fsmeta merge
+- **VMDK generation**: This snapshotter always generates VMDK descriptors for multi-layer images, which requires fsmeta merge
+- **Block size**: Default 4KB blocks ensure compatibility and optimal random read performance
+
+Compression cannot be enabled because it would break multi-layer image support.
 
 ## License
 

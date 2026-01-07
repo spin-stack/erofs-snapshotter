@@ -29,7 +29,6 @@ package snapshotter
 // Core tests in this file:
 // - TestErofs (testsuite) - SKIPPED (VM-only)
 // - TestErofsWithQuota - SKIPPED (VM-only)
-// - TestErofsFsverity - SKIPPED (VM-only)
 //
 // Helper functions shared with erofs_differ_linux_test.go and
 // erofs_snapshot_linux_test.go:
@@ -63,7 +62,6 @@ import (
 	"github.com/containerd/containerd/v2/pkg/testutil"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/aledbf/nexus-erofs/internal/fsverity"
 	"github.com/aledbf/nexus-erofs/internal/loop"
 	"github.com/aledbf/nexus-erofs/internal/mountutils"
 	"github.com/aledbf/nexus-erofs/internal/preflight"
@@ -247,88 +245,6 @@ func TestErofsWithQuota(t *testing.T) {
 	skipIfVMOnly(t) // Testsuite requires host mounting
 	testutil.RequiresRoot(t)
 	testsuite.SnapshotterSuite(t, "erofs", newSnapshotter(t, WithDefaultSize(16*1024*1024)))
-}
-
-func TestErofsFsverity(t *testing.T) {
-	skipIfVMOnly(t) // Test requires host mounting
-	testutil.RequiresRoot(t)
-	ctx := t.Context()
-
-	root := t.TempDir()
-
-	// Skip if fsverity is not supported
-	supported, err := fsverity.IsSupported(root)
-	if !supported || err != nil {
-		t.Skip("fsverity not supported, skipping test")
-	}
-
-	// Create snapshotter with fsverity enabled
-	s, err := NewSnapshotter(root, WithFsverity())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	defer cleanupAllSnapshots(ctx, s)
-
-	// Create a test snapshot
-	key := "test-snapshot"
-	mounts, err := s.Prepare(ctx, key, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	target := filepath.Join(root, key)
-	if err := os.MkdirAll(target, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := mount.All(mounts, target); err != nil {
-		t.Fatal(err)
-	}
-	defer testutil.Unmount(t, target)
-
-	// Write test data
-	if err := os.WriteFile(filepath.Join(target, "foo"), []byte("test data"), 0777); err != nil {
-		t.Fatal(err)
-	}
-
-	// Commit the snapshot
-	commitKey := "test-commit"
-	if err := s.Commit(ctx, commitKey, key); err != nil {
-		t.Fatal(err)
-	}
-
-	snap, ok := s.(*snapshotter)
-	if !ok {
-		t.Fatal("failed to cast snapshotter to *snapshotter")
-	}
-
-	// Get the internal ID from the snapshotter
-	var id string
-	if err := snap.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		id, _, _, err = storage.GetInfo(ctx, commitKey)
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Verify fsverity is enabled on the EROFS layer
-	layerPath, err := snap.findLayerBlob(id)
-	if err != nil {
-		t.Fatalf("Failed to find layer blob: %v", err)
-	}
-
-	enabled, err := fsverity.IsEnabled(layerPath)
-	if err != nil {
-		t.Fatalf("Failed to check fsverity status: %v", err)
-	}
-	if !enabled {
-		t.Fatal("Expected fsverity to be enabled on committed layer")
-	}
-
-	// Try to modify the layer file directly (should fail)
-	if err := os.WriteFile(layerPath, []byte("tampered data"), 0666); err == nil {
-		t.Fatal("Expected direct write to fsverity-enabled layer to fail")
-	}
 }
 
 // createTestTarContent creates test tar content using tartest.

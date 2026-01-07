@@ -14,7 +14,6 @@ The following files are derived from or based on containerd code:
 - pkg/differ/* - Based on plugins/diff/erofs from containerd
 - pkg/erofs/* - Based on internal/erofsutils from containerd
 - pkg/loopback/* - Based on plugins/mount/erofs from containerd
-- internal/fsverity/* - Based on internal/fsverity from containerd
 - internal/mountutils/* - Based on internal/mountutils from containerd
 - internal/cleanup/* - Based on internal/cleanup from containerd
 
