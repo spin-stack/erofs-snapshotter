@@ -63,7 +63,7 @@
 //   - No error surfaced to caller (graceful degradation)
 //
 // To debug fsmeta issues, check logs for "fsmeta generation" messages.
-// See [snapshotter.generateFsMeta] for the generation logic.
+// See [generateFsMeta] for the generation logic.
 //
 // # Mount Decision Tree
 //
