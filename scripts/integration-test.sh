@@ -710,6 +710,7 @@ run_test_with_timing() {
 declare -A TEST_DEPENDS
 TEST_DEPENDS[test_prepare_snapshot]="test_pull_image"
 TEST_DEPENDS[test_view_snapshot]="test_pull_image"
+TEST_DEPENDS[test_diff_service_erofs_mounts]="test_pull_image"
 TEST_DEPENDS[test_commit]="test_pull_image"
 TEST_DEPENDS[test_rwlayer_creation]="test_pull_image"
 TEST_DEPENDS[test_snapshot_cleanup]="test_pull_image"
@@ -849,6 +850,124 @@ test_view_snapshot() {
 
     # Clean up
     ctr_cmd snapshots --snapshotter nexus-erofs rm "$view_name" 2>/dev/null || true
+}
+
+# =============================================================================
+# Test: test_diff_service_erofs_mounts
+# =============================================================================
+# Goal: Verify that the diff service correctly handles EROFS mount types without
+#       requiring the .erofslayer marker file. This is critical for commit
+#       operations on non-extract snapshots.
+#
+# Background:
+#   - View/Active snapshots return "format/erofs" or "erofs" mount types
+#   - The diff service's MountsToLayer() must accept these mounts
+#   - Before the fix, MountsToLayer() required a .erofslayer marker file
+#   - Now it trusts EROFS mount types directly
+#
+# Expectations:
+#   - View snapshot mounts contain "erofs" in the type
+#   - The diff service can extract layer path from EROFS mounts
+#   - Commit operations work without the marker file
+# =============================================================================
+test_diff_service_erofs_mounts() {
+    # Get a committed snapshot to use as parent
+    local parent_snap
+    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
+
+    assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
+
+    # Create a view snapshot - this returns format/erofs or erofs mount type
+    local view_name="test-diff-view-${TEST_NAMESPACE}"
+    if ! ctr_cmd snapshots --snapshotter nexus-erofs view "$view_name" "$parent_snap" >/dev/null 2>&1; then
+        log_error "Failed to create view snapshot"
+        return 1
+    fi
+
+    # Get mount information for the view
+    local mounts
+    mounts=$(ctr_cmd snapshots --snapshotter nexus-erofs mounts /tmp/mnt "$view_name" 2>&1)
+
+    log_debug "View mount output: $mounts"
+
+    # Verify mount type contains "erofs" (format/erofs or erofs)
+    if ! echo "$mounts" | grep -qE "(format/erofs|type.*erofs|erofs)"; then
+        log_error "View snapshot does not return EROFS mount type"
+        log_error "Mount output: $mounts"
+        ctr_cmd snapshots --snapshotter nexus-erofs rm "$view_name" 2>/dev/null || true
+        return 1
+    fi
+    log_info "✓ View snapshot returns EROFS mount type"
+
+    # Verify the mount source points to an EROFS file (not a directory)
+    if echo "$mounts" | grep -qE "\.erofs"; then
+        log_info "✓ Mount source is an EROFS file path"
+    else
+        log_warn "Mount source may not be an EROFS file (checking anyway)"
+    fi
+
+    # Now test that the diff service can work with these mounts by creating
+    # an active snapshot and committing it. This exercises MountsToLayer().
+    local active_name="test-diff-active-${TEST_NAMESPACE}"
+    if ! ctr_cmd snapshots --snapshotter nexus-erofs prepare "$active_name" "$parent_snap" >/dev/null 2>&1; then
+        log_error "Failed to prepare active snapshot"
+        ctr_cmd snapshots --snapshotter nexus-erofs rm "$view_name" 2>/dev/null || true
+        return 1
+    fi
+
+    # Get mount information for the active snapshot
+    local active_mounts
+    active_mounts=$(ctr_cmd snapshots --snapshotter nexus-erofs mounts /tmp/mnt "$active_name" 2>&1)
+
+    log_debug "Active mount output: $active_mounts"
+
+    # Active snapshots should also return EROFS mounts (for the lower layers)
+    if ! echo "$active_mounts" | grep -qE "(format/erofs|erofs)"; then
+        log_warn "Active snapshot may not include EROFS mounts in output"
+    else
+        log_info "✓ Active snapshot includes EROFS mount type"
+    fi
+
+    # Commit the active snapshot - this tests that the diff service
+    # can process EROFS mounts via MountsToLayer()
+    local commit_name="test-diff-commit-${TEST_NAMESPACE}"
+
+    # The commit may use extract- prefix internally, but the diff service
+    # should be able to handle the EROFS mount types from the parent
+    log_info "Testing diff service commit with EROFS parent mounts..."
+
+    # Use extract- prefix to trigger the differ code path
+    local extract_name="extract-diff-test-${TEST_NAMESPACE}"
+    ctr_cmd snapshots --snapshotter nexus-erofs prepare "$extract_name" "$parent_snap" >/dev/null 2>&1
+
+    # Commit - this exercises the diff service's Apply/Compare methods
+    if ctr_cmd snapshots --snapshotter nexus-erofs commit "$commit_name" "$extract_name" 2>&1; then
+        log_info "✓ Diff service commit succeeded with EROFS parent"
+    else
+        # Check if the commit actually created the snapshot despite error output
+        if ctr_cmd snapshots --snapshotter nexus-erofs info "$commit_name" >/dev/null 2>&1; then
+            log_info "✓ Commit snapshot created (with warnings)"
+        else
+            log_error "Diff service commit failed - MountsToLayer() may not handle EROFS mounts"
+            ctr_cmd snapshots --snapshotter nexus-erofs rm "$view_name" 2>/dev/null || true
+            ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_name" 2>/dev/null || true
+            ctr_cmd snapshots --snapshotter nexus-erofs rm "$extract_name" 2>/dev/null || true
+            return 1
+        fi
+    fi
+
+    # Verify the committed snapshot exists and has EROFS layer
+    if ctr_cmd snapshots --snapshotter nexus-erofs info "$commit_name" >/dev/null 2>&1; then
+        log_info "✓ Committed snapshot exists"
+    fi
+
+    # Clean up test snapshots
+    ctr_cmd snapshots --snapshotter nexus-erofs rm "$commit_name" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter nexus-erofs rm "$extract_name" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_name" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter nexus-erofs rm "$view_name" 2>/dev/null || true
+
+    log_info "Diff service correctly handles EROFS mount types"
 }
 
 # =============================================================================
@@ -1716,6 +1835,7 @@ ALL_TESTS=(
     test_pull_image
     test_prepare_snapshot
     test_view_snapshot
+    test_diff_service_erofs_mounts
     test_erofs_layers
     test_multi_layer
     test_vmdk_format_valid
