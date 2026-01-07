@@ -7,6 +7,7 @@ require (
 	github.com/containerd/containerd/v2 v2.2.1
 	github.com/containerd/continuity v0.4.5
 	github.com/containerd/errdefs v1.0.0
+	github.com/containerd/errdefs/pkg v0.3.0
 	github.com/containerd/log v0.1.0
 	github.com/google/uuid v1.6.0
 	github.com/moby/sys/mountinfo v0.7.2
@@ -22,7 +23,6 @@ require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/Microsoft/hcsshim v0.14.0-rc.1 // indirect
 	github.com/containerd/cgroups/v3 v3.1.2 // indirect
-	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/fifo v1.1.0 // indirect
 	github.com/containerd/platforms v1.0.0-rc.2 // indirect
 	github.com/containerd/plugin v1.0.0 // indirect
