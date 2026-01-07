@@ -309,7 +309,7 @@ func withUpperMount(ctx context.Context, upper []mount.Mount, mm mount.Manager, 
 }
 
 // withActiveSnapshotMount handles active snapshot mounts (EROFS + ext4) by creating
-// an overlay on the host. The EROFS layers form the lowerdir, and the ext4's /rw/upper
+// an overlay on the host. The EROFS layers form the lowerdir, and the ext4's /upper
 // forms the upperdir. This allows Compare to see the changes made in the container.
 func withActiveSnapshotMount(ctx context.Context, mounts []mount.Mount, f func(root string) error) error {
 	// Separate EROFS and ext4 mounts
@@ -368,9 +368,10 @@ func withActiveSnapshotMount(ctx context.Context, mounts []mount.Mount, f func(r
 		}
 	}()
 
-	// The ext4 contains /rw/upper and /rw/work for overlay
-	upperDir := filepath.Join(ext4Dir, "rw", "upper")
-	workDir := filepath.Join(ext4Dir, "rw", "work")
+	// The ext4 contains /upper and /work for overlay at its root.
+	// Note: The "rw" in blockRwMountPath is the HOST mount point, not a directory inside ext4.
+	upperDir := filepath.Join(ext4Dir, "upper")
+	workDir := filepath.Join(ext4Dir, "work")
 
 	// Ensure directories exist (they should from VM usage)
 	if _, err := os.Stat(upperDir); err != nil {
