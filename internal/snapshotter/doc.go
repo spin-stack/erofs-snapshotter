@@ -23,19 +23,19 @@
 // # Two Commit Modes
 //
 // The commit process reads files from either block mode or overlay mode.
-// Mode detection happens in [snapshotter.resolveCommitSource].
+// Mode detection happens in [resolveCommitSource].
 //
 // BLOCK MODE (extract snapshots):
 //   - Condition: rwlayer.img exists in snapshot directory
 //   - Used when: EROFS differ writes to host-mounted ext4
 //   - Source: {snapshotDir}/rw/upper/ (inside mounted ext4)
-//   - See: [snapshotter.commitSourceFromBlock]
+//   - See: [commitSourceFromBlock]
 //
 // OVERLAY MODE (regular snapshots):
 //   - Condition: rwlayer.img does NOT exist
 //   - Used when: VM handles overlay internally
 //   - Source: {snapshotDir}/fs/
-//   - See: [snapshotter.commitSourceFromOverlay]
+//   - See: [commitSourceFromOverlay]
 //
 // # Mount Types Returned
 //
