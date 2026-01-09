@@ -30,8 +30,8 @@ import (
 	"github.com/containerd/log"
 	"github.com/moby/sys/mountinfo"
 
-	"github.com/aledbf/nexus-erofs/internal/erofs"
-	"github.com/aledbf/nexus-erofs/internal/stringutil"
+	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
+	"github.com/spin-stack/erofs-snapshotter/internal/stringutil"
 )
 
 // SnapshotterConfig is used to configure the erofs snapshotter instance

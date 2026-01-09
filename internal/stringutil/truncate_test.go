@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	// Import testutil to register the -test.root flag
-	_ "github.com/aledbf/nexus-erofs/internal/testutil"
+	_ "github.com/spin-stack/erofs-snapshotter/internal/testutil"
 )
 
 func TestTruncateOutput(t *testing.T) {

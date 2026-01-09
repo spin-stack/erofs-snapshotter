@@ -35,7 +35,7 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/aledbf/nexus-erofs/internal/erofs"
+	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 )
 
 // MountManagerResolver is a function that resolves the mount manager lazily.

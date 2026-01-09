@@ -16,7 +16,7 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 
-	"github.com/aledbf/nexus-erofs/internal/erofs"
+	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 )
 
 // fsmetaTimeout is the maximum time allowed for fsmeta generation.

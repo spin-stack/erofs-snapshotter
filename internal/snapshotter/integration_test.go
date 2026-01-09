@@ -11,7 +11,7 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 
 	// Import testutil to register the -test.root flag
-	_ "github.com/aledbf/nexus-erofs/internal/testutil"
+	_ "github.com/spin-stack/erofs-snapshotter/internal/testutil"
 )
 
 const osLinux = "linux"

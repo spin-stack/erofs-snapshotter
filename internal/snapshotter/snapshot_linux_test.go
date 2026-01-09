@@ -60,9 +60,9 @@ import (
 	"github.com/containerd/containerd/v2/pkg/testutil"
 	bolt "go.etcd.io/bbolt"
 
-	erofsdiffer "github.com/aledbf/nexus-erofs/internal/differ"
-	"github.com/aledbf/nexus-erofs/internal/mountutils"
-	"github.com/aledbf/nexus-erofs/internal/preflight"
+	erofsdiffer "github.com/spin-stack/erofs-snapshotter/internal/differ"
+	"github.com/spin-stack/erofs-snapshotter/internal/mountutils"
+	"github.com/spin-stack/erofs-snapshotter/internal/preflight"
 )
 
 // mountTypeBind is the mount type for bind mounts.

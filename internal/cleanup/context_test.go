@@ -6,7 +6,7 @@ import (
 	"time"
 
 	// Import testutil to register the -test.root flag
-	_ "github.com/aledbf/nexus-erofs/internal/testutil"
+	_ "github.com/spin-stack/erofs-snapshotter/internal/testutil"
 )
 
 func TestDo(t *testing.T) {

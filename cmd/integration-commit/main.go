@@ -24,7 +24,7 @@ func main() {
 	var (
 		address       = flag.String("address", "/run/containerd/containerd.sock", "containerd socket")
 		namespace     = flag.String("namespace", "default", "containerd namespace")
-		snapshotterNm = flag.String("snapshotter", "nexus-erofs", "snapshotter name")
+		snapshotterNm = flag.String("snapshotter", "spin-erofs", "snapshotter name")
 		sourceImage   = flag.String("source", "ghcr.io/containerd/alpine:3.14.0", "source image")
 		targetImage   = flag.String("target", "localhost/alpine:with-new-layer", "target image name")
 		markerFile    = flag.String("marker", "/root/committed-marker.txt", "marker file to create")
@@ -120,7 +120,7 @@ func run(address, namespace, snapshotterName, sourceImage, targetImage, markerFi
 
 	fmt.Printf("Wrote marker file: %s\n", markerFile)
 
-	// Commit the snapshot (converts rwlayer to EROFS for nexus-erofs)
+	// Commit the snapshot (converts rwlayer to EROFS for spin-erofs)
 	committedKey := snapshotKey + "-committed"
 	commitLabels := map[string]string{
 		"containerd.io/gc.root":         time.Now().Format(time.RFC3339),
@@ -195,11 +195,11 @@ func run(address, namespace, snapshotterName, sourceImage, targetImage, markerFi
 }
 
 func writeToSnapshot(mounts []mount.Mount, markerFile string) error {
-	// For VM-only snapshotters like nexus-erofs, the mounts returned are file paths
+	// For VM-only snapshotters like spin-erofs, the mounts returned are file paths
 	// meant for VMs to mount, not for host mounting via containerd's mount.All().
 	// We need to find the ext4 rwlayer and mount it manually.
 	//
-	// Expected mounts from nexus-erofs for active snapshots:
+	// Expected mounts from spin-erofs for active snapshots:
 	//   [0] type=erofs source=/path/to/fsmeta.erofs options=[ro loop ...]
 	//   [1] type=ext4  source=/path/to/rwlayer.img  options=[rw loop]
 

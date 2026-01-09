@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/aledbf/nexus-erofs/internal/erofs"
+	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 )
 
 const (

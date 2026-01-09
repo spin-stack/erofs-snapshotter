@@ -26,9 +26,11 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/proxy"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	ptypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/errdefs/pkg/errgrpc"
+	"github.com/containerd/log"
 )
 
 var empty = &ptypes.Empty{}
@@ -46,14 +48,31 @@ func FromSnapshotter(sn snapshots.Snapshotter) snapshotsapi.SnapshotsServer {
 }
 
 func (s *service) Prepare(ctx context.Context, pr *snapshotsapi.PrepareSnapshotRequest) (*snapshotsapi.PrepareSnapshotResponse, error) {
+	ns, _ := namespaces.Namespace(ctx)
+	log.G(ctx).WithFields(log.Fields{
+		"namespace": ns,
+		"key":       pr.Key,
+		"parent":    pr.Parent,
+	}).Debug("grpc: received prepare request")
+
 	var opts []snapshots.Opt
 	if pr.Labels != nil {
 		opts = append(opts, snapshots.WithLabels(pr.Labels))
 	}
 	mounts, err := s.sn.Prepare(ctx, pr.Key, pr.Parent, opts...)
 	if err != nil {
+		log.G(ctx).WithError(err).WithFields(log.Fields{
+			"namespace": ns,
+			"key":       pr.Key,
+		}).Debug("grpc: prepare failed")
 		return nil, errgrpc.ToGRPC(err)
 	}
+
+	log.G(ctx).WithFields(log.Fields{
+		"namespace":   ns,
+		"key":         pr.Key,
+		"mount_count": len(mounts),
+	}).Debug("grpc: prepare succeeded")
 
 	return &snapshotsapi.PrepareSnapshotResponse{
 		Mounts: mount.ToProto(mounts),
@@ -85,6 +104,14 @@ func (s *service) Mounts(ctx context.Context, mr *snapshotsapi.MountsRequest) (*
 }
 
 func (s *service) Commit(ctx context.Context, cr *snapshotsapi.CommitSnapshotRequest) (*ptypes.Empty, error) {
+	ns, _ := namespaces.Namespace(ctx)
+	log.G(ctx).WithFields(log.Fields{
+		"namespace": ns,
+		"name":      cr.Name,
+		"key":       cr.Key,
+		"parent":    cr.Parent,
+	}).Debug("grpc: received commit request")
+
 	var opts []snapshots.Opt
 	if cr.Labels != nil {
 		opts = append(opts, snapshots.WithLabels(cr.Labels))
@@ -96,8 +123,19 @@ func (s *service) Commit(ctx context.Context, cr *snapshotsapi.CommitSnapshotReq
 		opts = append(opts, snapshots.WithParent(cr.Parent))
 	}
 	if err := s.sn.Commit(ctx, cr.Name, cr.Key, opts...); err != nil {
+		log.G(ctx).WithError(err).WithFields(log.Fields{
+			"namespace": ns,
+			"name":      cr.Name,
+			"key":       cr.Key,
+		}).Debug("grpc: commit failed")
 		return nil, errgrpc.ToGRPC(err)
 	}
+
+	log.G(ctx).WithFields(log.Fields{
+		"namespace": ns,
+		"name":      cr.Name,
+		"key":       cr.Key,
+	}).Debug("grpc: commit succeeded")
 
 	return empty, nil
 }
@@ -111,10 +149,21 @@ func (s *service) Remove(ctx context.Context, rr *snapshotsapi.RemoveSnapshotReq
 }
 
 func (s *service) Stat(ctx context.Context, sr *snapshotsapi.StatSnapshotRequest) (*snapshotsapi.StatSnapshotResponse, error) {
+	ns, _ := namespaces.Namespace(ctx)
 	info, err := s.sn.Stat(ctx, sr.Key)
 	if err != nil {
+		log.G(ctx).WithError(err).WithFields(log.Fields{
+			"namespace": ns,
+			"key":       sr.Key,
+		}).Debug("grpc: stat failed")
 		return nil, errgrpc.ToGRPC(err)
 	}
+
+	log.G(ctx).WithFields(log.Fields{
+		"namespace": ns,
+		"key":       sr.Key,
+		"kind":      info.Kind,
+	}).Debug("grpc: stat succeeded")
 
 	return &snapshotsapi.StatSnapshotResponse{Info: proxy.InfoToProto(info)}, nil
 }

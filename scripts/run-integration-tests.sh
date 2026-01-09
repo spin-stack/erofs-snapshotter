@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run integration tests in Docker with containerd and nexus-erofs snapshotter
+# Run integration tests in Docker with containerd and erofs snapshotter
 #
 # This script builds Go binaries locally and mounts them into the container,
 # avoiding the need to rebuild the Docker image for code changes. The Docker
@@ -24,7 +24,7 @@
 #   ./scripts/run-integration-tests.sh --test commit      # Run only commit test
 #
 # What gets mounted at runtime (no Docker rebuild needed):
-#   - Go binaries (nexus-erofs-snapshotter, integration-commit) -> /usr/local/bin/
+#   - Go binaries (erofs-snapshotter, integration-commit) -> /usr/local/bin/
 #   - scripts/integration-test.sh -> /workspace/scripts/
 #
 # AI Assistant Usage (Claude Code):
@@ -39,9 +39,9 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Default to published image on ghcr.io
 # Get repo name from git remote or use fallback
-REPO_NAME=$(git -C "${ROOT_DIR}" remote get-url origin 2>/dev/null | sed -E 's|.*github.com[:/]||; s|\.git$||' || echo "aledbf/nexus-erofs")
+REPO_NAME=$(git -C "${ROOT_DIR}" remote get-url origin 2>/dev/null | sed -E 's|.*github.com[:/]||; s|\.git$||' || echo "aledbf/erofs")
 GHCR_IMAGE="ghcr.io/${REPO_NAME}/integration:latest"
-LOCAL_IMAGE="nexus-erofs-integration"
+LOCAL_IMAGE="erofs-integration"
 
 IMAGE_NAME="${GHCR_IMAGE}"
 FORCE_BUILD=false
@@ -146,13 +146,13 @@ echo "==> Building Go binaries..."
 (
     cd "${ROOT_DIR}"
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" \
-        -o "${BUILD_DIR}/nexus-erofs-snapshotter" \
-        ./cmd/nexus-erofs-snapshotter
+        -o "${BUILD_DIR}/spin-erofs-snapshotter" \
+        ./cmd/spin-erofs-snapshotter
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" \
         -o "${BUILD_DIR}/integration-commit" \
         ./cmd/integration-commit
 )
-echo "    Built: nexus-erofs-snapshotter, integration-commit"
+echo "    Built: spin-erofs-snapshotter, integration-commit"
 
 # Docker run options
 DOCKER_OPTS=(
@@ -164,13 +164,13 @@ DOCKER_OPTS=(
     -v "${GO_MOD_CACHE}:/go/pkg/mod"
     -v "${GO_BUILD_CACHE}:/root/.cache/go-build"
     # Mount built binaries directly into PATH
-    -v "${BUILD_DIR}/nexus-erofs-snapshotter:/usr/local/bin/nexus-erofs-snapshotter"
+    -v "${BUILD_DIR}/spin-erofs-snapshotter:/usr/local/bin/spin-erofs-snapshotter"
     -v "${BUILD_DIR}/integration-commit:/usr/local/bin/integration-commit"
     -w /workspace
     --tmpfs /tmp:exec
     --tmpfs /run:exec
     --tmpfs /var/lib/containerd-test:exec
-    --tmpfs /var/lib/nexus-erofs-snapshotter:exec
+    --tmpfs /var/lib/spin-stack:exec
 )
 
 # Mount Docker credentials if available
@@ -184,7 +184,7 @@ if [[ "${KEEP_DATA}" == "true" ]]; then
     DOCKER_OPTS+=(-e CLEANUP_ON_EXIT=false)
     # Remove tmpfs mounts so data persists
     DOCKER_OPTS=("${DOCKER_OPTS[@]/--tmpfs \/var\/lib\/containerd-test:exec/}")
-    DOCKER_OPTS=("${DOCKER_OPTS[@]/--tmpfs \/var\/lib\/nexus-erofs-snapshotter:exec/}")
+    DOCKER_OPTS=("${DOCKER_OPTS[@]/--tmpfs \/var\/lib\/spin-stack:exec/}")
 fi
 
 if [[ "${INTERACTIVE}" == "true" ]]; then

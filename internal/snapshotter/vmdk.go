@@ -9,7 +9,7 @@ import (
 
 	"github.com/opencontainers/go-digest"
 
-	"github.com/aledbf/nexus-erofs/internal/erofs"
+	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 )
 
 // VMDKLayerInfo contains information about a layer extracted from a VMDK descriptor.

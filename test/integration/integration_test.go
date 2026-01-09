@@ -1,4 +1,4 @@
-// Package integration provides end-to-end tests for the nexus-erofs snapshotter.
+// Package integration provides end-to-end tests for the spin-erofs snapshotter.
 //
 // These tests verify the complete workflow of the snapshotter when used with
 // containerd, including image pulling, snapshot operations, VMDK generation,
@@ -56,7 +56,7 @@ const (
 	multiLayerImage = "quay.io/prometheus/node-exporter:latest"
 
 	// snapshotterName is the name of the snapshotter under test.
-	snapshotterName = "nexus-erofs"
+	snapshotterName = "spin-erofs"
 
 	// serviceStartTimeout is the maximum time to wait for services to start.
 	serviceStartTimeout = 30 * time.Second
@@ -542,33 +542,33 @@ root = %q
   address = %q
 
 [proxy_plugins]
-  [proxy_plugins.nexus-erofs]
+  [proxy_plugins.spin-erofs]
     type = "snapshot"
     address = %q
 %s
-  [proxy_plugins.nexus-erofs-diff]
+  [proxy_plugins.spin-erofs-diff]
     type = "diff"
     address = %q
 
 [plugins."io.containerd.service.v1.diff-service"]
-  default = ["nexus-erofs-diff", "walking"]
+  default = ["spin-erofs-diff", "walking"]
 
 [plugins."io.containerd.transfer.v1.local"]
   [[plugins."io.containerd.transfer.v1.local".unpack_config]]
     platform = "linux/amd64"
-    snapshotter = "nexus-erofs"
-    differ = "nexus-erofs-diff"
+    snapshotter = "spin-erofs"
+    differ = "spin-erofs-diff"
 
 [plugins."io.containerd.cri.v1.images"]
-  snapshotter = "nexus-erofs"
+  snapshotter = "spin-erofs"
 `, e.containerdRoot, e.containerdSocket, e.snapshotterSocket, capabilitiesLine, e.snapshotterSocket)
 
 	return os.WriteFile(configPath, []byte(config), 0644)
 }
 
-// startSnapshotter starts the nexus-erofs-snapshotter process.
+// startSnapshotter starts the spin-erofs-snapshotter process.
 func (e *Environment) startSnapshotter() error {
-	binary, err := findBinary("nexus-erofs-snapshotter")
+	binary, err := findBinary("spin-erofs-snapshotter")
 	if err != nil {
 		return err
 	}
@@ -881,8 +881,8 @@ func checkPrerequisites() error {
 		}
 	}
 
-	// Check for nexus-erofs-snapshotter
-	if _, err := findBinary("nexus-erofs-snapshotter"); err != nil {
+	// Check for spin-erofs-snapshotter
+	if _, err := findBinary("spin-erofs-snapshotter"); err != nil {
 		return err
 	}
 

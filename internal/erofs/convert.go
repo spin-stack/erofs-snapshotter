@@ -31,7 +31,7 @@ import (
 	"github.com/containerd/log"
 	"github.com/opencontainers/go-digest"
 
-	"github.com/aledbf/nexus-erofs/internal/stringutil"
+	"github.com/spin-stack/erofs-snapshotter/internal/stringutil"
 )
 
 // buildTarErofsArgs constructs the command-line arguments for mkfs.erofs

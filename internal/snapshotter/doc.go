@@ -1,4 +1,4 @@
-// Package snapshotter implements the nexus-erofs containerd snapshotter.
+// Package snapshotter implements the spin-erofs containerd snapshotter.
 //
 // This is a VM-only EROFS snapshotter for containerd, designed exclusively
 // for use with qemubox and similar VM runtimes. It does NOT mount filesystems
@@ -82,7 +82,7 @@
 //
 // Snapshot directory structure:
 //
-//	/var/lib/nexus-erofs-snapshotter/snapshots/{id}/
+//	/var/lib/spin-stack/erofs-snapshotter/snapshots/{id}/
 //	├── .erofslayer       # Marker: EROFS-managed snapshot (for differ)
 //	├── fs/               # Overlay upper directory (overlay mode)
 //	├── rwlayer.img       # ext4 writable layer file (block mode only)

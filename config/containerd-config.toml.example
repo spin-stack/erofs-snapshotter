@@ -1,24 +1,24 @@
-# containerd Configuration Example for Nexus EROFS Snapshotter
+# containerd Configuration Example for EROFS Snapshotter
 #
 # Add this to your /etc/containerd/config.toml
 
 version = 2
 
-# Register the external nexus-erofs snapshotter
+# Register the external spin-erofs snapshotter
 [proxy_plugins]
-  [proxy_plugins.nexus-erofs]
+  [proxy_plugins.spin-erofs]
     type = "snapshot"
-    address = "/run/nexus-erofs-snapshotter/snapshotter.sock"
+    address = "/run/erofs-snapshotter/snapshotter.sock"
 
-  [proxy_plugins.nexus-erofs-diff]
+  [proxy_plugins.spin-erofs-diff]
     type = "diff"
-    address = "/run/nexus-erofs-snapshotter/snapshotter.sock"
+    address = "/run/erofs-snapshotter/snapshotter.sock"
 
-# Optional: Use nexus-erofs as the default snapshotter for CRI
+# Optional: Use spin-erofs as the default snapshotter for CRI
 [plugins."io.containerd.cri.v1.images"]
-  snapshotter = "nexus-erofs"
+  snapshotter = "spin-erofs"
 
-# Optional: Configure the default runtime to use nexus-erofs
+# Optional: Configure the default runtime to use spin-erofs
 # [plugins."io.containerd.cri.v1.runtime"]
 #   [plugins."io.containerd.cri.v1.runtime".containerd]
-#     snapshotter = "nexus-erofs"
+#     snapshotter = "spin-erofs"

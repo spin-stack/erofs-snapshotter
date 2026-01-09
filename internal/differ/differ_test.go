@@ -12,7 +12,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	// Import testutil to register the -test.root flag
-	_ "github.com/aledbf/nexus-erofs/internal/testutil"
+	_ "github.com/spin-stack/erofs-snapshotter/internal/testutil"
 )
 
 func TestNewErofsDiffer(t *testing.T) {

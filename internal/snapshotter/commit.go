@@ -14,7 +14,7 @@ import (
 	"github.com/containerd/log"
 	"github.com/opencontainers/go-digest"
 
-	"github.com/aledbf/nexus-erofs/internal/erofs"
+	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 )
 
 // getCommitUpperDir returns the upper directory path for EROFS conversion.

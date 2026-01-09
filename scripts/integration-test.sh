@@ -1,5 +1,5 @@
 #!/bin/bash
-# Integration test script for nexus-erofs snapshotter
+# Integration test script for erofs snapshotter
 # Runs inside privileged Docker container with containerd
 #
 # Usage:
@@ -21,9 +21,9 @@ set -euo pipefail
 # =============================================================================
 
 CONTAINERD_ROOT="/var/lib/containerd-test"
-SNAPSHOTTER_ROOT="/var/lib/nexus-erofs-snapshotter"
+SNAPSHOTTER_ROOT="/var/lib/spin-stack/erofs-snapshotter"
 CONTAINERD_SOCKET="/run/containerd/containerd.sock"
-SNAPSHOTTER_SOCKET="/run/nexus-erofs-snapshotter/snapshotter.sock"
+SNAPSHOTTER_SOCKET="/run/spin-stack/erofs-snapshotter/snapshotter.sock"
 LOG_DIR="/tmp/integration-logs"
 
 # Use ghcr.io or quay.io to avoid Docker Hub rate limits
@@ -94,7 +94,7 @@ log_error_with_context() {
     echo ""
     echo "Active snapshots:"
     echo "────────────────────────────────────────────────────────────"
-    ctr_cmd snapshots --snapshotter nexus-erofs ls 2>/dev/null || echo "Could not list snapshots"
+    ctr_cmd snapshots --snapshotter spin-erofs ls 2>/dev/null || echo "Could not list snapshots"
     echo ""
     echo "Disk usage:"
     echo "────────────────────────────────────────────────────────────"
@@ -316,7 +316,7 @@ cleanup() {
     fi
 
     # Unmount any remaining mounts
-    mount 2>/dev/null | grep -E "(containerd-test|nexus-erofs)" | awk '{print $3}' | while read -r mp; do
+    mount 2>/dev/null | grep -E "(containerd-test|erofs)" | awk '{print $3}' | while read -r mp; do
         umount -l "$mp" 2>/dev/null || true
     done
 
@@ -376,27 +376,27 @@ root = "${CONTAINERD_ROOT}"
   address = "${CONTAINERD_SOCKET}"
 
 [proxy_plugins]
-  [proxy_plugins.nexus-erofs]
+  [proxy_plugins.spin-erofs]
     type = "snapshot"
     address = "${SNAPSHOTTER_SOCKET}"
 
-  [proxy_plugins.nexus-erofs-diff]
+  [proxy_plugins.spin-erofs-diff]
     type = "diff"
     address = "${SNAPSHOTTER_SOCKET}"
 
-# Use nexus-erofs-diff for layer application, with walking as fallback
+# Use spin-erofs-diff for layer application, with walking as fallback
 [plugins."io.containerd.service.v1.diff-service"]
-  default = ["nexus-erofs-diff", "walking"]
+  default = ["spin-erofs-diff", "walking"]
 
 # Configure unpack platforms for the proxy snapshotter
 [plugins."io.containerd.transfer.v1.local"]
   [[plugins."io.containerd.transfer.v1.local".unpack_config]]
     platform = "linux/amd64"
-    snapshotter = "nexus-erofs"
-    differ = "nexus-erofs-diff"
+    snapshotter = "spin-erofs"
+    differ = "spin-erofs-diff"
 
 [plugins."io.containerd.cri.v1.images"]
-  snapshotter = "nexus-erofs"
+  snapshotter = "spin-erofs"
 ${hosts_config}
 EOF
     log_info "Generated containerd config at /etc/containerd/config.toml"
@@ -406,8 +406,8 @@ EOF
 build_snapshotter() {
     # Check if pre-built binaries exist and we're not forcing rebuild
     if [ "${REBUILD_BINARIES}" != "true" ]; then
-        if [ -x /usr/local/bin/nexus-erofs-snapshotter ]; then
-            log_info "Using pre-built nexus-erofs-snapshotter"
+        if [ -x /usr/local/bin/spin-erofs-snapshotter ]; then
+            log_info "Using pre-built spin-erofs-snapshotter"
             if [ -x /usr/local/bin/integration-commit ]; then
                 log_info "Using pre-built integration-commit"
             fi
@@ -422,9 +422,9 @@ build_snapshotter() {
         return 1
     fi
 
-    log_info "Building nexus-erofs-snapshotter from source..."
+    log_info "Building spin-erofs-snapshotter from source..."
     cd /workspace
-    CGO_ENABLED=0 go build -buildvcs=false -o /usr/local/bin/nexus-erofs-snapshotter ./cmd/nexus-erofs-snapshotter
+    CGO_ENABLED=0 go build -buildvcs=false -o /usr/local/bin/spin-erofs-snapshotter ./cmd/spin-erofs-snapshotter
     log_info "Snapshotter built successfully"
 
     # Build integration-commit tool for image commit tests
@@ -465,13 +465,13 @@ start_containerd() {
 
 # Start snapshotter
 start_snapshotter() {
-    log_info "Starting nexus-erofs-snapshotter..."
+    log_info "Starting spin-erofs-snapshotter..."
     mkdir -p "${SNAPSHOTTER_ROOT}" "$(dirname "${SNAPSHOTTER_SOCKET}")" "${LOG_DIR}"
 
     # Remove stale socket
     rm -f "${SNAPSHOTTER_SOCKET}"
 
-    /usr/local/bin/nexus-erofs-snapshotter \
+    /usr/local/bin/spin-erofs-snapshotter \
         --address "${SNAPSHOTTER_SOCKET}" \
         --root "${SNAPSHOTTER_ROOT}" \
         --containerd-address "${CONTAINERD_SOCKET}" \
@@ -509,11 +509,11 @@ health_check() {
     fi
 
     # Check snapshotter is accessible (proxy plugins don't show in plugins ls)
-    if ctr_cmd snapshots --snapshotter nexus-erofs ls >/dev/null 2>&1; then
-        log_info "✓ nexus-erofs snapshotter accessible"
+    if ctr_cmd snapshots --snapshotter spin-erofs ls >/dev/null 2>&1; then
+        log_info "✓ erofs snapshotter accessible"
         checks_passed=$((checks_passed + 1))
     else
-        log_error "✗ nexus-erofs snapshotter not accessible"
+        log_error "✗ erofs snapshotter not accessible"
         checks_failed=$((checks_failed + 1))
     fi
 
@@ -594,14 +594,14 @@ cleanup_container() {
 # Helper: cleanup nerdctl containers
 cleanup_nerdctl_container() {
     local name="$1"
-    nerdctl --snapshotter nexus-erofs rm -f "$name" 2>/dev/null || true
+    nerdctl --snapshotter spin-erofs rm -f "$name" 2>/dev/null || true
 }
 
 # Helper: get snapshot parent using containerd API
 get_snapshot_parent() {
     local snap_name="$1"
     local snap_info
-    snap_info=$(ctr_cmd snapshots --snapshotter nexus-erofs info "$snap_name" 2>/dev/null) || return 1
+    snap_info=$(ctr_cmd snapshots --snapshotter spin-erofs info "$snap_name" 2>/dev/null) || return 1
 
     # Extract parent from snapshot info (format: Parent: "parent-name" or Parent: parent-name)
     local parent
@@ -618,7 +618,7 @@ get_snapshot_parent() {
 # Helper: get snapshot labels
 get_snapshot_labels() {
     local snap_name="$1"
-    ctr_cmd snapshots --snapshotter nexus-erofs info "$snap_name" 2>/dev/null | grep -A100 "Labels:" | grep -E "^\s+-" || true
+    ctr_cmd snapshots --snapshotter spin-erofs info "$snap_name" 2>/dev/null | grep -A100 "Labels:" | grep -E "^\s+-" || true
 }
 
 # Helper: extract layer digest from snapshot labels
@@ -656,11 +656,11 @@ teardown_test() {
     (
         set +e
         if [ -n "${TEST_NAMESPACE:-}" ]; then
-            ctr_cmd snapshots --snapshotter nexus-erofs ls 2>/dev/null | \
+            ctr_cmd snapshots --snapshotter spin-erofs ls 2>/dev/null | \
                 grep "$TEST_NAMESPACE" | \
                 awk '{print $1}' | \
                 while read -r snap; do
-                    ctr_cmd snapshots --snapshotter nexus-erofs rm "$snap" 2>/dev/null
+                    ctr_cmd snapshots --snapshotter spin-erofs rm "$snap" 2>/dev/null
                 done
         fi
     ) 2>/dev/null
@@ -739,19 +739,19 @@ check_test_dependencies() {
 # =============================================================================
 # Test: test_pull_image
 # =============================================================================
-# Goal: Verify that pulling an OCI image creates snapshots in the nexus-erofs
+# Goal: Verify that pulling an OCI image creates snapshots in the erofs
 #       snapshotter correctly.
 #
 # Expectations:
-#   - Image pull completes successfully using nexus-erofs snapshotter
+#   - Image pull completes successfully using erofs snapshotter
 #   - Image is visible in containerd image list
 #   - At least one snapshot is created for the image layers
 #
 # This is the foundational test - all other tests depend on this working.
 # =============================================================================
 test_pull_image() {
-    # Pull using ctr with nexus-erofs snapshotter (suppress progress output)
-    if ! ctr_pull --snapshotter nexus-erofs "${TEST_IMAGE}" >/dev/null; then
+    # Pull using ctr with erofs snapshotter (suppress progress output)
+    if ! ctr_pull --snapshotter spin-erofs "${TEST_IMAGE}" >/dev/null; then
         log_error_with_context "Failed to pull image"
         return 1
     fi
@@ -761,7 +761,7 @@ test_pull_image() {
 
     # Verify snapshots were created
     local snap_count
-    snap_count=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | wc -l)
+    snap_count=$(ctr_cmd snapshots --snapshotter spin-erofs ls | wc -l)
 
     assert_greater_than "$snap_count" 1 "Expected snapshots after pull" || return 1
 
@@ -785,23 +785,23 @@ test_pull_image() {
 test_prepare_snapshot() {
     # Get a committed snapshot from the pulled image (prepare requires Committed parent)
     local parent_snap
-    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
+    parent_snap=$(ctr_cmd snapshots --snapshotter spin-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
 
     assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
 
     # Prepare an active snapshot
     local snap_name="test-active-${TEST_NAMESPACE}"
-    if ! ctr_cmd snapshots --snapshotter nexus-erofs prepare "$snap_name" "$parent_snap" >/dev/null; then
+    if ! ctr_cmd snapshots --snapshotter spin-erofs prepare "$snap_name" "$parent_snap" >/dev/null; then
         log_error "Failed to prepare snapshot"
         return 1
     fi
 
     # Verify snapshot was created
-    assert_command_success "ctr_cmd snapshots --snapshotter nexus-erofs info '$snap_name' >/dev/null 2>&1" \
+    assert_command_success "ctr_cmd snapshots --snapshotter spin-erofs info '$snap_name' >/dev/null 2>&1" \
         "Snapshot should be created" || return 1
 
     # Clean up
-    ctr_cmd snapshots --snapshotter nexus-erofs rm "$snap_name" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter spin-erofs rm "$snap_name" 2>/dev/null || true
 
     log_info "Active snapshot prepared successfully"
 }
@@ -825,17 +825,17 @@ test_prepare_snapshot() {
 test_view_snapshot() {
     # Get a committed snapshot from the pulled image (View requires Committed parent)
     local parent_snap
-    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
+    parent_snap=$(ctr_cmd snapshots --snapshotter spin-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
 
     assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
 
     # Create a view snapshot
     local view_name="test-view-${TEST_NAMESPACE}"
-    ctr_cmd snapshots --snapshotter nexus-erofs view "$view_name" "$parent_snap" >/dev/null 2>&1
+    ctr_cmd snapshots --snapshotter spin-erofs view "$view_name" "$parent_snap" >/dev/null 2>&1
 
     # Get mounts for the view snapshot
     local mounts
-    mounts=$(ctr_cmd snapshots --snapshotter nexus-erofs mounts /tmp/mnt "$view_name" 2>&1)
+    mounts=$(ctr_cmd snapshots --snapshotter spin-erofs mounts /tmp/mnt "$view_name" 2>&1)
 
     # Verify it returns erofs type mount (check for .erofs file path or erofs mount type)
     if echo "$mounts" | grep -qE "(erofs|\.erofs)"; then
@@ -843,13 +843,13 @@ test_view_snapshot() {
     else
         log_debug "Mount output: $mounts"
         # Even if not erofs type, check the snapshot exists
-        assert_command_success "ctr_cmd snapshots --snapshotter nexus-erofs info '$view_name' >/dev/null 2>&1" \
+        assert_command_success "ctr_cmd snapshots --snapshotter spin-erofs info '$view_name' >/dev/null 2>&1" \
             "View snapshot should be created" || return 1
         log_info "View snapshot created successfully (mount type may vary)"
     fi
 
     # Clean up
-    ctr_cmd snapshots --snapshotter nexus-erofs rm "$view_name" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter spin-erofs rm "$view_name" 2>/dev/null || true
 }
 
 # =============================================================================
@@ -873,20 +873,20 @@ test_view_snapshot() {
 test_diff_service_erofs_mounts() {
     # Get a committed snapshot to use as parent
     local parent_snap
-    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
+    parent_snap=$(ctr_cmd snapshots --snapshotter spin-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
 
     assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
 
     # Create a view snapshot - this returns format/erofs or erofs mount type
     local view_name="test-diff-view-${TEST_NAMESPACE}"
-    if ! ctr_cmd snapshots --snapshotter nexus-erofs view "$view_name" "$parent_snap" >/dev/null 2>&1; then
+    if ! ctr_cmd snapshots --snapshotter spin-erofs view "$view_name" "$parent_snap" >/dev/null 2>&1; then
         log_error "Failed to create view snapshot"
         return 1
     fi
 
     # Get mount information for the view
     local mounts
-    mounts=$(ctr_cmd snapshots --snapshotter nexus-erofs mounts /tmp/mnt "$view_name" 2>&1)
+    mounts=$(ctr_cmd snapshots --snapshotter spin-erofs mounts /tmp/mnt "$view_name" 2>&1)
 
     log_debug "View mount output: $mounts"
 
@@ -894,7 +894,7 @@ test_diff_service_erofs_mounts() {
     if ! echo "$mounts" | grep -qE "(format/erofs|type.*erofs|erofs)"; then
         log_error "View snapshot does not return EROFS mount type"
         log_error "Mount output: $mounts"
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$view_name" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$view_name" 2>/dev/null || true
         return 1
     fi
     log_info "✓ View snapshot returns EROFS mount type"
@@ -909,15 +909,15 @@ test_diff_service_erofs_mounts() {
     # Now test that the diff service can work with these mounts by creating
     # an active snapshot and committing it. This exercises MountsToLayer().
     local active_name="test-diff-active-${TEST_NAMESPACE}"
-    if ! ctr_cmd snapshots --snapshotter nexus-erofs prepare "$active_name" "$parent_snap" >/dev/null 2>&1; then
+    if ! ctr_cmd snapshots --snapshotter spin-erofs prepare "$active_name" "$parent_snap" >/dev/null 2>&1; then
         log_error "Failed to prepare active snapshot"
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$view_name" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$view_name" 2>/dev/null || true
         return 1
     fi
 
     # Get mount information for the active snapshot
     local active_mounts
-    active_mounts=$(ctr_cmd snapshots --snapshotter nexus-erofs mounts /tmp/mnt "$active_name" 2>&1)
+    active_mounts=$(ctr_cmd snapshots --snapshotter spin-erofs mounts /tmp/mnt "$active_name" 2>&1)
 
     log_debug "Active mount output: $active_mounts"
 
@@ -938,34 +938,34 @@ test_diff_service_erofs_mounts() {
 
     # Use extract- prefix to trigger the differ code path
     local extract_name="extract-diff-test-${TEST_NAMESPACE}"
-    ctr_cmd snapshots --snapshotter nexus-erofs prepare "$extract_name" "$parent_snap" >/dev/null 2>&1
+    ctr_cmd snapshots --snapshotter spin-erofs prepare "$extract_name" "$parent_snap" >/dev/null 2>&1
 
     # Commit - this exercises the diff service's Apply/Compare methods
-    if ctr_cmd snapshots --snapshotter nexus-erofs commit "$commit_name" "$extract_name" 2>&1; then
+    if ctr_cmd snapshots --snapshotter spin-erofs commit "$commit_name" "$extract_name" 2>&1; then
         log_info "✓ Diff service commit succeeded with EROFS parent"
     else
         # Check if the commit actually created the snapshot despite error output
-        if ctr_cmd snapshots --snapshotter nexus-erofs info "$commit_name" >/dev/null 2>&1; then
+        if ctr_cmd snapshots --snapshotter spin-erofs info "$commit_name" >/dev/null 2>&1; then
             log_info "✓ Commit snapshot created (with warnings)"
         else
             log_error "Diff service commit failed - MountsToLayer() may not handle EROFS mounts"
-            ctr_cmd snapshots --snapshotter nexus-erofs rm "$view_name" 2>/dev/null || true
-            ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_name" 2>/dev/null || true
-            ctr_cmd snapshots --snapshotter nexus-erofs rm "$extract_name" 2>/dev/null || true
+            ctr_cmd snapshots --snapshotter spin-erofs rm "$view_name" 2>/dev/null || true
+            ctr_cmd snapshots --snapshotter spin-erofs rm "$active_name" 2>/dev/null || true
+            ctr_cmd snapshots --snapshotter spin-erofs rm "$extract_name" 2>/dev/null || true
             return 1
         fi
     fi
 
     # Verify the committed snapshot exists and has EROFS layer
-    if ctr_cmd snapshots --snapshotter nexus-erofs info "$commit_name" >/dev/null 2>&1; then
+    if ctr_cmd snapshots --snapshotter spin-erofs info "$commit_name" >/dev/null 2>&1; then
         log_info "✓ Committed snapshot exists"
     fi
 
     # Clean up test snapshots
-    ctr_cmd snapshots --snapshotter nexus-erofs rm "$commit_name" 2>/dev/null || true
-    ctr_cmd snapshots --snapshotter nexus-erofs rm "$extract_name" 2>/dev/null || true
-    ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_name" 2>/dev/null || true
-    ctr_cmd snapshots --snapshotter nexus-erofs rm "$view_name" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter spin-erofs rm "$commit_name" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter spin-erofs rm "$extract_name" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter spin-erofs rm "$active_name" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter spin-erofs rm "$view_name" 2>/dev/null || true
 
     log_info "Diff service correctly handles EROFS mount types"
 }
@@ -991,7 +991,7 @@ test_diff_service_erofs_mounts() {
 test_commit() {
     # Get a committed snapshot from the pulled image to use as parent
     local parent_snap
-    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
+    parent_snap=$(ctr_cmd snapshots --snapshotter spin-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
 
     assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
 
@@ -999,22 +999,22 @@ test_commit() {
 
     # Use extract- prefix to trigger host mounting (like image build does)
     local extract_name="extract-commit-${TEST_NAMESPACE}"
-    ctr_cmd snapshots --snapshotter nexus-erofs prepare "$extract_name" "$parent_snap" >/dev/null 2>&1
+    ctr_cmd snapshots --snapshotter spin-erofs prepare "$extract_name" "$parent_snap" >/dev/null 2>&1
 
     log_debug "Prepared extract snapshot: $extract_name"
 
     # The snapshotter should have created the snapshot
-    assert_command_success "ctr_cmd snapshots --snapshotter nexus-erofs info '$extract_name' >/dev/null 2>&1" \
+    assert_command_success "ctr_cmd snapshots --snapshotter spin-erofs info '$extract_name' >/dev/null 2>&1" \
         "Extract snapshot should exist" || return 1
 
     # Commit the snapshot - this triggers EROFS conversion
     local commit_name="committed-${TEST_NAMESPACE}"
-    if ! ctr_cmd snapshots --snapshotter nexus-erofs commit "$commit_name" "$extract_name" 2>&1; then
+    if ! ctr_cmd snapshots --snapshotter spin-erofs commit "$commit_name" "$extract_name" 2>&1; then
         log_warn "Snapshot commit returned error (checking if snapshot was created anyway)"
     fi
 
     # Verify committed snapshot exists
-    assert_command_success "ctr_cmd snapshots --snapshotter nexus-erofs info '$commit_name' >/dev/null 2>&1" \
+    assert_command_success "ctr_cmd snapshots --snapshotter spin-erofs info '$commit_name' >/dev/null 2>&1" \
         "Committed snapshot should exist" || return 1
 
     # Check for EROFS layer files
@@ -1029,13 +1029,13 @@ test_commit() {
         echo "┌──────────────────────────────────────────────────────────────┐"
         echo "│                  COMMITTED SNAPSHOT INFO                     │"
         echo "└──────────────────────────────────────────────────────────────┘"
-        ctr_cmd snapshots --snapshotter nexus-erofs info "$commit_name" 2>&1 || true
+        ctr_cmd snapshots --snapshotter spin-erofs info "$commit_name" 2>&1 || true
         echo ""
 
         echo "┌──────────────────────────────────────────────────────────────┐"
         echo "│                    SNAPSHOT HIERARCHY                        │"
         echo "└──────────────────────────────────────────────────────────────┘"
-        ctr_cmd snapshots --snapshotter nexus-erofs ls 2>&1 || true
+        ctr_cmd snapshots --snapshotter spin-erofs ls 2>&1 || true
         echo ""
 
         echo "┌──────────────────────────────────────────────────────────────┐"
@@ -1046,8 +1046,8 @@ test_commit() {
     fi
 
     # Clean up
-    ctr_cmd snapshots --snapshotter nexus-erofs rm "$commit_name" 2>/dev/null || true
-    ctr_cmd snapshots --snapshotter nexus-erofs rm "$extract_name" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter spin-erofs rm "$commit_name" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter spin-erofs rm "$extract_name" 2>/dev/null || true
 }
 
 # =============================================================================
@@ -1069,14 +1069,14 @@ test_commit() {
 # =============================================================================
 test_multi_layer() {
     # Pull a multi-layer image
-    if ! ctr_pull --snapshotter nexus-erofs "${MULTI_LAYER_IMAGE}" >/dev/null; then
+    if ! ctr_pull --snapshotter spin-erofs "${MULTI_LAYER_IMAGE}" >/dev/null; then
         log_error_with_context "Failed to pull multi-layer image"
         return 1
     fi
 
     # Count snapshots (subtract 1 for header line)
     local snap_count
-    snap_count=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | wc -l)
+    snap_count=$(ctr_cmd snapshots --snapshotter spin-erofs ls | wc -l)
     snap_count=$((snap_count - 1))
 
     log_info "Multi-layer image created $snap_count snapshots"
@@ -1091,7 +1091,7 @@ test_multi_layer() {
     # Find the top-level committed snapshot from the multi-layer image
     # Look for snapshots with nginx in the name or the most recent one
     local top_snap
-    top_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | tail -1 | awk '{print $1}')
+    top_snap=$(ctr_cmd snapshots --snapshotter spin-erofs ls | grep -v "^KEY" | grep "Committed" | tail -1 | awk '{print $1}')
 
     if [ -z "$top_snap" ]; then
         log_error "Could not find top-level committed snapshot"
@@ -1105,7 +1105,7 @@ test_multi_layer() {
     # VMDK is only generated when View() is called, not just when pulling
     MULTI_LAYER_VIEW_NAME="test-multi-view-${TEST_NAMESPACE}"
     log_info "Creating view to trigger VMDK generation..."
-    if ! ctr_cmd snapshots --snapshotter nexus-erofs view "$MULTI_LAYER_VIEW_NAME" "$top_snap" >/dev/null 2>&1; then
+    if ! ctr_cmd snapshots --snapshotter spin-erofs view "$MULTI_LAYER_VIEW_NAME" "$top_snap" >/dev/null 2>&1; then
         log_error "Failed to create view snapshot"
         return 1
     fi
@@ -1119,7 +1119,7 @@ test_multi_layer() {
 
     if [ "$vmdk_count" -eq 0 ]; then
         log_error "No VMDK descriptors found for multi-layer image"
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$MULTI_LAYER_VIEW_NAME" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$MULTI_LAYER_VIEW_NAME" 2>/dev/null || true
         MULTI_LAYER_VIEW_NAME=""
         return 1
     fi
@@ -1131,7 +1131,7 @@ test_multi_layer() {
 
     if [ "$fsmeta_count" -eq 0 ]; then
         log_error "No fsmeta.erofs found for multi-layer image"
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$MULTI_LAYER_VIEW_NAME" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$MULTI_LAYER_VIEW_NAME" 2>/dev/null || true
         MULTI_LAYER_VIEW_NAME=""
         return 1
     fi
@@ -1589,7 +1589,7 @@ test_nerdctl() {
 
     if ! /usr/local/bin/integration-commit \
         -address "${CONTAINERD_SOCKET}" \
-        -snapshotter nexus-erofs \
+        -snapshotter spin-erofs \
         -source "${TEST_IMAGE}" \
         -target "$new_image" \
         -marker "/root/integration-test-marker.txt" 2>&1; then
@@ -1637,29 +1637,29 @@ test_nerdctl() {
 test_snapshot_cleanup() {
     # Get a committed snapshot from the pulled image (prepare requires Committed parent)
     local parent_snap
-    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
+    parent_snap=$(ctr_cmd snapshots --snapshotter spin-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
 
     assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
 
     # Create a test snapshot
     local snap_name="test-cleanup-${TEST_NAMESPACE}"
-    if ! ctr_cmd snapshots --snapshotter nexus-erofs prepare "$snap_name" "$parent_snap" >/dev/null; then
+    if ! ctr_cmd snapshots --snapshotter spin-erofs prepare "$snap_name" "$parent_snap" >/dev/null; then
         log_error "Failed to prepare snapshot"
         return 1
     fi
 
     # Verify it exists
-    assert_command_success "ctr_cmd snapshots --snapshotter nexus-erofs info '$snap_name' >/dev/null 2>&1" \
+    assert_command_success "ctr_cmd snapshots --snapshotter spin-erofs info '$snap_name' >/dev/null 2>&1" \
         "Snapshot should exist before removal" || return 1
 
     # Remove it
-    if ! ctr_cmd snapshots --snapshotter nexus-erofs rm "$snap_name" 2>/dev/null; then
+    if ! ctr_cmd snapshots --snapshotter spin-erofs rm "$snap_name" 2>/dev/null; then
         log_error "Failed to remove snapshot"
         return 1
     fi
 
     # Verify it's gone
-    if ctr_cmd snapshots --snapshotter nexus-erofs info "$snap_name" >/dev/null 2>&1; then
+    if ctr_cmd snapshots --snapshotter spin-erofs info "$snap_name" >/dev/null 2>&1; then
         log_error "Snapshot still exists after removal"
         return 1
     fi
@@ -1675,13 +1675,13 @@ test_snapshot_cleanup() {
 test_rwlayer_creation() {
     # Get a committed snapshot from the pulled image (prepare requires Committed parent)
     local parent_snap
-    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
+    parent_snap=$(ctr_cmd snapshots --snapshotter spin-erofs ls | grep -v "^KEY" | grep "Committed" | head -1 | awk '{print $1}')
 
     assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
 
     # Create an active snapshot
     local snap_name="test-rwlayer-${TEST_NAMESPACE}"
-    if ! ctr_cmd snapshots --snapshotter nexus-erofs prepare "$snap_name" "$parent_snap" >/dev/null; then
+    if ! ctr_cmd snapshots --snapshotter spin-erofs prepare "$snap_name" "$parent_snap" >/dev/null; then
         log_error "Failed to prepare snapshot"
         return 1
     fi
@@ -1695,7 +1695,7 @@ test_rwlayer_creation() {
     log_info "Found $rwlayer_count rwlayer.img files"
 
     # Clean up
-    ctr_cmd snapshots --snapshotter nexus-erofs rm "$snap_name" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter spin-erofs rm "$snap_name" 2>/dev/null || true
 }
 
 # =============================================================================
@@ -1719,14 +1719,14 @@ test_commit_lifecycle() {
 
     # Get a committed snapshot to use as parent
     local parent_snap
-    parent_snap=$(ctr_cmd snapshots --snapshotter nexus-erofs ls | grep -v "^KEY" | grep "Committed" | tail -1 | awk '{print $1}')
+    parent_snap=$(ctr_cmd snapshots --snapshotter spin-erofs ls | grep -v "^KEY" | grep "Committed" | tail -1 | awk '{print $1}')
 
     assert_not_empty "$parent_snap" "Committed parent snapshot should exist" || return 1
     log_info "Using parent snapshot: $parent_snap"
 
     # Create an active snapshot (simulates container creation)
     local active_snap="lifecycle-active-${TEST_NAMESPACE}"
-    if ! ctr_cmd snapshots --snapshotter nexus-erofs prepare "$active_snap" "$parent_snap" >/dev/null; then
+    if ! ctr_cmd snapshots --snapshotter spin-erofs prepare "$active_snap" "$parent_snap" >/dev/null; then
         log_error "Failed to prepare active snapshot"
         return 1
     fi
@@ -1734,7 +1734,7 @@ test_commit_lifecycle() {
 
     # Get mounts to find the rwlayer.img path
     local mounts
-    mounts=$(ctr_cmd snapshots --snapshotter nexus-erofs mounts /tmp/mnt "$active_snap" 2>&1)
+    mounts=$(ctr_cmd snapshots --snapshotter spin-erofs mounts /tmp/mnt "$active_snap" 2>&1)
     log_debug "Active snapshot mounts: $mounts"
 
     # Extract rwlayer.img path from mount output (ext4 mount source)
@@ -1744,7 +1744,7 @@ test_commit_lifecycle() {
     if [ -z "$rwlayer_path" ]; then
         log_error "Could not find rwlayer.img path in mount output"
         log_error "Mount output: $mounts"
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$active_snap" 2>/dev/null || true
         return 1
     fi
     log_info "Found rwlayer.img: $rwlayer_path"
@@ -1759,7 +1759,7 @@ test_commit_lifecycle() {
     loop_dev=$(losetup -f --show "$rwlayer_path" 2>/dev/null)
     if [ -z "$loop_dev" ]; then
         log_error "Failed to setup loop device for rwlayer.img"
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$active_snap" 2>/dev/null || true
         rmdir "$mount_point" 2>/dev/null || true
         return 1
     fi
@@ -1768,7 +1768,7 @@ test_commit_lifecycle() {
     if ! mount -t ext4 "$loop_dev" "$mount_point" 2>&1; then
         log_error "Failed to mount ext4"
         losetup -d "$loop_dev" 2>/dev/null || true
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$active_snap" 2>/dev/null || true
         rmdir "$mount_point" 2>/dev/null || true
         return 1
     fi
@@ -1791,7 +1791,7 @@ test_commit_lifecycle() {
         log_error "Test file was not created"
         umount "$mount_point" 2>/dev/null || true
         losetup -d "$loop_dev" 2>/dev/null || true
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$active_snap" 2>/dev/null || true
         rmdir "$mount_point" 2>/dev/null || true
         return 1
     fi
@@ -1802,7 +1802,7 @@ test_commit_lifecycle() {
     if ! umount "$mount_point" 2>&1; then
         log_error "Failed to unmount ext4"
         losetup -d "$loop_dev" 2>/dev/null || true
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$active_snap" 2>/dev/null || true
         rmdir "$mount_point" 2>/dev/null || true
         return 1
     fi
@@ -1817,9 +1817,9 @@ test_commit_lifecycle() {
     log_info "Committing snapshot..."
     local committed_snap="lifecycle-committed-${TEST_NAMESPACE}"
 
-    if ! ctr_cmd snapshots --snapshotter nexus-erofs commit "$committed_snap" "$active_snap" 2>&1; then
+    if ! ctr_cmd snapshots --snapshotter spin-erofs commit "$committed_snap" "$active_snap" 2>&1; then
         log_error "Snapshot commit failed"
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$active_snap" 2>/dev/null || true
         return 1
     fi
     log_info "✓ Snapshot committed: $committed_snap"
@@ -1835,8 +1835,8 @@ test_commit_lifecycle() {
 
     if [ -z "$new_layer" ]; then
         log_error "Could not find EROFS layer file for committed snapshot"
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$committed_snap" 2>/dev/null || true
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$committed_snap" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$active_snap" 2>/dev/null || true
         return 1
     fi
 
@@ -1848,15 +1848,15 @@ test_commit_lifecycle() {
         log_error "CRITICAL: Committed layer is too small (${layer_size} bytes < ${min_layer_size} bytes)"
         log_error "The 1MB test file was NOT captured in the commit!"
         log_error "This indicates the diff service is not properly reading the ext4 upper directory."
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$committed_snap" 2>/dev/null || true
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$committed_snap" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$active_snap" 2>/dev/null || true
         return 1
     fi
     log_info "✓ Layer size verified: ${layer_size} bytes (expected >= ${min_layer_size})"
 
     # Clean up
-    ctr_cmd snapshots --snapshotter nexus-erofs rm "$committed_snap" 2>/dev/null || true
-    ctr_cmd snapshots --snapshotter nexus-erofs rm "$active_snap" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter spin-erofs rm "$committed_snap" 2>/dev/null || true
+    ctr_cmd snapshots --snapshotter spin-erofs rm "$active_snap" 2>/dev/null || true
 
     log_info "✓ Full lifecycle test PASSED - commit captured changes correctly"
     return 0
@@ -1873,7 +1873,7 @@ test_full_cleanup_no_leaks() {
     # First clean up the multi-layer view if it exists
     if [ -n "$MULTI_LAYER_VIEW_NAME" ]; then
         log_debug "Cleaning up multi-layer view: $MULTI_LAYER_VIEW_NAME"
-        ctr_cmd snapshots --snapshotter nexus-erofs rm "$MULTI_LAYER_VIEW_NAME" 2>/dev/null || true
+        ctr_cmd snapshots --snapshotter spin-erofs rm "$MULTI_LAYER_VIEW_NAME" 2>/dev/null || true
         MULTI_LAYER_VIEW_NAME=""
     fi
 
@@ -1903,7 +1903,7 @@ test_full_cleanup_no_leaks() {
 
     while [ $iteration -lt $max_iterations ]; do
         local snapshots
-        snapshots=$(ctr_cmd snapshots --snapshotter nexus-erofs ls 2>/dev/null | grep -v "^KEY" | awk '{print $1}' || true)
+        snapshots=$(ctr_cmd snapshots --snapshotter spin-erofs ls 2>/dev/null | grep -v "^KEY" | awk '{print $1}' || true)
 
         local current_count
         current_count=$(echo "$snapshots" | grep -c . 2>/dev/null || true)
@@ -1929,7 +1929,7 @@ test_full_cleanup_no_leaks() {
         echo "$snapshots" | while read -r snap; do
             if [ -n "$snap" ]; then
                 log_debug "Removing snapshot: $snap"
-                ctr_cmd snapshots --snapshotter nexus-erofs rm "$snap" 2>/dev/null || true
+                ctr_cmd snapshots --snapshotter spin-erofs rm "$snap" 2>/dev/null || true
             fi
         done
 
@@ -1941,10 +1941,10 @@ test_full_cleanup_no_leaks() {
 
     # Verify no snapshots remain
     local remaining_snaps
-    remaining_snaps=$(ctr_cmd snapshots --snapshotter nexus-erofs ls 2>/dev/null | grep -v "^KEY" | wc -l)
+    remaining_snaps=$(ctr_cmd snapshots --snapshotter spin-erofs ls 2>/dev/null | grep -v "^KEY" | wc -l)
     if [ "$remaining_snaps" -gt 0 ]; then
         log_error "Found $remaining_snaps snapshots still registered after cleanup"
-        ctr_cmd snapshots --snapshotter nexus-erofs ls >&2 || true
+        ctr_cmd snapshots --snapshotter spin-erofs ls >&2 || true
         return 1
     fi
     log_info "All snapshots removed from registry"
@@ -2097,7 +2097,7 @@ generate_junit_xml() {
 
     cat > "$output_file" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="nexus-erofs-integration" tests="$total_tests" failures="$failed" skipped="$skipped" time="$total_duration" timestamp="$timestamp">
+<testsuites name="erofs-integration" tests="$total_tests" failures="$failed" skipped="$skipped" time="$total_duration" timestamp="$timestamp">
   <testsuite name="integration" tests="$total_tests" failures="$failed" skipped="$skipped" time="$total_duration">
 EOF
 
@@ -2109,18 +2109,18 @@ EOF
 
         case "$status" in
             PASS)
-                echo "    <testcase name=\"$test_name\" classname=\"nexus-erofs.$test_name\" time=\"$duration\"/>" >> "$output_file"
+                echo "    <testcase name=\"$test_name\" classname=\"erofs.$test_name\" time=\"$duration\"/>" >> "$output_file"
                 ;;
             FAIL)
                 cat >> "$output_file" <<TESTCASE
-    <testcase name="$test_name" classname="nexus-erofs.$test_name" time="$duration">
+    <testcase name="$test_name" classname="erofs.$test_name" time="$duration">
       <failure message="Test failed">${message:-Test $test_name failed. Check logs for details.}</failure>
     </testcase>
 TESTCASE
                 ;;
             SKIPPED)
                 cat >> "$output_file" <<TESTCASE
-    <testcase name="$test_name" classname="nexus-erofs.$test_name" time="$duration">
+    <testcase name="$test_name" classname="erofs.$test_name" time="$duration">
       <skipped message="Test skipped">${message:-Test dependencies not met}</skipped>
     </testcase>
 TESTCASE
@@ -2198,7 +2198,7 @@ run_tests() {
 main() {
     TOTAL_START_TIME=$(date +%s)
 
-    log_info "Starting nexus-erofs integration tests"
+    log_info "Starting erofs integration tests"
     log_info "Containerd root: ${CONTAINERD_ROOT}"
     log_info "Snapshotter root: ${SNAPSHOTTER_ROOT}"
     log_info "Log directory: ${LOG_DIR}"

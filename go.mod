@@ -1,4 +1,4 @@
-module github.com/aledbf/nexus-erofs
+module github.com/spin-stack/erofs-snapshotter
 
 go 1.25
 

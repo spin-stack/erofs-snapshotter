@@ -37,11 +37,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/grpclog"
 
-	"github.com/aledbf/nexus-erofs/internal/differ"
-	"github.com/aledbf/nexus-erofs/internal/grpcservice"
-	"github.com/aledbf/nexus-erofs/internal/preflight"
-	"github.com/aledbf/nexus-erofs/internal/snapshotter"
-	"github.com/aledbf/nexus-erofs/internal/store"
+	"github.com/spin-stack/erofs-snapshotter/internal/differ"
+	"github.com/spin-stack/erofs-snapshotter/internal/grpcservice"
+	"github.com/spin-stack/erofs-snapshotter/internal/preflight"
+	"github.com/spin-stack/erofs-snapshotter/internal/snapshotter"
+	"github.com/spin-stack/erofs-snapshotter/internal/store"
 )
 
 // Version information - set via ldflags at build time
@@ -53,8 +53,8 @@ var (
 )
 
 const (
-	defaultAddress          = "/run/nexus-erofs-snapshotter/snapshotter.sock"
-	defaultRoot             = "/var/lib/nexus-erofs-snapshotter"
+	defaultAddress          = "/run/spin-stack/erofs-snapshotter/snapshotter.sock"
+	defaultRoot             = "/var/lib/spin-stack/erofs-snapshotter"
 	defaultContainerdSocket = "/run/containerd/containerd.sock"
 )
 
@@ -66,7 +66,7 @@ func main() {
 	}
 
 	app := &cli.App{
-		Name:    "nexus-erofs-snapshotter",
+		Name:    "spin-erofs-snapshotter",
 		Usage:   "External EROFS snapshotter for containerd",
 		Version: fmt.Sprintf("%s (commit: %s, built: %s)", version, gitCommit, buildDate),
 		Flags: []cli.Flag{
@@ -75,14 +75,14 @@ func main() {
 				Aliases: []string{"a"},
 				Usage:   "Address for the snapshotter socket",
 				Value:   defaultAddress,
-				EnvVars: []string{"nexus-erofs_SNAPSHOTTER_ADDRESS"},
+				EnvVars: []string{"EROFS_SNAPSHOTTER_ADDRESS"},
 			},
 			&cli.StringFlag{
 				Name:    "root",
 				Aliases: []string{"r"},
 				Usage:   "Root directory for snapshotter data",
 				Value:   defaultRoot,
-				EnvVars: []string{"nexus-erofs_SNAPSHOTTER_ROOT"},
+				EnvVars: []string{"EROFS_SNAPSHOTTER_ROOT"},
 			},
 			&cli.StringFlag{
 				Name:    "containerd-address",
@@ -106,13 +106,13 @@ func main() {
 				Name:    "default-size",
 				Usage:   "Size of ext4 writable layer in bytes (must be > 0)",
 				Value:   64 * 1024 * 1024, // 64 MiB
-				EnvVars: []string{"nexus-erofs_DEFAULT_SIZE"},
+				EnvVars: []string{"EROFS_SNAPSHOTTER_DEFAULT_SIZE"},
 			},
 			&cli.BoolFlag{
 				Name:    "set-immutable",
 				Usage:   "Set immutable flag on committed layers",
 				Value:   true,
-				EnvVars: []string{"nexus-erofs_SET_IMMUTABLE"},
+				EnvVars: []string{"EROFS_SNAPSHOTTER_SET_IMMUTABLE"},
 			},
 		},
 		Action: run,

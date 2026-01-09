@@ -1,16 +1,16 @@
-# Nexus EROFS
+# EROFS Snapshotter
 
-[![CI](https://github.com/aledbf/nexus-erofs/actions/workflows/ci.yml/badge.svg)](https://github.com/aledbf/nexus-erofs/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/github/aledbf/nexus-erofs/graph/badge.svg?token=WLFBVZ0DSM)](https://codecov.io/github/aledbf/nexus-erofs)
+[![CI](https://github.com/aledbf/erofs/actions/workflows/ci.yml/badge.svg)](https://github.com/aledbf/erofs/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/github/aledbf/erofs/graph/badge.svg?token=WLFBVZ0DSM)](https://codecov.io/github/aledbf/erofs)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 A containerd snapshotter that converts OCI image layers to EROFS and returns raw file paths for VM-based container runtimes.
 
-## Why nexus-erofs?
+## Why erofs?
 
 **The problem:** Traditional snapshotters mount filesystems on the host, then bind-mount them into containers. This doesn't work for VM-based runtimes where containers run inside guest VMs with their own kernels.
 
-**The solution:** nexus-erofs returns *file paths* instead of *mounted directories*. VM runtimes pass these files directly to QEMU as virtio-blk devices. The guest kernel mounts them internally.
+**The solution:** erofs returns *file paths* instead of *mounted directories*. VM runtimes pass these files directly to QEMU as virtio-blk devices. The guest kernel mounts them internally.
 
 | Feature | What it means |
 |---------|---------------|
@@ -36,16 +36,16 @@ A containerd snapshotter that converts OCI image layers to EROFS and returns raw
 └─────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
-│ nexus-erofs (VM-only)                                               │
+│ erofs (VM-only)                                               │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Host returns file paths → VM passes as virtio-blk → Guest mounts   │
-│  Returns: /var/lib/nexus-erofs/snapshots/123/merged.vmdk (file)     │
+│  Returns: /var/lib/erofs/snapshots/123/merged.vmdk (file)     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### vs containerd's Built-in EROFS Snapshotter
 
-| Aspect | containerd EROFS | nexus-erofs |
+| Aspect | containerd EROFS | erofs |
 |--------|------------------|-------------|
 | Target runtime | runc, crun (host containers) | qemubox (VM containers) |
 | Layer source | Requires pre-converted EROFS | Converts tar→EROFS on pull |
@@ -56,17 +56,17 @@ A containerd snapshotter that converts OCI image layers to EROFS and returns raw
 
 ```bash
 # 1. Start the snapshotter
-sudo nexus-erofs-snapshotter \
-  --root /var/lib/nexus-erofs-snapshotter \
-  --address /run/nexus-erofs-snapshotter/snapshotter.sock \
+sudo spin-erofs-snapshotter \
+  --root /var/lib/spin-stack/erofs-snapshotter \
+  --address /run/spin-stack/erofs-snapshotter/snapshotter.sock \
   --containerd-address /run/containerd/containerd.sock
 
 # 2. Pull an image using the snapshotter
-ctr images pull --snapshotter nexus-erofs docker.io/library/alpine:latest
+ctr images pull --snapshotter spin-erofs docker.io/library/alpine:latest
 
 # 3. The snapshotter returns file paths (not mounted directories)
-ctr snapshots --snapshotter nexus-erofs mounts /tmp/mnt alpine-snapshot
-# Output: mount -t erofs /var/lib/nexus-erofs-snapshotter/snapshots/1/layer.erofs /tmp/mnt
+ctr snapshots --snapshotter spin-erofs mounts /tmp/mnt alpine-snapshot
+# Output: mount -t erofs /var/lib/spin-stack/erofs-snapshotter/snapshots/1/layer.erofs /tmp/mnt
 ```
 
 See [Configuration](#configuration) for containerd integration.
@@ -79,7 +79,7 @@ flowchart LR
         Pull[Image Pull]
     end
 
-    subgraph nexus["nexus-erofs"]
+    subgraph spin["erofs"]
         Differ[tar → EROFS]
         Snap[Return file paths]
     end
@@ -99,7 +99,7 @@ flowchart LR
 ```
 
 **Data flow:**
-1. containerd pulls image, calls nexus-erofs differ
+1. containerd pulls image, calls erofs differ
 2. Differ converts each tar layer to EROFS (`mkfs.erofs --tar=f`)
 3. For multi-layer: generates `fsmeta.erofs` + `merged.vmdk`
 4. VM runtime receives file paths, passes to QEMU as block devices
@@ -138,7 +138,7 @@ When running a container, the snapshotter returns raw file paths with mount opti
 // VM runtime detects merged.vmdk in same directory and uses it for QEMU
 []mount.Mount{{
     Type:   "erofs",
-    Source: "/var/lib/nexus-erofs/snapshots/123/fsmeta.erofs",
+    Source: "/var/lib/erofs/snapshots/123/fsmeta.erofs",
     Options: []string{"ro", "loop", "device=/path/to/layer1.erofs", "device=/path/to/layer2.erofs"},
 }}
 
@@ -169,7 +169,7 @@ The VM runtime (qemubox) passes these as virtio-blk devices. The guest VM mounts
 
 ### VMDK: Single Virtual Disk for Multiple Layers
 
-For multi-layer images, nexus-erofs generates a **VMDK descriptor** that concatenates:
+For multi-layer images, erofs generates a **VMDK descriptor** that concatenates:
 - `fsmeta.erofs` - Metadata-only EROFS referencing all layer blobs
 - `layer1.erofs`, `layer2.erofs`, ... - Individual layer blobs
 
@@ -191,7 +191,7 @@ Creating a new image from a running container:
 
 ```bash
 nerdctl --address /var/run/qemubox/containerd.sock \
-    commit --snapshotter nexus-erofs \
+    commit --snapshotter spin-erofs \
     container-name docker.io/user/image:tag
 ```
 
@@ -243,7 +243,7 @@ stateDiagram-v2
 ## Storage Layout
 
 ```
-/var/lib/nexus-erofs-snapshotter/
+/var/lib/spin-stack/erofs-snapshotter/
 ├── metadata.db              # BBolt database (snapshot metadata)
 ├── mounts.db                # BBolt database (mount manager state)
 └── snapshots/
@@ -310,9 +310,9 @@ task build-linux
 ## Running
 
 ```bash
-sudo ./bin/nexus-erofs-snapshotter \
-  --root /var/lib/nexus-erofs-snapshotter \
-  --address /run/nexus-erofs-snapshotter/snapshotter.sock \
+sudo ./bin/spin-erofs-snapshotter \
+  --root /var/lib/spin-stack/erofs-snapshotter \
+  --address /run/spin-stack/erofs-snapshotter/snapshotter.sock \
   --containerd-address /run/containerd/containerd.sock
 ```
 
@@ -328,31 +328,31 @@ version = 2
 
 # Register the external snapshotter and differ
 [proxy_plugins]
-  [proxy_plugins.nexus-erofs]
+  [proxy_plugins.spin-erofs]
     type = "snapshot"
-    address = "/run/nexus-erofs-snapshotter/snapshotter.sock"
+    address = "/run/spin-stack/erofs-snapshotter/snapshotter.sock"
     # Enable parallel layer unpacking (requires containerd 2.0+)
     capabilities = ["rebase"]
 
-  [proxy_plugins.nexus-erofs-diff]
+  [proxy_plugins.spin-erofs-diff]
     type = "diff"
-    address = "/run/nexus-erofs-snapshotter/snapshotter.sock"
+    address = "/run/spin-stack/erofs-snapshotter/snapshotter.sock"
 
 [plugins]
-  # Configure diff service to use nexus-erofs-diff (with walking as fallback)
+  # Configure diff service to use spin-erofs-diff (with walking as fallback)
   [plugins."io.containerd.service.v1.diff-service"]
-    default = ["nexus-erofs-diff", "walking"]
+    default = ["spin-erofs-diff", "walking"]
 
-  # Configure layer unpacking to use nexus-erofs
+  # Configure layer unpacking to use spin-erofs
   [plugins."io.containerd.transfer.v1.local"]
     [[plugins."io.containerd.transfer.v1.local".unpack_config]]
       platform = "linux/amd64"
-      snapshotter = "nexus-erofs"
-      differ = "nexus-erofs-diff"
+      snapshotter = "spin-erofs"
+      differ = "spin-erofs-diff"
 
-  # For CRI (Kubernetes): use nexus-erofs for image pulls
+  # For CRI (Kubernetes): use spin-erofs for image pulls
   [plugins."io.containerd.cri.v1.images"]
-    snapshotter = "nexus-erofs"
+    snapshotter = "spin-erofs"
 ```
 
 **Key configuration sections:**
@@ -361,16 +361,16 @@ version = 2
 |---------|---------|
 | `proxy_plugins` | Registers the external snapshotter and differ services |
 | `proxy_plugins.*.capabilities` | Enables parallel layer unpacking with `["rebase"]` |
-| `diff-service.default` | Prioritizes nexus-erofs-diff for layer application |
+| `diff-service.default` | Prioritizes spin-erofs-diff for layer application |
 | `transfer.v1.local.unpack_config` | Tells containerd which snapshotter/differ to use for unpacking |
-| `cri.v1.images.snapshotter` | (Optional) Makes CRI use nexus-erofs for Kubernetes workloads |
+| `cri.v1.images.snapshotter` | (Optional) Makes CRI use spin-erofs for Kubernetes workloads |
 
 ### Snapshotter Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--root` | `/var/lib/nexus-erofs-snapshotter` | Root directory for snapshotter data |
-| `--address` | `/run/nexus-erofs-snapshotter/snapshotter.sock` | Unix socket address |
+| `--root` | `/var/lib/spin-stack/erofs-snapshotter` | Root directory for snapshotter data |
+| `--address` | `/run/spin-stack/erofs-snapshotter/snapshotter.sock` | Unix socket address |
 | `--containerd-address` | `/run/containerd/containerd.sock` | containerd socket |
 | `--containerd-namespace` | `default` | containerd namespace to use |
 | `--log-level` | `info` | Log level (debug, info, warn, error) |

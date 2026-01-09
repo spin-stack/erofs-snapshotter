@@ -1,6 +1,6 @@
 # Dockerfile for running tests with erofs-utils built from source
-# Build: docker build -t nexus-erofs-test -f Dockerfile.test .
-# Run:   docker run --privileged --rm -v $(pwd):/workspace -w /workspace nexus-erofs-test
+# Build: docker build -t erofs-test -f Dockerfile.test .
+# Run:   docker run --privileged --rm -v $(pwd):/workspace -w /workspace erofs-test
 
 ARG GO_VERSION=1.25
 FROM golang:${GO_VERSION}

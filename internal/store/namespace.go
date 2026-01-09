@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-// Package store provides content store utilities for the nexus-erofs snapshotter.
+// Package store provides content store utilities for the spin-erofs snapshotter.
 package store
 
 import (

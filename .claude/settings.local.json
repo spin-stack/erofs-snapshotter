@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(task build:*)",
+      "WebSearch",
+      "Bash(go mod download:*)",
+      "Bash(go list:*)",
+      "Bash(xargs:*)",
+      "Bash(go build:*)",
+      "Bash(task lint:*)",
+      "Bash(grep:*)"
+    ]
+  }
+}

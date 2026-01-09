@@ -1,6 +1,6 @@
 //go:build !linux
 
-// Package preflight provides system requirement checks for nexus-erofs.
+// Package preflight provides system requirement checks for spin-erofs-snapshotter.
 package preflight
 
 import "github.com/containerd/errdefs"
