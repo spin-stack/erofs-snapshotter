@@ -75,7 +75,7 @@ COPY --from=erofs-builder /usr/local/bin/dump.erofs /usr/local/bin/
 # Verify erofs-utils installation
 RUN mkfs.erofs --version
 
-# Note: Go binaries (erofs-snapshotter, integration-commit) are built on
+# Note: Go binaries (spin-erofs-snapshotter, integration-commit) are built on
 # the host and mounted at runtime. See run-integration-tests.sh for details.
 
 # Install nerdctl (containerd + ctr + nerdctl bundle)
@@ -95,9 +95,9 @@ RUN for i in $(seq 0 31); do \
 # Create required directories
 RUN mkdir -p \
     /var/lib/containerd-test \
-    /var/lib/erofs-snapshotter \
+    /var/lib/spin-stack/erofs-snapshotter \
     /run/containerd \
-    /run/erofs-snapshotter \
+    /run/spin-stack/erofs-snapshotter \
     /tmp/integration-logs
 
 WORKDIR /workspace

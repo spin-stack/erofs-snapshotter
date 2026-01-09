@@ -146,13 +146,13 @@ echo "==> Building Go binaries..."
 (
     cd "${ROOT_DIR}"
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" \
-        -o "${BUILD_DIR}/erofs-snapshotter" \
-        ./cmd/erofs-snapshotter
+        -o "${BUILD_DIR}/spin-erofs-snapshotter" \
+        ./cmd/spin-erofs-snapshotter
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" \
         -o "${BUILD_DIR}/integration-commit" \
         ./cmd/integration-commit
 )
-echo "    Built: erofs-snapshotter, integration-commit"
+echo "    Built: spin-erofs-snapshotter, integration-commit"
 
 # Docker run options
 DOCKER_OPTS=(
@@ -164,13 +164,13 @@ DOCKER_OPTS=(
     -v "${GO_MOD_CACHE}:/go/pkg/mod"
     -v "${GO_BUILD_CACHE}:/root/.cache/go-build"
     # Mount built binaries directly into PATH
-    -v "${BUILD_DIR}/erofs-snapshotter:/usr/local/bin/erofs-snapshotter"
+    -v "${BUILD_DIR}/spin-erofs-snapshotter:/usr/local/bin/spin-erofs-snapshotter"
     -v "${BUILD_DIR}/integration-commit:/usr/local/bin/integration-commit"
     -w /workspace
     --tmpfs /tmp:exec
     --tmpfs /run:exec
     --tmpfs /var/lib/containerd-test:exec
-    --tmpfs /var/lib/erofs-snapshotter:exec
+    --tmpfs /var/lib/spin-stack:exec
 )
 
 # Mount Docker credentials if available
@@ -184,7 +184,7 @@ if [[ "${KEEP_DATA}" == "true" ]]; then
     DOCKER_OPTS+=(-e CLEANUP_ON_EXIT=false)
     # Remove tmpfs mounts so data persists
     DOCKER_OPTS=("${DOCKER_OPTS[@]/--tmpfs \/var\/lib\/containerd-test:exec/}")
-    DOCKER_OPTS=("${DOCKER_OPTS[@]/--tmpfs \/var\/lib\/erofs-snapshotter:exec/}")
+    DOCKER_OPTS=("${DOCKER_OPTS[@]/--tmpfs \/var\/lib\/spin-stack:exec/}")
 fi
 
 if [[ "${INTERACTIVE}" == "true" ]]; then

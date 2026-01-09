@@ -56,17 +56,17 @@ A containerd snapshotter that converts OCI image layers to EROFS and returns raw
 
 ```bash
 # 1. Start the snapshotter
-sudo erofs-snapshotter \
-  --root /var/lib/erofs-snapshotter \
-  --address /run/erofs-snapshotter/snapshotter.sock \
+sudo spin-erofs-snapshotter \
+  --root /var/lib/spin-stack/erofs-snapshotter \
+  --address /run/spin-stack/erofs-snapshotter/snapshotter.sock \
   --containerd-address /run/containerd/containerd.sock
 
 # 2. Pull an image using the snapshotter
-ctr images pull --snapshotter erofs docker.io/library/alpine:latest
+ctr images pull --snapshotter spin-erofs docker.io/library/alpine:latest
 
 # 3. The snapshotter returns file paths (not mounted directories)
-ctr snapshots --snapshotter erofs mounts /tmp/mnt alpine-snapshot
-# Output: mount -t erofs /var/lib/erofs-snapshotter/snapshots/1/layer.erofs /tmp/mnt
+ctr snapshots --snapshotter spin-erofs mounts /tmp/mnt alpine-snapshot
+# Output: mount -t erofs /var/lib/spin-stack/erofs-snapshotter/snapshots/1/layer.erofs /tmp/mnt
 ```
 
 See [Configuration](#configuration) for containerd integration.
@@ -191,7 +191,7 @@ Creating a new image from a running container:
 
 ```bash
 nerdctl --address /var/run/qemubox/containerd.sock \
-    commit --snapshotter erofs \
+    commit --snapshotter spin-erofs \
     container-name docker.io/user/image:tag
 ```
 
@@ -243,7 +243,7 @@ stateDiagram-v2
 ## Storage Layout
 
 ```
-/var/lib/erofs-snapshotter/
+/var/lib/spin-stack/erofs-snapshotter/
 ├── metadata.db              # BBolt database (snapshot metadata)
 ├── mounts.db                # BBolt database (mount manager state)
 └── snapshots/
@@ -310,9 +310,9 @@ task build-linux
 ## Running
 
 ```bash
-sudo ./bin/erofs-snapshotter \
-  --root /var/lib/erofs-snapshotter \
-  --address /run/erofs-snapshotter/snapshotter.sock \
+sudo ./bin/spin-erofs-snapshotter \
+  --root /var/lib/spin-stack/erofs-snapshotter \
+  --address /run/spin-stack/erofs-snapshotter/snapshotter.sock \
   --containerd-address /run/containerd/containerd.sock
 ```
 
@@ -330,13 +330,13 @@ version = 2
 [proxy_plugins]
   [proxy_plugins.spin-erofs]
     type = "snapshot"
-    address = "/run/erofs-snapshotter/snapshotter.sock"
+    address = "/run/spin-stack/erofs-snapshotter/snapshotter.sock"
     # Enable parallel layer unpacking (requires containerd 2.0+)
     capabilities = ["rebase"]
 
   [proxy_plugins.spin-erofs-diff]
     type = "diff"
-    address = "/run/erofs-snapshotter/snapshotter.sock"
+    address = "/run/spin-stack/erofs-snapshotter/snapshotter.sock"
 
 [plugins]
   # Configure diff service to use spin-erofs-diff (with walking as fallback)
@@ -369,8 +369,8 @@ version = 2
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--root` | `/var/lib/erofs-snapshotter` | Root directory for snapshotter data |
-| `--address` | `/run/erofs-snapshotter/snapshotter.sock` | Unix socket address |
+| `--root` | `/var/lib/spin-stack/erofs-snapshotter` | Root directory for snapshotter data |
+| `--address` | `/run/spin-stack/erofs-snapshotter/snapshotter.sock` | Unix socket address |
 | `--containerd-address` | `/run/containerd/containerd.sock` | containerd socket |
 | `--containerd-namespace` | `default` | containerd namespace to use |
 | `--log-level` | `info` | Log level (debug, info, warn, error) |

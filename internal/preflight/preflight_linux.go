@@ -1,4 +1,4 @@
-// Package preflight provides system requirement checks for erofs-snapshotter.
+// Package preflight provides system requirement checks for spin-erofs-snapshotter.
 package preflight
 
 import (

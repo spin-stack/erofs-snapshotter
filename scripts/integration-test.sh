@@ -21,9 +21,9 @@ set -euo pipefail
 # =============================================================================
 
 CONTAINERD_ROOT="/var/lib/containerd-test"
-SNAPSHOTTER_ROOT="/var/lib/erofs-snapshotter"
+SNAPSHOTTER_ROOT="/var/lib/spin-stack/erofs-snapshotter"
 CONTAINERD_SOCKET="/run/containerd/containerd.sock"
-SNAPSHOTTER_SOCKET="/run/erofs-snapshotter/snapshotter.sock"
+SNAPSHOTTER_SOCKET="/run/spin-stack/erofs-snapshotter/snapshotter.sock"
 LOG_DIR="/tmp/integration-logs"
 
 # Use ghcr.io or quay.io to avoid Docker Hub rate limits
@@ -406,8 +406,8 @@ EOF
 build_snapshotter() {
     # Check if pre-built binaries exist and we're not forcing rebuild
     if [ "${REBUILD_BINARIES}" != "true" ]; then
-        if [ -x /usr/local/bin/erofs-snapshotter ]; then
-            log_info "Using pre-built erofs-snapshotter"
+        if [ -x /usr/local/bin/spin-erofs-snapshotter ]; then
+            log_info "Using pre-built spin-erofs-snapshotter"
             if [ -x /usr/local/bin/integration-commit ]; then
                 log_info "Using pre-built integration-commit"
             fi
@@ -422,9 +422,9 @@ build_snapshotter() {
         return 1
     fi
 
-    log_info "Building erofs-snapshotter from source..."
+    log_info "Building spin-erofs-snapshotter from source..."
     cd /workspace
-    CGO_ENABLED=0 go build -buildvcs=false -o /usr/local/bin/erofs-snapshotter ./cmd/erofs-snapshotter
+    CGO_ENABLED=0 go build -buildvcs=false -o /usr/local/bin/spin-erofs-snapshotter ./cmd/spin-erofs-snapshotter
     log_info "Snapshotter built successfully"
 
     # Build integration-commit tool for image commit tests
@@ -465,13 +465,13 @@ start_containerd() {
 
 # Start snapshotter
 start_snapshotter() {
-    log_info "Starting erofs-snapshotter..."
+    log_info "Starting spin-erofs-snapshotter..."
     mkdir -p "${SNAPSHOTTER_ROOT}" "$(dirname "${SNAPSHOTTER_SOCKET}")" "${LOG_DIR}"
 
     # Remove stale socket
     rm -f "${SNAPSHOTTER_SOCKET}"
 
-    /usr/local/bin/erofs-snapshotter \
+    /usr/local/bin/spin-erofs-snapshotter \
         --address "${SNAPSHOTTER_SOCKET}" \
         --root "${SNAPSHOTTER_ROOT}" \
         --containerd-address "${CONTAINERD_SOCKET}" \

@@ -1,0 +1,39 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'rm[[:space:]]+-rf[[:space:]]+(/|\\.)'; then echo 'BLOCKED: Dangerous rm -rf on root or current directory' && exit 2; fi"
+          },
+          {
+            "type": "command",
+            "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'git[[:space:]]+push.*--force.*(main|master)'; then echo 'BLOCKED: Force push to protected branch' && exit 2; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "for file in $CLAUDE_FILE_PATHS; do if echo \"$file\" | grep -qE '_linux\\.go$'; then echo \"WARNING: Editing Linux-specific file: $file\"; echo \"Consider if *_other.go needs corresponding changes\"; fi; done"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "for file in $CLAUDE_FILE_PATHS; do if echo \"$file\" | grep -qE '\\.go$'; then gofmt -w \"$file\" 2>/dev/null || true; fi; done"
+          }
+        ]
+      }
+    ]
+  }
+}

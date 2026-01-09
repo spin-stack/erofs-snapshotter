@@ -566,9 +566,9 @@ root = %q
 	return os.WriteFile(configPath, []byte(config), 0644)
 }
 
-// startSnapshotter starts the erofs-snapshotter process.
+// startSnapshotter starts the spin-erofs-snapshotter process.
 func (e *Environment) startSnapshotter() error {
-	binary, err := findBinary("erofs-snapshotter")
+	binary, err := findBinary("spin-erofs-snapshotter")
 	if err != nil {
 		return err
 	}
@@ -881,8 +881,8 @@ func checkPrerequisites() error {
 		}
 	}
 
-	// Check for erofs-snapshotter
-	if _, err := findBinary("erofs-snapshotter"); err != nil {
+	// Check for spin-erofs-snapshotter
+	if _, err := findBinary("spin-erofs-snapshotter"); err != nil {
 		return err
 	}
 

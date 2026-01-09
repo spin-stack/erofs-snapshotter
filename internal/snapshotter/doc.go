@@ -82,7 +82,7 @@
 //
 // Snapshot directory structure:
 //
-//	/var/lib/erofs-snapshotter/snapshots/{id}/
+//	/var/lib/spin-stack/erofs-snapshotter/snapshots/{id}/
 //	├── .erofslayer       # Marker: EROFS-managed snapshot (for differ)
 //	├── fs/               # Overlay upper directory (overlay mode)
 //	├── rwlayer.img       # ext4 writable layer file (block mode only)

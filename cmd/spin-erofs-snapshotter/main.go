@@ -53,8 +53,8 @@ var (
 )
 
 const (
-	defaultAddress          = "/run/erofs-snapshotter/snapshotter.sock"
-	defaultRoot             = "/var/lib/erofs-snapshotter"
+	defaultAddress          = "/run/spin-stack/erofs-snapshotter/snapshotter.sock"
+	defaultRoot             = "/var/lib/spin-stack/erofs-snapshotter"
 	defaultContainerdSocket = "/run/containerd/containerd.sock"
 )
 
@@ -66,7 +66,7 @@ func main() {
 	}
 
 	app := &cli.App{
-		Name:    "erofs-snapshotter",
+		Name:    "spin-erofs-snapshotter",
 		Usage:   "External EROFS snapshotter for containerd",
 		Version: fmt.Sprintf("%s (commit: %s, built: %s)", version, gitCommit, buildDate),
 		Flags: []cli.Flag{

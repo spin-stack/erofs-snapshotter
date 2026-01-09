@@ -5,9 +5,9 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/erofs-snapshotter \
-    --address /run/erofs-snapshotter/snapshotter.sock \
-    --root /var/lib/erofs-snapshotter \
+ExecStart=/usr/local/bin/spin-erofs-snapshotter \
+    --address /run/spin-stack/erofs-snapshotter/snapshotter.sock \
+    --root /var/lib/spin-stack/erofs-snapshotter \
     --containerd-address /run/containerd/containerd.sock \
     --log-level info
 Restart=always
