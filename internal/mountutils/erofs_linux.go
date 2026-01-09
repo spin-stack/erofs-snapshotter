@@ -26,8 +26,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/spin-stack/erofs-snapshotter/internal/loop"
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/spin-stack/erofs-snapshotter/internal/loop"
 )
 
 // MountAll mounts all provided mounts to the target directory.
