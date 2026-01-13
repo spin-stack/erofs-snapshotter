@@ -56,3 +56,8 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 func (s *snapshotter) mountBlockRwLayer(ctx context.Context, id string) error {
 	return errdefs.ErrNotImplemented
 }
+
+// syncFile is a no-op on non-Linux platforms.
+func syncFile(path string) error {
+	return nil
+}

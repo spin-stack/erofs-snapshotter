@@ -258,6 +258,13 @@ func (s *snapshotter) createWritableLayer(ctx context.Context, id string) error 
 		return fmt.Errorf("format ext4: %w: %s", err, stringutil.TruncateOutput(out, 256))
 	}
 
+	// Ensure the formatted ext4 image is durable on disk.
+	// Without fsync, a system crash could leave the file corrupt or incomplete.
+	if err := syncFile(path); err != nil {
+		os.Remove(path)
+		return fmt.Errorf("sync writable layer: %w", err)
+	}
+
 	log.G(ctx).WithField("path", path).WithField("size", size).Debug("created writable layer")
 	return nil
 }

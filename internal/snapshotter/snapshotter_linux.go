@@ -99,6 +99,26 @@ func syncFile(path string) error {
 	return f.Sync()
 }
 
+// snapshotIDExists checks if a snapshot with the given internal ID exists in metadata.
+// This is used for TOCTOU protection during orphan cleanup.
+func (s *snapshotter) snapshotIDExists(ctx context.Context, targetID string) bool {
+	var found bool
+	_ = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		return storage.WalkInfo(ctx, func(ctx context.Context, info snapshots.Info) error {
+			id, _, _, err := storage.GetInfo(ctx, info.Name)
+			if err != nil {
+				return nil // Continue on error
+			}
+			if id == targetID {
+				found = true
+				return fmt.Errorf("found") // Stop walking
+			}
+			return nil
+		})
+	})
+	return found
+}
+
 // isNotMountError returns true if the error indicates the target was not mounted.
 // These errors are expected during cleanup when the path was never mounted.
 func isNotMountError(err error) bool {
@@ -173,6 +193,16 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 			layerBlob := filepath.Join(snapshotDir, "layer.erofs")
 			if err := setImmutable(layerBlob, false); err != nil && !os.IsNotExist(err) {
 				log.L.WithError(err).WithField("path", layerBlob).Debug("failed to clear immutable flag during orphan cleanup")
+			}
+
+			// TOCTOU protection: double-check this snapshot wasn't just created
+			// between our initial scan and now. This prevents a race where:
+			// 1. We scan metadata and don't see snapshot X
+			// 2. Commit() creates snapshot X and adds to metadata
+			// 3. We delete X, causing data loss
+			if s.snapshotIDExists(ctx, id) {
+				log.L.WithField("id", id).Debug("snapshot appeared in metadata during cleanup, skipping removal")
+				continue
 			}
 
 			// Remove the entire directory
