@@ -225,8 +225,8 @@ func TestSnapshotterOptions(t *testing.T) {
 	})
 }
 
-func TestMountFsMetaReturnsFormatErofs(t *testing.T) {
-	// This test verifies that mountFsMeta returns "format/erofs" type for multi-device mounts.
+func TestFsmetaMountReturnsFormatErofs(t *testing.T) {
+	// This test verifies that fsmetaMount returns "format/erofs" type for multi-device mounts.
 	// The format/ prefix signals that containerd's standard mount manager cannot handle this type,
 	// providing a clear "unsupported mount type" error instead of cryptic EINVAL.
 
@@ -239,7 +239,7 @@ func TestMountFsMetaReturnsFormatErofs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create required files for mountFsMeta to succeed
+	// Create required files for fsmetaMount to succeed
 	// Use digest-based naming for layer file (as the differ now creates)
 	vmdkPath := filepath.Join(snapshotDir, "merged.vmdk")
 	fsmetaPath := filepath.Join(snapshotDir, "fsmeta.erofs")
@@ -257,19 +257,23 @@ func TestMountFsMetaReturnsFormatErofs(t *testing.T) {
 		ParentIDs: []string{"parent1"},
 	}
 
-	mount, ok := s.mountFsMeta(snap)
-	if !ok {
-		t.Fatal("mountFsMeta should return true when fsmeta/vmdk exist")
+	mounts, err := s.fsmetaMount(snap)
+	if err != nil {
+		t.Fatalf("fsmetaMount should succeed when fsmeta/vmdk exist: %v", err)
 	}
+	if len(mounts) != 1 {
+		t.Fatalf("fsmetaMount should return 1 mount, got %d", len(mounts))
+	}
+	mount := mounts[0]
 
 	// Verify mount type is "format/erofs" (not "erofs")
 	if mount.Type != "format/erofs" {
-		t.Errorf("mountFsMeta returned Type=%q, want %q", mount.Type, "format/erofs")
+		t.Errorf("fsmetaMount returned Type=%q, want %q", mount.Type, "format/erofs")
 	}
 
 	// Verify source points to fsmeta.erofs
 	if mount.Source != fsmetaPath {
-		t.Errorf("mountFsMeta returned Source=%q, want %q", mount.Source, fsmetaPath)
+		t.Errorf("fsmetaMount returned Source=%q, want %q", mount.Source, fsmetaPath)
 	}
 
 	// Verify options include device= for parent layer
@@ -281,12 +285,12 @@ func TestMountFsMetaReturnsFormatErofs(t *testing.T) {
 		}
 	}
 	if !hasDevice {
-		t.Errorf("mountFsMeta should include device= option for parent layer, got: %v", mount.Options)
+		t.Errorf("fsmetaMount should include device= option for parent layer, got: %v", mount.Options)
 	}
 }
 
-func TestMountFsMetaDeviceOrder(t *testing.T) {
-	// This test verifies that mountFsMeta returns device= options in oldest-first order,
+func TestFsmetaMountDeviceOrder(t *testing.T) {
+	// This test verifies that fsmetaMount returns device= options in oldest-first order,
 	// matching containerd's approach (backward iteration through ParentIDs).
 	// See: https://github.com/containerd/containerd/pull/12374
 
@@ -337,10 +341,14 @@ func TestMountFsMetaDeviceOrder(t *testing.T) {
 		ParentIDs: parentIDs,
 	}
 
-	mount, ok := s.mountFsMeta(snap)
-	if !ok {
-		t.Fatal("mountFsMeta should return true when fsmeta/vmdk exist")
+	mounts, err := s.fsmetaMount(snap)
+	if err != nil {
+		t.Fatalf("fsmetaMount should succeed when fsmeta/vmdk exist: %v", err)
 	}
+	if len(mounts) != 1 {
+		t.Fatalf("fsmetaMount should return 1 mount, got %d", len(mounts))
+	}
+	mount := mounts[0]
 
 	// Extract device= options from mount.Options
 	var deviceOpts []string

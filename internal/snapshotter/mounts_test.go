@@ -17,8 +17,8 @@ const (
 	testMountBind        = "bind"
 )
 
-func TestViewMountsFallbackToIndividualLayers(t *testing.T) {
-	// This test verifies that viewMounts falls back to individual EROFS mounts
+func TestMultiLayerMountsFallbackToIndividualLayers(t *testing.T) {
+	// This test verifies that multiLayerMounts falls back to individual EROFS mounts
 	// when fsmeta is not available (common during async generation or failures).
 
 	root := t.TempDir()
@@ -26,7 +26,6 @@ func TestViewMountsFallbackToIndividualLayers(t *testing.T) {
 
 	// Create 3 parent snapshot directories with layer blobs but NO fsmeta
 	parentIDs := []string{"parent3", "parent2", "parent1"}
-	layerPaths := make(map[string]string)
 
 	for _, pid := range parentIDs {
 		snapshotDir := filepath.Join(root, "snapshots", pid)
@@ -38,7 +37,6 @@ func TestViewMountsFallbackToIndividualLayers(t *testing.T) {
 		if err := os.WriteFile(layerPath, []byte("fake"), 0644); err != nil {
 			t.Fatal(err)
 		}
-		layerPaths[pid] = layerPath
 	}
 
 	// NOTE: No fsmeta.erofs or merged.vmdk created - forces fallback
@@ -49,9 +47,9 @@ func TestViewMountsFallbackToIndividualLayers(t *testing.T) {
 		ParentIDs: parentIDs,
 	}
 
-	mounts, err := s.viewMounts(snap)
+	mounts, err := s.multiLayerMounts(snap)
 	if err != nil {
-		t.Fatalf("viewMounts failed: %v", err)
+		t.Fatalf("multiLayerMounts failed: %v", err)
 	}
 
 	// Should get 3 individual EROFS mounts (fallback path)
@@ -68,8 +66,8 @@ func TestViewMountsFallbackToIndividualLayers(t *testing.T) {
 }
 
 func TestActiveMountsFallbackToIndividualLayers(t *testing.T) {
-	// This test verifies that activeMounts falls back to individual EROFS mounts
-	// when fsmeta is not available.
+	// This test verifies that mounts() for active snapshots falls back to
+	// individual EROFS mounts when fsmeta is not available.
 
 	root := t.TempDir()
 	s := newTestSnapshotterWithRoot(t, root)
@@ -99,10 +97,11 @@ func TestActiveMountsFallbackToIndividualLayers(t *testing.T) {
 		Kind:      snapshots.KindActive,
 		ParentIDs: []string{"parent1"},
 	}
+	info := snapshots.Info{} // Empty info = not extract snapshot
 
-	mounts, err := s.activeMounts(snap)
+	mounts, err := s.mounts(snap, info)
 	if err != nil {
-		t.Fatalf("activeMounts failed: %v", err)
+		t.Fatalf("mounts failed: %v", err)
 	}
 
 	// Should get 2 mounts: 1 EROFS (fallback) + 1 ext4 (writable)
@@ -124,8 +123,8 @@ func TestActiveMountsFallbackToIndividualLayers(t *testing.T) {
 	}
 }
 
-func TestViewMountsForKindDecisionTree(t *testing.T) {
-	// This test verifies the complete decision tree for view mounts.
+func TestLayerMountsDecisionTree(t *testing.T) {
+	// This test verifies the complete decision tree for layerMounts.
 
 	t.Run("0 parents returns bind mount", func(t *testing.T) {
 		root := t.TempDir()
@@ -143,9 +142,9 @@ func TestViewMountsForKindDecisionTree(t *testing.T) {
 			ParentIDs: []string{}, // No parents
 		}
 
-		mounts, err := s.viewMountsForKind(snap)
+		mounts, err := s.layerMounts(snap)
 		if err != nil {
-			t.Fatalf("viewMountsForKind failed: %v", err)
+			t.Fatalf("layerMounts failed: %v", err)
 		}
 
 		if len(mounts) != 1 {
@@ -177,9 +176,9 @@ func TestViewMountsForKindDecisionTree(t *testing.T) {
 			ParentIDs: []string{"parent1"},
 		}
 
-		mounts, err := s.viewMountsForKind(snap)
+		mounts, err := s.layerMounts(snap)
 		if err != nil {
-			t.Fatalf("viewMountsForKind failed: %v", err)
+			t.Fatalf("layerMounts failed: %v", err)
 		}
 
 		if len(mounts) != 1 {
@@ -225,9 +224,9 @@ func TestViewMountsForKindDecisionTree(t *testing.T) {
 			ParentIDs: parentIDs,
 		}
 
-		mounts, err := s.viewMountsForKind(snap)
+		mounts, err := s.layerMounts(snap)
 		if err != nil {
-			t.Fatalf("viewMountsForKind failed: %v", err)
+			t.Fatalf("layerMounts failed: %v", err)
 		}
 
 		if len(mounts) != 1 {
@@ -240,54 +239,64 @@ func TestViewMountsForKindDecisionTree(t *testing.T) {
 	})
 }
 
-func TestActiveMountsForKindDecisionTree(t *testing.T) {
-	t.Run("0 parents returns ext4 only", func(t *testing.T) {
-		root := t.TempDir()
-		s := newTestSnapshotterWithRoot(t, root)
-
-		// Create snapshot directory with rwlayer.img
-		snapshotDir := filepath.Join(root, "snapshots", "active")
-		if err := os.MkdirAll(snapshotDir, 0755); err != nil {
-			t.Fatal(err)
-		}
-		rwLayer := filepath.Join(snapshotDir, "rwlayer.img")
-		if err := os.WriteFile(rwLayer, []byte("fake"), 0644); err != nil {
-			t.Fatal(err)
-		}
-
-		snap := storage.Snapshot{
-			ID:        "active",
-			Kind:      snapshots.KindActive,
-			ParentIDs: []string{}, // No parents
-		}
-
-		mounts, err := s.activeMountsForKind(snap)
-		if err != nil {
-			t.Fatalf("activeMountsForKind failed: %v", err)
-		}
-
-		if len(mounts) != 1 {
-			t.Fatalf("expected 1 mount, got %d", len(mounts))
-		}
-
-		if mounts[0].Type != testMountExt4 {
-			t.Errorf("mount.Type = %q, want %q", mounts[0].Type, testMountExt4)
-		}
-	})
-}
-
-func TestSingleLayerMountsRequiresActive(t *testing.T) {
+func TestActiveSnapshotNoParentsReturnsExt4Only(t *testing.T) {
 	root := t.TempDir()
 	s := newTestSnapshotterWithRoot(t, root)
 
-	snap := storage.Snapshot{
-		ID:        "view",
-		Kind:      snapshots.KindView, // Not Active
-		ParentIDs: []string{},
+	// Create snapshot directory with rwlayer.img
+	snapshotDir := filepath.Join(root, "snapshots", "active")
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rwLayer := filepath.Join(snapshotDir, "rwlayer.img")
+	if err := os.WriteFile(rwLayer, []byte("fake"), 0644); err != nil {
+		t.Fatal(err)
 	}
 
-	_, err := s.singleLayerMounts(snap)
-	if err == nil {
-		t.Error("singleLayerMounts should reject non-Active snapshots")
+	snap := storage.Snapshot{
+		ID:        "active",
+		Kind:      snapshots.KindActive,
+		ParentIDs: []string{}, // No parents
+	}
+	info := snapshots.Info{} // Empty info = not extract snapshot
+
+	mounts, err := s.mounts(snap, info)
+	if err != nil {
+		t.Fatalf("mounts failed: %v", err)
+	}
+
+	// Should get 2 mounts: 1 bind (empty layer) + 1 ext4 (writable)
+	if len(mounts) != 2 {
+		t.Fatalf("expected 2 mounts, got %d", len(mounts))
+	}
+
+	// First should be bind mount (empty read-only layer)
+	if mounts[0].Type != testMountBind {
+		t.Errorf("mounts[0].Type = %q, want %q", mounts[0].Type, testMountBind)
+	}
+
+	// Last should be ext4 (writable layer)
+	if mounts[1].Type != testMountExt4 {
+		t.Errorf("mounts[1].Type = %q, want %q", mounts[1].Type, testMountExt4)
+	}
+}
+
+func TestWritableMountReturnsExt4(t *testing.T) {
+	root := t.TempDir()
+	s := newTestSnapshotterWithRoot(t, root)
+
+	// Create snapshot directory with rwlayer.img
+	snapshotDir := filepath.Join(root, "snapshots", "test")
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	mount := s.writableMount("test")
+
+	if mount.Type != testMountExt4 {
+		t.Errorf("mount.Type = %q, want %q", mount.Type, testMountExt4)
+	}
+	if mount.Options[0] != "rw" {
+		t.Errorf("mount.Options[0] = %q, want %q", mount.Options[0], "rw")
 	}
 }
