@@ -223,7 +223,6 @@ func TestSnapshotterOptions(t *testing.T) {
 			t.Errorf("expected defaultSize to be 100MB, got %d", config.defaultSize)
 		}
 	})
-
 }
 
 func TestMountFsMetaReturnsFormatErofs(t *testing.T) {

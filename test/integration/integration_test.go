@@ -1252,7 +1252,6 @@ func testMultiLayer(t *testing.T, env *Environment) {
 		multiLayerVMDK, layerCount = findVMDKWithMostLayers(snapshotsDir)
 		return layerCount >= 2
 	}, 15*time.Second, "waiting for multi-layer VMDK")
-
 	if err != nil {
 		// Log what we found for debugging
 		multiLayerVMDK, layerCount = findVMDKWithMostLayers(snapshotsDir)
@@ -1290,7 +1289,6 @@ func testVMDKLayerOrder(t *testing.T, env *Environment) {
 		vmdkPath, maxLayers = findVMDKWithMostLayers(snapshotsDir)
 		return maxLayers >= 2
 	}, 10*time.Second, "waiting for multi-layer VMDK")
-
 	if err != nil {
 		// Log what we found for debugging
 		vmdkPath, maxLayers = findVMDKWithMostLayers(snapshotsDir)
@@ -1632,7 +1630,6 @@ func verifyRebaseLayerOrder(t *testing.T, snapshotsDir string, assert *Assertion
 		vmdkPath, layerCount = findVMDKWithMostLayers(snapshotsDir)
 		return layerCount >= 2
 	}, 30*time.Second, "waiting for multi-layer VMDK")
-
 	if err != nil {
 		vmdkPath, layerCount = findVMDKWithMostLayers(snapshotsDir)
 		assert.DumpFiles(snapshotsDir)

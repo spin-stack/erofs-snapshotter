@@ -14,9 +14,9 @@ import (
 // Note: We use errors.As (not errors.Is) for structural error types per Go idioms.
 func TestLayerBlobNotFoundErrorAs(t *testing.T) {
 	err := &LayerBlobNotFoundError{
-		SnapshotID: "test-123",
-		Dir:        "/test/path",
-		Searched:   []string{"*.erofs"},
+		ID:       "test-123",
+		Dir:      "/test/path",
+		Searched: []string{"*.erofs"},
 	}
 
 	// Test errors.As for type-based matching
@@ -24,23 +24,24 @@ func TestLayerBlobNotFoundErrorAs(t *testing.T) {
 	if !errors.As(err, &target) {
 		t.Error("errors.As should match LayerBlobNotFoundError")
 	}
-	if target.SnapshotID != "test-123" {
-		t.Errorf("expected snapshot ID test-123, got %s", target.SnapshotID)
+	if target.ID != "test-123" {
+		t.Errorf("expected snapshot ID test-123, got %s", target.ID)
 	}
 
 	// Test that wrapped error can be unwrapped with errors.As
 	wrapped := &CommitConversionError{
-		SnapshotID: "commit-test",
-		UpperDir:   "/upper",
-		Cause:      err,
+		ID:       "commit-test",
+		UpperDir: "/upper",
+		Mode:     CommitModeOverlay,
+		Cause:    err,
 	}
 
 	var wrappedTarget *LayerBlobNotFoundError
 	if !errors.As(wrapped, &wrappedTarget) {
 		t.Error("errors.As should find LayerBlobNotFoundError in chain")
 	}
-	if wrappedTarget.SnapshotID != "test-123" {
-		t.Errorf("expected snapshot ID test-123, got %s", wrappedTarget.SnapshotID)
+	if wrappedTarget.ID != "test-123" {
+		t.Errorf("expected snapshot ID test-123, got %s", wrappedTarget.ID)
 	}
 }
 
@@ -49,9 +50,10 @@ func TestErrorChainDepth(t *testing.T) {
 	// Create a 2-level error chain
 	level1 := errors.New("root cause: filesystem full")
 	level2 := &CommitConversionError{
-		SnapshotID: "snap-abc",
-		UpperDir:   "/var/lib/snapshotter/abc/upper",
-		Cause:      level1,
+		ID:       "snap-abc",
+		UpperDir: "/var/lib/snapshotter/abc/upper",
+		Mode:     CommitModeBlock,
+		Cause:    level1,
 	}
 
 	// Should find root cause
@@ -104,8 +106,8 @@ func TestFindLayerBlobNotFound(t *testing.T) {
 		t.Errorf("expected LayerBlobNotFoundError, got %T: %v", err, err)
 	}
 
-	if notFoundErr.SnapshotID != "missing-blob" {
-		t.Errorf("expected snapshot ID 'missing-blob', got %q", notFoundErr.SnapshotID)
+	if notFoundErr.ID != "missing-blob" {
+		t.Errorf("expected snapshot ID 'missing-blob', got %q", notFoundErr.ID)
 	}
 
 	if len(notFoundErr.Searched) == 0 {

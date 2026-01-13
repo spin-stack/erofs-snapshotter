@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -39,6 +40,10 @@ import (
 // An ext4 image file of this size is created and loop-mounted for each
 // active snapshot's writable layer.
 const defaultWritableSize = 64 * 1024 * 1024 // 64 MiB
+
+// orphanCleanupTimeout is the maximum time allowed for orphan cleanup at startup.
+// If cleanup takes longer than this, it will be aborted to prevent blocking forever.
+const orphanCleanupTimeout = 30 * time.Second
 
 func checkCompatibility(root string) error {
 	// Check kernel version and EROFS support via preflight
@@ -110,7 +115,11 @@ func isNotMountError(err error) bool {
 // 1. Orphaned snapshot directories (on disk but not in metadata) - unmount and remove
 // 2. Stale mounts for existing snapshots (mounts left behind from previous runs)
 // Errors are logged but not returned since this is best-effort cleanup.
+// The function respects a timeout to avoid blocking indefinitely.
 func (s *snapshotter) cleanupOrphanedMounts() {
+	ctx, cancel := context.WithTimeout(context.Background(), orphanCleanupTimeout)
+	defer cancel()
+
 	snapshotsDir := filepath.Join(s.root, "snapshots")
 	entries, err := os.ReadDir(snapshotsDir)
 	if err != nil {
@@ -120,7 +129,6 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 
 	// Get all valid snapshot IDs from metadata
 	validIDs := make(map[string]bool)
-	ctx := context.Background()
 	if err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		return storage.WalkInfo(ctx, func(ctx context.Context, info snapshots.Info) error {
 			// Get the snapshot ID from its key
@@ -139,6 +147,12 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 	}
 
 	for _, entry := range entries {
+		// Check for timeout/cancellation
+		if ctx.Err() != nil {
+			log.L.Warn("orphan cleanup timed out, aborting")
+			return
+		}
+
 		if !entry.IsDir() {
 			continue
 		}
@@ -157,7 +171,9 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 
 			// Clear immutable flag if present
 			layerBlob := filepath.Join(snapshotDir, "layer.erofs")
-			_ = setImmutable(layerBlob, false)
+			if err := setImmutable(layerBlob, false); err != nil && !os.IsNotExist(err) {
+				log.L.WithError(err).WithField("path", layerBlob).Debug("failed to clear immutable flag during orphan cleanup")
+			}
 
 			// Remove the entire directory
 			if err := os.RemoveAll(snapshotDir); err != nil {
@@ -282,12 +298,16 @@ func (s *snapshotter) mountBlockRwLayer(ctx context.Context, id string) error {
 	workDir := filepath.Join(s.blockRwMountPath(id), "work")
 
 	if err := os.MkdirAll(upperDir, 0755); err != nil {
-		// Cleanup mount on failure
-		_ = unmountAll(rwMountPath)
+		// Cleanup mount on failure - log if unmount also fails
+		if derr := unmountAll(rwMountPath); derr != nil && !isNotMountError(derr) {
+			log.G(ctx).WithError(derr).WithField("path", rwMountPath).Debug("cleanup unmount failed after upper dir creation error")
+		}
 		return fmt.Errorf("failed to create upper directory: %w", err)
 	}
 	if err := os.MkdirAll(workDir, 0755); err != nil {
-		_ = unmountAll(rwMountPath)
+		if derr := unmountAll(rwMountPath); derr != nil && !isNotMountError(derr) {
+			log.G(ctx).WithError(derr).WithField("path", rwMountPath).Debug("cleanup unmount failed after work dir creation error")
+		}
 		return fmt.Errorf("failed to create work directory: %w", err)
 	}
 

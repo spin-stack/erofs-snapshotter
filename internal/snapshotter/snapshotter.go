@@ -68,6 +68,10 @@ type snapshotter struct {
 
 	// bgWg tracks background operations (fsmeta generation) for clean shutdown.
 	bgWg sync.WaitGroup
+
+	// layerCache caches layer blob paths to avoid repeated filesystem lookups.
+	// Keys are snapshot IDs, values are layer blob paths.
+	layerCache sync.Map
 }
 
 // isMounted checks if a path is currently mounted.
@@ -131,7 +135,17 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 	}
 
 	// Clean up any orphaned mounts from previous runs.
-	s.cleanupOrphanedMounts() //nolint:contextcheck // startup cleanup uses background context
+	// Run asynchronously to avoid blocking server startup on large snapshot stores.
+	s.bgWg.Add(1)
+	go func() {
+		defer s.bgWg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.L.WithField("panic", r).Error("orphan cleanup panic recovered")
+			}
+		}()
+		s.cleanupOrphanedMounts()
+	}()
 
 	return s, nil
 }

@@ -129,6 +129,13 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		//nolint:contextcheck // intentionally using fresh context with timeout for background work
 		go func(ids []string) {
 			defer s.bgWg.Done()
+			// Panic recovery prevents Close() from hanging forever if goroutine panics.
+			// Without this, bgWg.Wait() would block indefinitely.
+			defer func() {
+				if r := recover(); r != nil {
+					log.L.WithField("panic", r).Error("fsmeta generation panic recovered")
+				}
+			}()
 			// Use a fresh context with timeout - intentionally independent of parent
 			// context to allow completion even if the original request is cancelled.
 			bgCtx, cancel := context.WithTimeout(context.Background(), fsmetaTimeout)
@@ -272,6 +279,9 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 
 // cleanupAfterRemove handles post-removal cleanup.
 func (s *snapshotter) cleanupAfterRemove(ctx context.Context, id string, removals []string) {
+	// Invalidate layer cache for removed snapshot
+	s.invalidateLayerCache(id)
+
 	// Cleanup block rw mount (only exists if commit was in progress)
 	if err := unmountAll(s.blockRwMountPath(id)); err != nil {
 		log.G(ctx).WithError(err).WithField("id", id).Warnf("failed to cleanup block rw mount")

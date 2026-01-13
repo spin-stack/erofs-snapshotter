@@ -13,9 +13,119 @@ import (
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/log"
 	"github.com/opencontainers/go-digest"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 )
+
+// fsmeta lock retry configuration
+const (
+	// fsmetaLockMaxRetries is the maximum number of times to retry waiting
+	// for another goroutine's fsmeta generation to complete.
+	fsmetaLockMaxRetries = 10
+
+	// fsmetaLockBaseDelay is the base delay between retries (exponential backoff).
+	fsmetaLockBaseDelay = 100 * time.Millisecond
+
+	// fsmetaLockMaxDelay caps the maximum delay between retries.
+	fsmetaLockMaxDelay = 2 * time.Second
+
+	// fsmetaStaleLockAge is how old a lock file must be to be considered stale.
+	// If a lock file is older than this and the final file doesn't exist,
+	// we assume the lock holder crashed and remove the stale lock.
+	fsmetaStaleLockAge = 5 * time.Minute
+)
+
+// acquireFsmetaLock attempts to acquire an exclusive lock for fsmeta generation.
+// Returns (true, nil) if lock was acquired and caller should proceed.
+// Returns (false, nil) if another goroutine completed generation (no work needed).
+// Returns (false, error) on unexpected errors.
+//
+// This function handles:
+// 1. Atomic lock file creation (O_EXCL)
+// 2. Retry with exponential backoff when lock is held by another goroutine
+// 3. Stale lock detection and cleanup (from crashed processes)
+func (s *snapshotter) acquireFsmetaLock(ctx context.Context, lockFile, finalFile string) (bool, error) {
+	for attempt := 0; attempt <= fsmetaLockMaxRetries; attempt++ {
+		// Check if final file exists (fast path - another goroutine completed)
+		if _, err := os.Stat(finalFile); err == nil {
+			return false, nil
+		}
+
+		// Try to create lock file atomically
+		lockFd, err := os.OpenFile(lockFile, os.O_CREATE|os.O_EXCL, 0600)
+		if err == nil {
+			// We acquired the lock
+			lockFd.Close()
+			return true, nil
+		}
+
+		if !os.IsExist(err) {
+			// Unexpected error (not "file exists")
+			return false, fmt.Errorf("create lock file: %w", err)
+		}
+
+		// Lock file exists - check if it's stale
+		if s.tryCleanStaleLock(ctx, lockFile, finalFile) {
+			// Stale lock was cleaned, retry immediately
+			continue
+		}
+
+		// Lock is held by another goroutine, wait with backoff
+		if attempt < fsmetaLockMaxRetries {
+			delay := s.backoffDelay(attempt)
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-time.After(delay):
+				// Continue to next attempt
+			}
+		}
+	}
+
+	// Exhausted retries - log and give up
+	log.G(ctx).WithField("lockFile", lockFile).Warn("fsmeta generation: timed out waiting for lock")
+	return false, nil
+}
+
+// tryCleanStaleLock checks if a lock file is stale and removes it if so.
+// A lock is considered stale if it's older than fsmetaStaleLockAge and
+// the final file doesn't exist (indicating the lock holder crashed).
+func (s *snapshotter) tryCleanStaleLock(ctx context.Context, lockFile, finalFile string) bool {
+	info, err := os.Stat(lockFile)
+	if err != nil {
+		return false // Lock file doesn't exist or other error
+	}
+
+	age := time.Since(info.ModTime())
+	if age < fsmetaStaleLockAge {
+		return false // Lock is fresh, let holder complete
+	}
+
+	// Check if final file exists (lock holder may have just finished)
+	if _, err := os.Stat(finalFile); err == nil {
+		// Final file exists - just remove the orphaned lock
+		if rmErr := os.Remove(lockFile); rmErr != nil {
+			log.G(ctx).WithError(rmErr).Debug("failed to remove orphaned lock file")
+		}
+		return false
+	}
+
+	// Lock is stale - try to remove it
+	if err := os.Remove(lockFile); err != nil {
+		log.G(ctx).WithError(err).WithField("age", age).Debug("failed to remove stale lock")
+		return false
+	}
+
+	log.G(ctx).WithField("age", age).Info("removed stale fsmeta lock file")
+	return true
+}
+
+// backoffDelay calculates exponential backoff delay for the given attempt.
+func (s *snapshotter) backoffDelay(attempt int) time.Duration {
+	delay := fsmetaLockBaseDelay * (1 << attempt) // 2^attempt * base
+	return min(delay, fsmetaLockMaxDelay)
+}
 
 // getCommitUpperDir returns the upper directory path for EROFS conversion.
 //
@@ -60,9 +170,9 @@ func (s *snapshotter) commitBlock(ctx context.Context, layerBlob string, id stri
 
 	if err := convertDirToErofs(ctx, layerBlob, upperDir); err != nil {
 		return &CommitConversionError{
-			SnapshotID: id,
-			UpperDir:   upperDir,
-			Cause:      err,
+			ID:       id,
+			UpperDir: upperDir,
+			Cause:    err,
 		}
 	}
 
@@ -103,19 +213,16 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 		return
 	}
 
-	// Atomic lock file creation - only one goroutine wins
-	lockFd, err := os.OpenFile(lockFile, os.O_CREATE|os.O_EXCL, 0600)
+	// Try to acquire lock with retry logic for robustness
+	acquired, err := s.acquireFsmetaLock(ctx, lockFile, mergedMeta)
 	if err != nil {
-		// Another goroutine is generating or lock file is stale
-		// Check if final file exists now (generation completed while we waited)
-		if _, statErr := os.Stat(mergedMeta); statErr == nil {
-			return
-		}
-		// Lock file exists but no final file - could be stale from crash.
-		// Let the other holder finish or fail; don't compete.
+		log.G(ctx).WithError(err).Warn("fsmeta generation: failed to acquire lock")
 		return
 	}
-	lockFd.Close()
+	if !acquired {
+		// Another goroutine completed generation or we timed out waiting
+		return
+	}
 
 	// Always remove lock file when done
 	defer os.Remove(lockFile)
@@ -128,28 +235,37 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 	success := false
 	defer func() {
 		if !success {
-			_ = os.Remove(tmpMeta)
-			_ = os.Remove(tmpVmdk)
+			if err := os.Remove(tmpMeta); err != nil && !os.IsNotExist(err) {
+				log.L.WithError(err).WithField("path", tmpMeta).Debug("failed to cleanup temp fsmeta file")
+			}
+			if err := os.Remove(tmpVmdk); err != nil && !os.IsNotExist(err) {
+				log.L.WithError(err).WithField("path", tmpVmdk).Debug("failed to cleanup temp vmdk file")
+			}
 		}
 	}()
 
 	// Convert to oldest-first order for mkfs.erofs (OCI manifest order)
 	ociOrder := reverseStrings(parentIDs)
 
-	// Collect layer blob paths in OCI order (oldest-first)
-	var blobs []string
-	for _, snapID := range ociOrder {
-		blob, err := s.findLayerBlob(snapID)
-		if err != nil {
-			log.G(ctx).WithError(err).WithFields(log.Fields{
-				"snapshot":       snapID,
-				"layerCount":     len(parentIDs),
-				"stage":          "collect_blobs",
-				"collectedSoFar": len(blobs),
-			}).Warn("fsmeta generation skipped: layer blob not found")
-			return
-		}
-		blobs = append(blobs, blob)
+	// Collect layer blob paths in parallel (OCI order: oldest-first)
+	blobs := make([]string, len(ociOrder))
+	g, gctx := errgroup.WithContext(ctx)
+	for i, snapID := range ociOrder {
+		g.Go(func() error {
+			blob, err := s.findLayerBlob(snapID)
+			if err != nil {
+				return err
+			}
+			blobs[i] = blob
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		log.G(gctx).WithError(err).WithFields(log.Fields{
+			"layerCount": len(parentIDs),
+			"stage":      "collect_blobs",
+		}).Warn("fsmeta generation skipped: layer blob not found")
+		return
 	}
 
 	// Check block size compatibility for fsmeta merge
@@ -224,6 +340,7 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 
 // fixVmdkPaths replaces oldPath with newPath in a VMDK descriptor file.
 // VMDK is a simple text format where paths appear in FLAT extent lines.
+// Uses atomic write (write to temp + rename) to prevent corruption on crash.
 func fixVmdkPaths(vmdkFile, oldPath, newPath string) error {
 	content, err := os.ReadFile(vmdkFile)
 	if err != nil {
@@ -233,8 +350,41 @@ func fixVmdkPaths(vmdkFile, oldPath, newPath string) error {
 	// Simple string replacement - the VMDK format uses quoted paths
 	fixed := strings.ReplaceAll(string(content), oldPath, newPath)
 
-	if err := os.WriteFile(vmdkFile, []byte(fixed), 0644); err != nil {
+	// Atomic write: write to temp file, then rename
+	if err := atomicWriteFile(vmdkFile, []byte(fixed), 0644); err != nil {
 		return fmt.Errorf("write vmdk: %w", err)
+	}
+
+	return nil
+}
+
+// atomicWriteFile writes data to a file atomically by writing to a temp file
+// and then renaming. This prevents corruption if the process crashes mid-write.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	tmpPath := path + ".atomic"
+
+	// Write to temp file
+	if err := os.WriteFile(tmpPath, data, perm); err != nil {
+		return err
+	}
+
+	// Sync to ensure data is on disk before rename
+	f, err := os.Open(tmpPath)
+	if err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	f.Close()
+
+	// Atomic rename
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return err
 	}
 
 	return nil
@@ -243,6 +393,7 @@ func fixVmdkPaths(vmdkFile, oldPath, newPath string) error {
 // writeLayerManifest writes layer digests to a manifest file in VMDK/OCI order.
 // Format: one digest per line (sha256:hex...), oldest/base layer first.
 // This is the authoritative source for VMDK layer order verification.
+// Uses atomic write to prevent corruption on crash.
 func (s *snapshotter) writeLayerManifest(manifestFile string, blobs []string) error {
 	var digests []digest.Digest
 	for _, blob := range blobs {
@@ -263,7 +414,7 @@ func (s *snapshotter) writeLayerManifest(manifestFile string, blobs []string) er
 	}
 
 	content := strings.Join(lines, "\n") + "\n"
-	return os.WriteFile(manifestFile, []byte(content), 0644)
+	return atomicWriteFile(manifestFile, []byte(content), 0644)
 }
 
 // Commit finalizes an active snapshot, converting it to EROFS format.
