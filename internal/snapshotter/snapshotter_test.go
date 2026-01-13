@@ -231,7 +231,7 @@ func TestMountFsMetaReturnsFormatErofs(t *testing.T) {
 	// providing a clear "unsupported mount type" error instead of cryptic EINVAL.
 
 	root := t.TempDir()
-	s := &snapshotter{root: root}
+	s := newTestSnapshotterWithRoot(t, root)
 
 	// Create fake snapshot directories with fsmeta and vmdk files
 	snapshotDir := filepath.Join(root, "snapshots", "parent1")
@@ -291,7 +291,7 @@ func TestMountFsMetaDeviceOrder(t *testing.T) {
 	// See: https://github.com/containerd/containerd/pull/12374
 
 	root := t.TempDir()
-	s := &snapshotter{root: root}
+	s := newTestSnapshotterWithRoot(t, root)
 
 	// Create 3 parent snapshot directories with layer blobs
 	// ParentIDs order: [parent3, parent2, parent1] (newest to oldest, as containerd provides)
@@ -365,7 +365,7 @@ func TestMountFsMetaDeviceOrder(t *testing.T) {
 
 func TestSnapshotterPaths(t *testing.T) {
 	root := "/var/lib/containerd/io.containerd.snapshotter.v1.erofs"
-	s := &snapshotter{root: root}
+	s := newTestSnapshotterWithRoot(t, root)
 
 	t.Run("viewLowerPath", func(t *testing.T) {
 		got := s.viewLowerPath("123")

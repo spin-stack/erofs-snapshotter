@@ -24,11 +24,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/log"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/moby/sys/mountinfo"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 	"github.com/spin-stack/erofs-snapshotter/internal/stringutil"
@@ -60,6 +63,21 @@ func WithDefaultSize(size int64) Opt {
 	}
 }
 
+// Configuration for resource limits.
+const (
+	// closeTimeout is the maximum time to wait for background operations during Close().
+	closeTimeout = 30 * time.Second
+
+	// maxConcurrentFsmeta limits concurrent fsmeta generation goroutines.
+	maxConcurrentFsmeta = 4
+
+	// layerCacheSize is the maximum number of layer blob paths to cache.
+	layerCacheSize = 10000
+
+	// layerCacheTTL is how long cached layer blob paths remain valid.
+	layerCacheTTL = 5 * time.Minute
+)
+
 type snapshotter struct {
 	root            string
 	ms              *storage.MetaStore
@@ -69,9 +87,12 @@ type snapshotter struct {
 	// bgWg tracks background operations (fsmeta generation) for clean shutdown.
 	bgWg sync.WaitGroup
 
+	// fsmetaSem limits concurrent fsmeta generation to prevent goroutine explosion.
+	fsmetaSem *semaphore.Weighted
+
 	// layerCache caches layer blob paths to avoid repeated filesystem lookups.
-	// Keys are snapshot IDs, values are layer blob paths.
-	layerCache sync.Map
+	// Uses LRU with TTL to bound memory usage.
+	layerCache *expirable.LRU[string, string]
 }
 
 // isMounted checks if a path is currently mounted.
@@ -132,6 +153,8 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		ms:              ms,
 		setImmutable:    config.setImmutable,
 		defaultWritable: config.defaultSize,
+		fsmetaSem:       semaphore.NewWeighted(maxConcurrentFsmeta),
+		layerCache:      expirable.NewLRU[string, string](layerCacheSize, nil, layerCacheTTL),
 	}
 
 	// Clean up any orphaned mounts from previous runs.
@@ -151,9 +174,22 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 }
 
 // Close releases all resources held by the snapshotter.
-// It waits for any background operations (fsmeta generation) to complete.
+// It waits up to closeTimeout for background operations (fsmeta generation) to complete.
 func (s *snapshotter) Close() error {
-	s.bgWg.Wait() // Wait for background operations to complete
+	// Wait for background operations with timeout to prevent indefinite blocking.
+	done := make(chan struct{})
+	go func() {
+		s.bgWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All background work completed normally.
+	case <-time.After(closeTimeout):
+		log.L.Warn("close timed out waiting for background operations")
+	}
+
 	s.cleanupBlockMounts()
 	return s.ms.Close()
 }

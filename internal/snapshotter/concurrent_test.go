@@ -181,7 +181,7 @@ func TestConcurrentRemove(t *testing.T) {
 // uses the lock file correctly (only one wins).
 func TestFsmetaLockFileRace(t *testing.T) {
 	root := t.TempDir()
-	s := &snapshotter{root: root}
+	s := newTestSnapshotterWithRoot(t, root)
 
 	// Create snapshot directory
 	snapshotDir := filepath.Join(root, "snapshots", "test-parent")
@@ -232,7 +232,7 @@ func TestFsmetaLockFileRace(t *testing.T) {
 // TestFsmetaAtomicRename verifies the atomic rename pattern for fsmeta generation.
 func TestFsmetaAtomicRename(t *testing.T) {
 	root := t.TempDir()
-	s := &snapshotter{root: root}
+	s := newTestSnapshotterWithRoot(t, root)
 
 	// Create snapshot directory
 	snapshotDir := filepath.Join(root, "snapshots", "test-parent")

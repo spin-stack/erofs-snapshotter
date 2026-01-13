@@ -22,7 +22,7 @@ func TestViewMountsFallbackToIndividualLayers(t *testing.T) {
 	// when fsmeta is not available (common during async generation or failures).
 
 	root := t.TempDir()
-	s := &snapshotter{root: root}
+	s := newTestSnapshotterWithRoot(t, root)
 
 	// Create 3 parent snapshot directories with layer blobs but NO fsmeta
 	parentIDs := []string{"parent3", "parent2", "parent1"}
@@ -72,7 +72,7 @@ func TestActiveMountsFallbackToIndividualLayers(t *testing.T) {
 	// when fsmeta is not available.
 
 	root := t.TempDir()
-	s := &snapshotter{root: root}
+	s := newTestSnapshotterWithRoot(t, root)
 
 	// Create parent snapshot directory with layer blob but NO fsmeta
 	snapshotDir := filepath.Join(root, "snapshots", "parent1")
@@ -129,7 +129,7 @@ func TestViewMountsForKindDecisionTree(t *testing.T) {
 
 	t.Run("0 parents returns bind mount", func(t *testing.T) {
 		root := t.TempDir()
-		s := &snapshotter{root: root}
+		s := newTestSnapshotterWithRoot(t, root)
 
 		// Create snapshot directory
 		snapshotDir := filepath.Join(root, "snapshots", "empty")
@@ -159,7 +159,7 @@ func TestViewMountsForKindDecisionTree(t *testing.T) {
 
 	t.Run("1 parent returns single erofs mount", func(t *testing.T) {
 		root := t.TempDir()
-		s := &snapshotter{root: root}
+		s := newTestSnapshotterWithRoot(t, root)
 
 		// Create parent with layer blob
 		snapshotDir := filepath.Join(root, "snapshots", "parent1")
@@ -196,7 +196,7 @@ func TestViewMountsForKindDecisionTree(t *testing.T) {
 
 	t.Run("N parents with fsmeta returns format/erofs", func(t *testing.T) {
 		root := t.TempDir()
-		s := &snapshotter{root: root}
+		s := newTestSnapshotterWithRoot(t, root)
 
 		// Create parent directories with layer blobs
 		parentIDs := []string{"parent2", "parent1"}
@@ -243,7 +243,7 @@ func TestViewMountsForKindDecisionTree(t *testing.T) {
 func TestActiveMountsForKindDecisionTree(t *testing.T) {
 	t.Run("0 parents returns ext4 only", func(t *testing.T) {
 		root := t.TempDir()
-		s := &snapshotter{root: root}
+		s := newTestSnapshotterWithRoot(t, root)
 
 		// Create snapshot directory with rwlayer.img
 		snapshotDir := filepath.Join(root, "snapshots", "active")
@@ -278,7 +278,7 @@ func TestActiveMountsForKindDecisionTree(t *testing.T) {
 
 func TestSingleLayerMountsRequiresActive(t *testing.T) {
 	root := t.TempDir()
-	s := &snapshotter{root: root}
+	s := newTestSnapshotterWithRoot(t, root)
 
 	snap := storage.Snapshot{
 		ID:        "view",

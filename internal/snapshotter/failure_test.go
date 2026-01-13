@@ -86,7 +86,7 @@ func TestReverseStringsEmpty(t *testing.T) {
 // TestFindLayerBlobNotFound verifies findLayerBlob returns correct error type.
 func TestFindLayerBlobNotFound(t *testing.T) {
 	root := t.TempDir()
-	s := &snapshotter{root: root}
+	s := newTestSnapshotterWithRoot(t, root)
 
 	// Create empty snapshot directory
 	snapshotDir := filepath.Join(root, "snapshots", "missing-blob")
@@ -118,7 +118,7 @@ func TestFindLayerBlobNotFound(t *testing.T) {
 // TestFindLayerBlobDigestNaming verifies digest-based blob naming works.
 func TestFindLayerBlobDigestNaming(t *testing.T) {
 	root := t.TempDir()
-	s := &snapshotter{root: root}
+	s := newTestSnapshotterWithRoot(t, root)
 
 	// Create snapshot directory with digest-based layer blob
 	snapshotDir := filepath.Join(root, "snapshots", "digest-test")
@@ -146,7 +146,7 @@ func TestFindLayerBlobDigestNaming(t *testing.T) {
 // TestFindLayerBlobFallbackNaming verifies fallback naming works.
 func TestFindLayerBlobFallbackNaming(t *testing.T) {
 	root := t.TempDir()
-	s := &snapshotter{root: root}
+	s := newTestSnapshotterWithRoot(t, root)
 
 	// Create snapshot directory with fallback-named layer blob
 	snapshotDir := filepath.Join(root, "snapshots", "fallback-test")
@@ -174,7 +174,7 @@ func TestFindLayerBlobFallbackNaming(t *testing.T) {
 // TestFindLayerBlobDigestPriority verifies digest-based naming takes priority.
 func TestFindLayerBlobDigestPriority(t *testing.T) {
 	root := t.TempDir()
-	s := &snapshotter{root: root}
+	s := newTestSnapshotterWithRoot(t, root)
 
 	// Create snapshot directory with both naming styles
 	snapshotDir := filepath.Join(root, "snapshots", "priority-test")

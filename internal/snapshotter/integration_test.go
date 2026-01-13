@@ -28,6 +28,13 @@ func checkBlockModeRequirements(t *testing.T) bool {
 
 func newTestSnapshotter(t *testing.T, opts ...Opt) snapshots.Snapshotter {
 	t.Helper()
+	return newTestSnapshotterInternal(t, opts...)
+}
+
+// newTestSnapshotterInternal creates a test snapshotter and returns the internal type.
+// Use this for tests that need access to internal methods (paths, mounts, etc.).
+func newTestSnapshotterInternal(t *testing.T, opts ...Opt) *snapshotter {
+	t.Helper()
 	root := t.TempDir()
 
 	// On non-Linux, we need block mode (default is 64MB)
@@ -50,7 +57,31 @@ func newTestSnapshotter(t *testing.T, opts ...Opt) snapshots.Snapshotter {
 		t.Fatalf("failed to create snapshotter: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	return s
+	return s.(*snapshotter)
+}
+
+// newTestSnapshotterWithRoot creates a test snapshotter with a specific root directory.
+// The caller is responsible for ensuring the root directory exists.
+func newTestSnapshotterWithRoot(t *testing.T, root string, opts ...Opt) *snapshotter {
+	t.Helper()
+
+	needsBlockMode := runtime.GOOS != osLinux
+	if needsBlockMode {
+		if !checkBlockModeRequirements(t) {
+			t.Skip("mkfs.ext4 not available, required for block mode testing")
+		}
+		opts = append([]Opt{WithDefaultSize(1024 * 1024)}, opts...)
+	}
+
+	s, err := NewSnapshotter(root, opts...)
+	if err != nil {
+		if runtime.GOOS == osLinux {
+			t.Skipf("snapshotter creation failed (EROFS likely not available): %v", err)
+		}
+		t.Fatalf("failed to create snapshotter: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s.(*snapshotter)
 }
 
 func TestNewSnapshotter(t *testing.T) {

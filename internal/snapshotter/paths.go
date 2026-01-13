@@ -71,8 +71,8 @@ func (s *snapshotter) blockUpperPath(id string) string {
 // Results are cached to avoid repeated filesystem lookups.
 func (s *snapshotter) findLayerBlob(id string) (string, error) {
 	// Check cache first
-	if cached, ok := s.layerCache.Load(id); ok {
-		return cached.(string), nil
+	if cached, ok := s.layerCache.Get(id); ok {
+		return cached, nil
 	}
 
 	dir := filepath.Join(s.root, snapshotsDirName, id)
@@ -84,14 +84,14 @@ func (s *snapshotter) findLayerBlob(id string) (string, error) {
 		return "", fmt.Errorf("glob layer blob: %w", err)
 	}
 	if len(matches) > 0 {
-		s.layerCache.Store(id, matches[0])
+		s.layerCache.Add(id, matches[0])
 		return matches[0], nil
 	}
 
 	// Try fallback naming (walking differ creates these)
 	fallbackPath := filepath.Join(dir, fallbackLayerPrefix+id+".erofs")
 	if _, err := os.Stat(fallbackPath); err == nil {
-		s.layerCache.Store(id, fallbackPath)
+		s.layerCache.Add(id, fallbackPath)
 		return fallbackPath, nil
 	}
 
@@ -105,7 +105,7 @@ func (s *snapshotter) findLayerBlob(id string) (string, error) {
 // invalidateLayerCache removes a snapshot from the layer blob cache.
 // Called when a snapshot is removed to prevent stale cache entries.
 func (s *snapshotter) invalidateLayerCache(id string) {
-	s.layerCache.Delete(id)
+	s.layerCache.Remove(id)
 }
 
 // fallbackLayerBlobPath returns the path for creating a layer blob when the

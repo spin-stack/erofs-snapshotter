@@ -12,7 +12,7 @@ func TestGetCommitUpperDir(t *testing.T) {
 
 	t.Run("overlay mode when no rwlayer.img", func(t *testing.T) {
 		root := t.TempDir()
-		s := &snapshotter{root: root}
+		s := newTestSnapshotterWithRoot(t, root)
 
 		// Create snapshot directory without rwlayer.img
 		snapshotDir := filepath.Join(root, "snapshots", "test-id")
@@ -32,7 +32,7 @@ func TestGetCommitUpperDir(t *testing.T) {
 
 	t.Run("block mode when rwlayer.img exists and upper dir exists", func(t *testing.T) {
 		root := t.TempDir()
-		s := &snapshotter{root: root}
+		s := newTestSnapshotterWithRoot(t, root)
 
 		// Create snapshot directory with rwlayer.img and rw/upper/
 		snapshotDir := filepath.Join(root, "snapshots", "test-id")
@@ -57,7 +57,7 @@ func TestGetCommitUpperDir(t *testing.T) {
 
 	t.Run("block mode when rw has content but no upper subdir", func(t *testing.T) {
 		root := t.TempDir()
-		s := &snapshotter{root: root}
+		s := newTestSnapshotterWithRoot(t, root)
 
 		// Create snapshot directory with rwlayer.img and rw/ with some content
 		snapshotDir := filepath.Join(root, "snapshots", "test-id")
@@ -86,7 +86,7 @@ func TestGetCommitUpperDir(t *testing.T) {
 
 	t.Run("falls back to overlay when rw is empty", func(t *testing.T) {
 		root := t.TempDir()
-		s := &snapshotter{root: root}
+		s := newTestSnapshotterWithRoot(t, root)
 
 		// Create snapshot directory with rwlayer.img but empty rw/
 		snapshotDir := filepath.Join(root, "snapshots", "test-id")
@@ -114,7 +114,7 @@ func TestGetCommitUpperDir(t *testing.T) {
 
 	t.Run("falls back to overlay when rw does not exist", func(t *testing.T) {
 		root := t.TempDir()
-		s := &snapshotter{root: root}
+		s := newTestSnapshotterWithRoot(t, root)
 
 		// Create snapshot directory with rwlayer.img but no rw/ directory
 		snapshotDir := filepath.Join(root, "snapshots", "test-id")

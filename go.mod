@@ -10,6 +10,7 @@ require (
 	github.com/containerd/errdefs/pkg v0.3.0
 	github.com/containerd/log v0.1.0
 	github.com/google/uuid v1.6.0
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/moby/sys/mountinfo v0.7.2
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1

@@ -58,6 +58,34 @@ func checkContext(ctx context.Context, operation string) error {
 	return nil
 }
 
+// startFsmetaGeneration spawns a background goroutine to generate fsmeta for multi-layer images.
+// The goroutine acquires a semaphore to limit concurrent generations and uses an independent
+// context with timeout to allow completion even if the original request is cancelled.
+func (s *snapshotter) startFsmetaGeneration(parentIDs []string) {
+	s.bgWg.Add(1)
+	//nolint:contextcheck // intentionally using fresh context with timeout for background work
+	go func(ids []string) {
+		defer s.bgWg.Done()
+		// Panic recovery prevents Close() from hanging forever if goroutine panics.
+		defer func() {
+			if r := recover(); r != nil {
+				log.L.WithField("panic", r).Error("fsmeta generation panic recovered")
+			}
+		}()
+
+		bgCtx, cancel := context.WithTimeout(context.Background(), fsmetaTimeout)
+		defer cancel()
+
+		// Acquire semaphore to limit concurrent fsmeta generations.
+		if err := s.fsmetaSem.Acquire(bgCtx, 1); err != nil {
+			return // Context cancelled or timed out waiting for semaphore
+		}
+		defer s.fsmetaSem.Release(1)
+
+		s.generateFsMeta(bgCtx, ids)
+	}(parentIDs)
+}
+
 func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (_ []mount.Mount, err error) {
 	var (
 		snap     storage.Snapshot
@@ -120,28 +148,10 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}
 
 	// Generate VMDK for VM runtimes - always generate when there are parent layers.
-	// ParentIDs come from the snapshot chain in newest-first order.
-	// Run async to avoid blocking Prepare/View - fsmeta generation is expensive
-	// but not required for basic snapshot operations.
+	// Run async to avoid blocking Prepare/View.
 	if !isExtractKey(key) && len(snap.ParentIDs) > 0 {
-		parentIDs := snap.ParentIDs // capture for goroutine
-		s.bgWg.Add(1)
-		//nolint:contextcheck // intentionally using fresh context with timeout for background work
-		go func(ids []string) {
-			defer s.bgWg.Done()
-			// Panic recovery prevents Close() from hanging forever if goroutine panics.
-			// Without this, bgWg.Wait() would block indefinitely.
-			defer func() {
-				if r := recover(); r != nil {
-					log.L.WithField("panic", r).Error("fsmeta generation panic recovered")
-				}
-			}()
-			// Use a fresh context with timeout - intentionally independent of parent
-			// context to allow completion even if the original request is cancelled.
-			bgCtx, cancel := context.WithTimeout(context.Background(), fsmetaTimeout)
-			defer cancel()
-			s.generateFsMeta(bgCtx, ids)
-		}(parentIDs)
+		//nolint:contextcheck // uses fresh context to complete even if request is cancelled
+		s.startFsmetaGeneration(snap.ParentIDs)
 	}
 
 	// For active snapshots, create the writable ext4 layer file.
