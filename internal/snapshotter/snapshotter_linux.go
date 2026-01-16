@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
-	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/log"
@@ -101,20 +100,20 @@ func syncFile(path string) error {
 
 // snapshotIDExists checks if a snapshot with the given internal ID exists in metadata.
 // This is used for TOCTOU protection during orphan cleanup.
+//
+// IMPORTANT: This function uses storage.IDMap which works without a namespace context,
+// making it safe to call from background goroutines that don't have namespace metadata.
+// Do NOT use storage.WalkInfo here as it requires namespace context and would fail
+// silently when called from cleanupOrphanedMounts.
 func (s *snapshotter) snapshotIDExists(ctx context.Context, targetID string) bool {
 	var found bool
 	_ = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		return storage.WalkInfo(ctx, func(ctx context.Context, info snapshots.Info) error {
-			id, _, _, err := storage.GetInfo(ctx, info.Name)
-			if err != nil {
-				return nil //nolint:nilerr // intentionally continue walking on individual snapshot errors
-			}
-			if id == targetID {
-				found = true
-				return fmt.Errorf("found") // Stop walking
-			}
-			return nil
-		})
+		ids, err := storage.IDMap(ctx)
+		if err != nil {
+			return err
+		}
+		_, found = ids[targetID]
+		return nil
 	})
 	return found
 }
@@ -136,6 +135,13 @@ func isNotMountError(err error) bool {
 // 2. Stale mounts for existing snapshots (mounts left behind from previous runs)
 // Errors are logged but not returned since this is best-effort cleanup.
 // The function respects a timeout to avoid blocking indefinitely.
+//
+// IMPORTANT: This function uses storage.IDMap instead of storage.WalkInfo because
+// it runs with context.Background() which has no namespace. WalkInfo requires a
+// namespace context to enumerate snapshots correctly - without it, WalkInfo returns
+// zero results, causing all directories to be incorrectly flagged as orphans.
+// IDMap works without namespace context and returns all snapshot IDs across all
+// namespaces, which is the correct behavior for orphan cleanup.
 func (s *snapshotter) cleanupOrphanedMounts() {
 	ctx, cancel := context.WithTimeout(context.Background(), orphanCleanupTimeout)
 	defer cancel()
@@ -147,20 +153,19 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 		return
 	}
 
-	// Get all valid snapshot IDs from metadata
+	// Get all valid snapshot IDs from metadata using IDMap.
+	// IDMap works without namespace context (unlike WalkInfo which requires it).
+	// This is critical because this function runs with context.Background().
 	validIDs := make(map[string]bool)
 	if err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		return storage.WalkInfo(ctx, func(ctx context.Context, info snapshots.Info) error {
-			// Get the snapshot ID from its key
-			id, _, _, err := storage.GetInfo(ctx, info.Name)
-			if err != nil {
-				// Log and continue walking even if one fails
-				log.L.WithError(err).WithField("key", info.Name).Debug("failed to get snapshot info during orphan cleanup")
-				return nil //nolint:nilerr // intentionally continue on error
-			}
+		ids, err := storage.IDMap(ctx)
+		if err != nil {
+			return fmt.Errorf("get snapshot ID map: %w", err)
+		}
+		for id := range ids {
 			validIDs[id] = true
-			return nil
-		})
+		}
+		return nil
 	}); err != nil {
 		log.L.WithError(err).Warn("failed to enumerate snapshots during orphan cleanup")
 		return
