@@ -444,6 +444,7 @@ start_containerd() {
     rm -f "${CONTAINERD_SOCKET}"
 
     containerd --config /etc/containerd/config.toml \
+        --log-level "${CONTAINERD_LOG_LEVEL:-info}" \
         > "${LOG_DIR}/containerd.log" 2>&1 &
 
     echo $! > /tmp/containerd.pid
@@ -475,7 +476,7 @@ start_snapshotter() {
         --address "${SNAPSHOTTER_SOCKET}" \
         --root "${SNAPSHOTTER_ROOT}" \
         --containerd-address "${CONTAINERD_SOCKET}" \
-        --log-level debug \
+        --log-level "${SNAPSHOTTER_LOG_LEVEL:-debug}" \
         > "${LOG_DIR}/snapshotter.log" 2>&1 &
 
     echo $! > /tmp/snapshotter.pid
@@ -711,6 +712,7 @@ TEST_DEPENDS[test_prepare_snapshot]="test_pull_image"
 TEST_DEPENDS[test_view_snapshot]="test_pull_image"
 TEST_DEPENDS[test_diff_service_erofs_mounts]="test_pull_image"
 TEST_DEPENDS[test_commit]="test_pull_image"
+TEST_DEPENDS[test_parallel_unpack_detection]="test_pull_image"
 TEST_DEPENDS[test_rwlayer_creation]="test_pull_image"
 TEST_DEPENDS[test_snapshot_cleanup]="test_pull_image"
 TEST_DEPENDS[test_vmdk_layer_order]="test_multi_layer"
@@ -766,6 +768,38 @@ test_pull_image() {
     assert_greater_than "$snap_count" 1 "Expected snapshots after pull" || return 1
 
     log_info "Image pulled successfully with $((snap_count - 1)) snapshots"
+}
+
+# =============================================================================
+# Test: test_parallel_unpack_detection
+# =============================================================================
+# Goal: Detect whether parallel unpack (rebase) is active during pulls and
+#       ensure commits are observed without parent-not-committed errors.
+#
+# Expectations:
+#   - If containerd logs show parallel=true, snapshotter logs should show commits
+#   - No "parent snapshot ... not committed yet" errors in snapshotter logs
+# =============================================================================
+test_parallel_unpack_detection() {
+    local containerd_log="${LOG_DIR}/containerd.log"
+    local snapshotter_log="${LOG_DIR}/snapshotter.log"
+
+    if ! grep -q "parallel=true" "${containerd_log}" 2>/dev/null; then
+        log_warn "Parallel unpack not detected (set CONTAINERD_LOG_LEVEL=debug to verify)"
+        return 0
+    fi
+
+    if grep -q "parent snapshot .* not committed yet" "${snapshotter_log}" 2>/dev/null; then
+        log_error "Parallel unpack saw parent-not-committed errors"
+        return 1
+    fi
+
+    if ! grep -q "snapshot committed" "${snapshotter_log}" 2>/dev/null; then
+        log_error "Parallel unpack detected but no snapshot commits seen"
+        return 1
+    fi
+
+    log_info "Parallel unpack detected; commits observed without parent errors"
 }
 
 # =============================================================================
@@ -2027,6 +2061,7 @@ test_full_cleanup_no_leaks() {
 # List of all tests in execution order
 ALL_TESTS=(
     test_pull_image
+    test_parallel_unpack_detection
     test_prepare_snapshot
     test_view_snapshot
     test_diff_service_erofs_mounts

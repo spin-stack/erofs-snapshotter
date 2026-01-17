@@ -24,14 +24,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
-	"time"
 
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/log"
-	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/moby/sys/mountinfo"
-	"golang.org/x/sync/semaphore"
 
 	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 	"github.com/spin-stack/erofs-snapshotter/internal/stringutil"
@@ -63,21 +60,6 @@ func WithDefaultSize(size int64) Opt {
 	}
 }
 
-// Configuration for resource limits.
-const (
-	// closeTimeout is the maximum time to wait for background operations during Close().
-	closeTimeout = 30 * time.Second
-
-	// maxConcurrentFsmeta limits concurrent fsmeta generation goroutines.
-	maxConcurrentFsmeta = 4
-
-	// layerCacheSize is the maximum number of layer blob paths to cache.
-	layerCacheSize = 10000
-
-	// layerCacheTTL is how long cached layer blob paths remain valid.
-	layerCacheTTL = 5 * time.Minute
-)
-
 type snapshotter struct {
 	root            string
 	ms              *storage.MetaStore
@@ -86,46 +68,6 @@ type snapshotter struct {
 
 	// bgWg tracks background operations (fsmeta generation) for clean shutdown.
 	bgWg sync.WaitGroup
-
-	// fsmetaSem limits concurrent fsmeta generation to prevent goroutine explosion.
-	fsmetaSem *semaphore.Weighted
-
-	// layerCache caches layer blob paths to avoid repeated filesystem lookups.
-	// Uses LRU with TTL to bound memory usage.
-	layerCache *expirable.LRU[string, string]
-
-	// keyLocks provides per-key mutual exclusion to serialize Commit and Remove
-	// operations on the same snapshot. This prevents race conditions where Remove
-	// deletes a snapshot's metadata while Commit is still processing it.
-	keyLocks keyLocker
-}
-
-// keyLocker provides per-key mutual exclusion using a striped lock approach.
-// Keys are hashed to one of a fixed number of mutexes to bound memory usage
-// while providing sufficient parallelism for different keys.
-type keyLocker struct {
-	locks [64]sync.Mutex
-}
-
-// lock acquires the mutex for the given key and returns an unlock function.
-func (kl *keyLocker) lock(key string) func() {
-	idx := keyHash(key) % uint32(len(kl.locks))
-	kl.locks[idx].Lock()
-	return func() { kl.locks[idx].Unlock() }
-}
-
-// keyHash computes a simple hash of the key string using FNV-1a.
-func keyHash(key string) uint32 {
-	const (
-		offset32 = 2166136261
-		prime32  = 16777619
-	)
-	h := uint32(offset32)
-	for i := range len(key) {
-		h ^= uint32(key[i])
-		h *= prime32
-	}
-	return h
 }
 
 // isMounted checks if a path is currently mounted.
@@ -156,7 +98,7 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		opt(&config)
 	}
 
-	if err := os.MkdirAll(root, 0o700); err != nil {
+	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, fmt.Errorf("create root directory %q: %w", root, err)
 	}
 
@@ -177,7 +119,7 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		return nil, fmt.Errorf("create metadata store: %w", err)
 	}
 
-	if err := os.Mkdir(filepath.Join(root, snapshotsDirName), 0o700); err != nil && !os.IsExist(err) {
+	if err := os.Mkdir(filepath.Join(root, snapshotsDirName), 0700); err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("create snapshots directory: %w", err)
 	}
 
@@ -186,36 +128,18 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		ms:              ms,
 		setImmutable:    config.setImmutable,
 		defaultWritable: config.defaultSize,
-		fsmetaSem:       semaphore.NewWeighted(maxConcurrentFsmeta),
-		layerCache:      expirable.NewLRU[string, string](layerCacheSize, nil, layerCacheTTL),
 	}
 
 	// Clean up any orphaned mounts from previous runs.
-	// Run synchronously to ensure cleanup completes before accepting operations.
-	// This prevents race conditions where cleanup might delete directories that
-	// are being created by concurrent Prepare operations.
-	s.cleanupOrphanedMounts()
+	s.cleanupOrphanedMounts() //nolint:contextcheck // startup cleanup uses background context
 
 	return s, nil
 }
 
 // Close releases all resources held by the snapshotter.
-// It waits up to closeTimeout for background operations (fsmeta generation) to complete.
+// It waits for any background operations (fsmeta generation) to complete.
 func (s *snapshotter) Close() error {
-	// Wait for background operations with timeout to prevent indefinite blocking.
-	done := make(chan struct{})
-	go func() {
-		s.bgWg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// All background work completed normally.
-	case <-time.After(closeTimeout):
-		log.L.Warn("close timed out waiting for background operations")
-	}
-
+	s.bgWg.Wait() // Wait for background operations to complete
 	s.cleanupBlockMounts()
 	return s.ms.Close()
 }
@@ -246,7 +170,7 @@ func (s *snapshotter) prepareDirectory(snapshotDir string, kind snapshots.Kind) 
 		return "", fmt.Errorf("create temp dir: %w", err)
 	}
 
-	if err := os.Mkdir(filepath.Join(td, fsDirName), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(td, fsDirName), 0755); err != nil {
 		return td, err
 	}
 	if kind == snapshots.KindActive {
@@ -282,13 +206,6 @@ func (s *snapshotter) createWritableLayer(ctx context.Context, id string) error 
 	if out, err := cmd.CombinedOutput(); err != nil {
 		os.Remove(path)
 		return fmt.Errorf("format ext4: %w: %s", err, stringutil.TruncateOutput(out, 256))
-	}
-
-	// Ensure the formatted ext4 image is durable on disk.
-	// Without fsync, a system crash could leave the file corrupt or incomplete.
-	if err := syncFile(path); err != nil {
-		os.Remove(path)
-		return fmt.Errorf("sync writable layer: %w", err)
 	}
 
 	log.G(ctx).WithField("path", path).WithField("size", size).Debug("created writable layer")

@@ -223,30 +223,31 @@ func TestSnapshotterOptions(t *testing.T) {
 			t.Errorf("expected defaultSize to be 100MB, got %d", config.defaultSize)
 		}
 	})
+
 }
 
-func TestFsmetaMountReturnsFormatErofs(t *testing.T) {
-	// This test verifies that fsmetaMount returns "format/erofs" type for multi-device mounts.
+func TestMountFsMetaReturnsFormatErofs(t *testing.T) {
+	// This test verifies that mountFsMeta returns "format/erofs" type for multi-device mounts.
 	// The format/ prefix signals that containerd's standard mount manager cannot handle this type,
 	// providing a clear "unsupported mount type" error instead of cryptic EINVAL.
 
 	root := t.TempDir()
-	s := newTestSnapshotterWithRoot(t, root)
+	s := &snapshotter{root: root}
 
 	// Create fake snapshot directories with fsmeta and vmdk files
 	snapshotDir := filepath.Join(root, "snapshots", "parent1")
-	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
-	// Create required files for fsmetaMount to succeed
+	// Create required files for mountFsMeta to succeed
 	// Use digest-based naming for layer file (as the differ now creates)
 	vmdkPath := filepath.Join(snapshotDir, "merged.vmdk")
 	fsmetaPath := filepath.Join(snapshotDir, "fsmeta.erofs")
 	layerPath := filepath.Join(snapshotDir, "sha256-a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4.erofs")
 
 	for _, path := range []string{vmdkPath, fsmetaPath, layerPath} {
-		if err := os.WriteFile(path, []byte("fake"), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte("fake"), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -257,23 +258,19 @@ func TestFsmetaMountReturnsFormatErofs(t *testing.T) {
 		ParentIDs: []string{"parent1"},
 	}
 
-	mounts, err := s.fsmetaMount(snap)
-	if err != nil {
-		t.Fatalf("fsmetaMount should succeed when fsmeta/vmdk exist: %v", err)
+	mount, ok := s.mountFsMeta(snap)
+	if !ok {
+		t.Fatal("mountFsMeta should return true when fsmeta/vmdk exist")
 	}
-	if len(mounts) != 1 {
-		t.Fatalf("fsmetaMount should return 1 mount, got %d", len(mounts))
-	}
-	mount := mounts[0]
 
 	// Verify mount type is "format/erofs" (not "erofs")
 	if mount.Type != "format/erofs" {
-		t.Errorf("fsmetaMount returned Type=%q, want %q", mount.Type, "format/erofs")
+		t.Errorf("mountFsMeta returned Type=%q, want %q", mount.Type, "format/erofs")
 	}
 
 	// Verify source points to fsmeta.erofs
 	if mount.Source != fsmetaPath {
-		t.Errorf("fsmetaMount returned Source=%q, want %q", mount.Source, fsmetaPath)
+		t.Errorf("mountFsMeta returned Source=%q, want %q", mount.Source, fsmetaPath)
 	}
 
 	// Verify options include device= for parent layer
@@ -285,17 +282,17 @@ func TestFsmetaMountReturnsFormatErofs(t *testing.T) {
 		}
 	}
 	if !hasDevice {
-		t.Errorf("fsmetaMount should include device= option for parent layer, got: %v", mount.Options)
+		t.Errorf("mountFsMeta should include device= option for parent layer, got: %v", mount.Options)
 	}
 }
 
-func TestFsmetaMountDeviceOrder(t *testing.T) {
-	// This test verifies that fsmetaMount returns device= options in oldest-first order,
+func TestMountFsMetaDeviceOrder(t *testing.T) {
+	// This test verifies that mountFsMeta returns device= options in oldest-first order,
 	// matching containerd's approach (backward iteration through ParentIDs).
 	// See: https://github.com/containerd/containerd/pull/12374
 
 	root := t.TempDir()
-	s := newTestSnapshotterWithRoot(t, root)
+	s := &snapshotter{root: root}
 
 	// Create 3 parent snapshot directories with layer blobs
 	// ParentIDs order: [parent3, parent2, parent1] (newest to oldest, as containerd provides)
@@ -306,12 +303,12 @@ func TestFsmetaMountDeviceOrder(t *testing.T) {
 	layerPaths := make(map[string]string)
 	for _, pid := range parentIDs {
 		snapshotDir := filepath.Join(root, "snapshots", pid)
-		if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 			t.Fatal(err)
 		}
 		// Use digest-based layer names (64 hex chars required)
 		layerPath := filepath.Join(snapshotDir, "sha256-"+pid+pid+pid+pid+pid+pid+pid+pid+".erofs")
-		if err := os.WriteFile(layerPath, []byte("fake"), 0o644); err != nil {
+		if err := os.WriteFile(layerPath, []byte("fake"), 0644); err != nil {
 			t.Fatal(err)
 		}
 		layerPaths[pid] = layerPath
@@ -330,7 +327,7 @@ func TestFsmetaMountDeviceOrder(t *testing.T) {
 	vmdkPath := filepath.Join(newestDir, "merged.vmdk")
 	fsmetaPath := filepath.Join(newestDir, "fsmeta.erofs")
 	for _, path := range []string{vmdkPath, fsmetaPath} {
-		if err := os.WriteFile(path, []byte("fake"), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte("fake"), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -341,14 +338,10 @@ func TestFsmetaMountDeviceOrder(t *testing.T) {
 		ParentIDs: parentIDs,
 	}
 
-	mounts, err := s.fsmetaMount(snap)
-	if err != nil {
-		t.Fatalf("fsmetaMount should succeed when fsmeta/vmdk exist: %v", err)
+	mount, ok := s.mountFsMeta(snap)
+	if !ok {
+		t.Fatal("mountFsMeta should return true when fsmeta/vmdk exist")
 	}
-	if len(mounts) != 1 {
-		t.Fatalf("fsmetaMount should return 1 mount, got %d", len(mounts))
-	}
-	mount := mounts[0]
 
 	// Extract device= options from mount.Options
 	var deviceOpts []string
@@ -373,7 +366,7 @@ func TestFsmetaMountDeviceOrder(t *testing.T) {
 
 func TestSnapshotterPaths(t *testing.T) {
 	root := "/var/lib/containerd/io.containerd.snapshotter.v1.erofs"
-	s := newTestSnapshotterWithRoot(t, root)
+	s := &snapshotter{root: root}
 
 	t.Run("viewLowerPath", func(t *testing.T) {
 		got := s.viewLowerPath("123")

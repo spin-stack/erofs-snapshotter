@@ -21,8 +21,6 @@ package grpcservice
 
 import (
 	"context"
-	"strconv"
-	"strings"
 
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
 	"github.com/containerd/containerd/v2/core/mount"
@@ -49,52 +47,30 @@ func FromSnapshotter(sn snapshots.Snapshotter) snapshotsapi.SnapshotsServer {
 	return &service{sn: sn}
 }
 
-// normalizeProxyKey strips the proxy prefix "namespace/txID/" when present.
-// Containerd's snapshotter proxy injects a transaction ID that changes across
-// calls; we must normalize to the stable snapshot name for cross-call lookups.
-func normalizeProxyKey(namespace, key string) string {
-	if key == "" {
-		return key
-	}
-	parts := strings.SplitN(key, "/", 3)
-	if len(parts) != 3 {
-		return key
-	}
-	if _, err := strconv.Atoi(parts[1]); err != nil {
-		return key
-	}
-	if namespace != "" && parts[0] != namespace {
-		return key
-	}
-	return parts[2]
-}
-
 func (s *service) Prepare(ctx context.Context, pr *snapshotsapi.PrepareSnapshotRequest) (*snapshotsapi.PrepareSnapshotResponse, error) {
 	ns, _ := namespaces.Namespace(ctx)
-	key := normalizeProxyKey(ns, pr.Key)
-	parent := normalizeProxyKey(ns, pr.Parent)
 	log.G(ctx).WithFields(log.Fields{
 		"namespace": ns,
-		"key":       key,
-		"parent":    parent,
+		"key":       pr.Key,
+		"parent":    pr.Parent,
 	}).Debug("grpc: received prepare request")
 
 	var opts []snapshots.Opt
 	if pr.Labels != nil {
 		opts = append(opts, snapshots.WithLabels(pr.Labels))
 	}
-	mounts, err := s.sn.Prepare(ctx, key, parent, opts...)
+	mounts, err := s.sn.Prepare(ctx, pr.Key, pr.Parent, opts...)
 	if err != nil {
 		log.G(ctx).WithError(err).WithFields(log.Fields{
 			"namespace": ns,
-			"key":       key,
+			"key":       pr.Key,
 		}).Debug("grpc: prepare failed")
 		return nil, errgrpc.ToGRPC(err)
 	}
 
 	log.G(ctx).WithFields(log.Fields{
 		"namespace":   ns,
-		"key":         key,
+		"key":         pr.Key,
 		"mount_count": len(mounts),
 	}).Debug("grpc: prepare succeeded")
 
@@ -104,14 +80,11 @@ func (s *service) Prepare(ctx context.Context, pr *snapshotsapi.PrepareSnapshotR
 }
 
 func (s *service) View(ctx context.Context, pr *snapshotsapi.ViewSnapshotRequest) (*snapshotsapi.ViewSnapshotResponse, error) {
-	ns, _ := namespaces.Namespace(ctx)
-	key := normalizeProxyKey(ns, pr.Key)
-	parent := normalizeProxyKey(ns, pr.Parent)
 	var opts []snapshots.Opt
 	if pr.Labels != nil {
 		opts = append(opts, snapshots.WithLabels(pr.Labels))
 	}
-	mounts, err := s.sn.View(ctx, key, parent, opts...)
+	mounts, err := s.sn.View(ctx, pr.Key, pr.Parent, opts...)
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
@@ -121,9 +94,7 @@ func (s *service) View(ctx context.Context, pr *snapshotsapi.ViewSnapshotRequest
 }
 
 func (s *service) Mounts(ctx context.Context, mr *snapshotsapi.MountsRequest) (*snapshotsapi.MountsResponse, error) {
-	ns, _ := namespaces.Namespace(ctx)
-	key := normalizeProxyKey(ns, mr.Key)
-	mounts, err := s.sn.Mounts(ctx, key)
+	mounts, err := s.sn.Mounts(ctx, mr.Key)
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
@@ -134,19 +105,11 @@ func (s *service) Mounts(ctx context.Context, mr *snapshotsapi.MountsRequest) (*
 
 func (s *service) Commit(ctx context.Context, cr *snapshotsapi.CommitSnapshotRequest) (*ptypes.Empty, error) {
 	ns, _ := namespaces.Namespace(ctx)
-	name := normalizeProxyKey(ns, cr.Name)
-	key := normalizeProxyKey(ns, cr.Key)
-	parent := normalizeProxyKey(ns, cr.Parent)
-	// Log immediately at handler entry to diagnose if we're even reaching here
-	log.L.WithFields(log.Fields{
-		"name": name,
-		"key":  key,
-	}).Debug("grpc: commit handler entry")
 	log.G(ctx).WithFields(log.Fields{
 		"namespace": ns,
-		"name":      name,
-		"key":       key,
-		"parent":    parent,
+		"name":      cr.Name,
+		"key":       cr.Key,
+		"parent":    cr.Parent,
 	}).Debug("grpc: received commit request")
 
 	var opts []snapshots.Opt
@@ -156,72 +119,49 @@ func (s *service) Commit(ctx context.Context, cr *snapshotsapi.CommitSnapshotReq
 	// FIX: Pass Parent field for rebase support (missing in contrib/snapshotservice)
 	// This is required for parallel layer unpacking with the "rebase" capability.
 	// See: https://github.com/containerd/containerd/issues/8881
-	if parent != "" {
-		opts = append(opts, snapshots.WithParent(parent))
+	if cr.Parent != "" {
+		opts = append(opts, snapshots.WithParent(cr.Parent))
 	}
-
-	log.G(ctx).WithFields(log.Fields{
-		"namespace": ns,
-		"key":       key,
-	}).Debug("grpc: commit calling snapshotter")
-
-	if err := s.sn.Commit(ctx, name, key, opts...); err != nil {
+	if err := s.sn.Commit(ctx, cr.Name, cr.Key, opts...); err != nil {
 		log.G(ctx).WithError(err).WithFields(log.Fields{
 			"namespace": ns,
-			"name":      name,
-			"key":       key,
+			"name":      cr.Name,
+			"key":       cr.Key,
 		}).Debug("grpc: commit failed")
 		return nil, errgrpc.ToGRPC(err)
 	}
 
 	log.G(ctx).WithFields(log.Fields{
 		"namespace": ns,
-		"name":      name,
-		"key":       key,
+		"name":      cr.Name,
+		"key":       cr.Key,
 	}).Debug("grpc: commit succeeded")
 
 	return empty, nil
 }
 
 func (s *service) Remove(ctx context.Context, rr *snapshotsapi.RemoveSnapshotRequest) (*ptypes.Empty, error) {
-	ns, _ := namespaces.Namespace(ctx)
-	key := normalizeProxyKey(ns, rr.Key)
-	log.G(ctx).WithFields(log.Fields{
-		"namespace": ns,
-		"key":       key,
-	}).Debug("grpc: received remove request")
-
-	if err := s.sn.Remove(ctx, key); err != nil {
-		log.G(ctx).WithError(err).WithFields(log.Fields{
-			"namespace": ns,
-			"key":       key,
-		}).Debug("grpc: remove failed")
+	if err := s.sn.Remove(ctx, rr.Key); err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
-
-	log.G(ctx).WithFields(log.Fields{
-		"namespace": ns,
-		"key":       key,
-	}).Debug("grpc: remove succeeded")
 
 	return empty, nil
 }
 
 func (s *service) Stat(ctx context.Context, sr *snapshotsapi.StatSnapshotRequest) (*snapshotsapi.StatSnapshotResponse, error) {
 	ns, _ := namespaces.Namespace(ctx)
-	key := normalizeProxyKey(ns, sr.Key)
-	info, err := s.sn.Stat(ctx, key)
+	info, err := s.sn.Stat(ctx, sr.Key)
 	if err != nil {
 		log.G(ctx).WithError(err).WithFields(log.Fields{
 			"namespace": ns,
-			"key":       key,
+			"key":       sr.Key,
 		}).Debug("grpc: stat failed")
 		return nil, errgrpc.ToGRPC(err)
 	}
 
 	log.G(ctx).WithFields(log.Fields{
 		"namespace": ns,
-		"key":       key,
+		"key":       sr.Key,
 		"kind":      info.Kind,
 	}).Debug("grpc: stat succeeded")
 
@@ -229,11 +169,7 @@ func (s *service) Stat(ctx context.Context, sr *snapshotsapi.StatSnapshotRequest
 }
 
 func (s *service) Update(ctx context.Context, sr *snapshotsapi.UpdateSnapshotRequest) (*snapshotsapi.UpdateSnapshotResponse, error) {
-	ns, _ := namespaces.Namespace(ctx)
-	info := proxy.InfoFromProto(sr.Info)
-	info.Name = normalizeProxyKey(ns, info.Name)
-	info.Parent = normalizeProxyKey(ns, info.Parent)
-	info, err := s.sn.Update(ctx, info, sr.UpdateMask.GetPaths()...)
+	info, err := s.sn.Update(ctx, proxy.InfoFromProto(sr.Info), sr.UpdateMask.GetPaths()...)
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
@@ -274,12 +210,11 @@ func (s *service) List(sr *snapshotsapi.ListSnapshotsRequest, ss snapshotsapi.Sn
 	}
 
 	return nil
+
 }
 
 func (s *service) Usage(ctx context.Context, ur *snapshotsapi.UsageRequest) (*snapshotsapi.UsageResponse, error) {
-	ns, _ := namespaces.Namespace(ctx)
-	key := normalizeProxyKey(ns, ur.Key)
-	usage, err := s.sn.Usage(ctx, key)
+	usage, err := s.sn.Usage(ctx, ur.Key)
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}

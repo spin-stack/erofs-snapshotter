@@ -173,6 +173,14 @@ DOCKER_OPTS=(
     --tmpfs /var/lib/spin-stack:exec
 )
 
+# Pass through log levels if set
+if [[ -n "${CONTAINERD_LOG_LEVEL:-}" ]]; then
+    DOCKER_OPTS+=(-e CONTAINERD_LOG_LEVEL="${CONTAINERD_LOG_LEVEL}")
+fi
+if [[ -n "${SNAPSHOTTER_LOG_LEVEL:-}" ]]; then
+    DOCKER_OPTS+=(-e SNAPSHOTTER_LOG_LEVEL="${SNAPSHOTTER_LOG_LEVEL}")
+fi
+
 # Mount Docker credentials if available
 if [[ -f "${HOME}/.docker/config.json" ]]; then
     DOCKER_OPTS+=(-v "${HOME}/.docker/config.json:/root/.docker/config.json:ro")

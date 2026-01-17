@@ -22,11 +22,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
-	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/log"
@@ -40,10 +39,6 @@ import (
 // An ext4 image file of this size is created and loop-mounted for each
 // active snapshot's writable layer.
 const defaultWritableSize = 64 * 1024 * 1024 // 64 MiB
-
-// orphanCleanupTimeout is the maximum time allowed for orphan cleanup at startup.
-// If cleanup takes longer than this, it will be aborted to prevent blocking forever.
-const orphanCleanupTimeout = 30 * time.Second
 
 func checkCompatibility(root string) error {
 	// Check kernel version and EROFS support via preflight
@@ -99,29 +94,6 @@ func syncFile(path string) error {
 	return f.Sync()
 }
 
-// snapshotIDExists checks if a snapshot with the given internal ID exists in metadata.
-// This is used for TOCTOU protection during orphan cleanup.
-//
-// IMPORTANT: This function uses storage.IDMap which works without a namespace context,
-// making it safe to call from background goroutines that don't have namespace metadata.
-// Do NOT use storage.WalkInfo here as it requires namespace context and would fail
-// silently when called from cleanupOrphanedMounts.
-func (s *snapshotter) snapshotIDExists(ctx context.Context, targetID string) bool {
-	var found bool
-	_ = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		ids, err := storage.IDMap(ctx)
-		if err != nil {
-			// "bucket does not exist" means empty database - no snapshots exist.
-			// This is expected on first startup, so we intentionally return nil
-			// to treat it as "snapshot not found" rather than propagating the error.
-			return nil //nolint:nilerr // intentional: empty DB means no snapshots
-		}
-		_, found = ids[targetID]
-		return nil
-	})
-	return found
-}
-
 // isNotMountError returns true if the error indicates the target was not mounted.
 // These errors are expected during cleanup when the path was never mounted.
 func isNotMountError(err error) bool {
@@ -138,18 +110,7 @@ func isNotMountError(err error) bool {
 // 1. Orphaned snapshot directories (on disk but not in metadata) - unmount and remove
 // 2. Stale mounts for existing snapshots (mounts left behind from previous runs)
 // Errors are logged but not returned since this is best-effort cleanup.
-// The function respects a timeout to avoid blocking indefinitely.
-//
-// IMPORTANT: This function uses storage.IDMap instead of storage.WalkInfo because
-// it runs with context.Background() which has no namespace. WalkInfo requires a
-// namespace context to enumerate snapshots correctly - without it, WalkInfo returns
-// zero results, causing all directories to be incorrectly flagged as orphans.
-// IDMap works without namespace context and returns all snapshot IDs across all
-// namespaces, which is the correct behavior for orphan cleanup.
 func (s *snapshotter) cleanupOrphanedMounts() {
-	ctx, cancel := context.WithTimeout(context.Background(), orphanCleanupTimeout)
-	defer cancel()
-
 	snapshotsDir := filepath.Join(s.root, "snapshots")
 	entries, err := os.ReadDir(snapshotsDir)
 	if err != nil {
@@ -157,46 +118,31 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 		return
 	}
 
-	// Get all valid snapshot IDs from metadata using IDMap.
-	// IDMap works without namespace context (unlike WalkInfo which requires it).
-	// This is critical because this function runs with context.Background().
+	// Get all valid snapshot IDs from metadata
 	validIDs := make(map[string]bool)
+	ctx := context.Background()
 	if err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		ids, err := storage.IDMap(ctx)
-		if err != nil {
-			// "bucket does not exist" means empty database - no snapshots exist yet.
-			// This is expected on first startup, so treat it as empty validIDs.
-			log.L.WithError(err).Debug("no snapshots in metadata (empty database)")
-			return nil
-		}
-		for id := range ids {
+		return storage.WalkInfo(ctx, func(ctx context.Context, info snapshots.Info) error {
+			// Get the snapshot ID from its key
+			id, _, _, err := storage.GetInfo(ctx, info.Name)
+			if err != nil {
+				// Log and continue walking even if one fails
+				log.L.WithError(err).WithField("key", info.Name).Debug("failed to get snapshot info during orphan cleanup")
+				return nil //nolint:nilerr // intentionally continue on error
+			}
 			validIDs[id] = true
-		}
-		return nil
+			return nil
+		})
 	}); err != nil {
 		log.L.WithError(err).Warn("failed to enumerate snapshots during orphan cleanup")
 		return
 	}
 
 	for _, entry := range entries {
-		// Check for timeout/cancellation
-		if ctx.Err() != nil {
-			log.L.Warn("orphan cleanup timed out, aborting")
-			return
-		}
-
 		if !entry.IsDir() {
 			continue
 		}
 		id := entry.Name()
-
-		// Skip "new-*" directories - these are temporary work directories created by
-		// Prepare() that haven't been renamed yet. They're not orphans, just in-progress
-		// operations that may complete at any moment.
-		if strings.HasPrefix(id, "new-") {
-			continue
-		}
-
 		snapshotDir := filepath.Join(snapshotsDir, id)
 
 		if !validIDs[id] {
@@ -211,19 +157,7 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 
 			// Clear immutable flag if present
 			layerBlob := filepath.Join(snapshotDir, "layer.erofs")
-			if err := setImmutable(layerBlob, false); err != nil && !os.IsNotExist(err) {
-				log.L.WithError(err).WithField("path", layerBlob).Debug("failed to clear immutable flag during orphan cleanup")
-			}
-
-			// TOCTOU protection: double-check this snapshot wasn't just created
-			// between our initial scan and now. This prevents a race where:
-			// 1. We scan metadata and don't see snapshot X
-			// 2. Commit() creates snapshot X and adds to metadata
-			// 3. We delete X, causing data loss
-			if s.snapshotIDExists(ctx, id) {
-				log.L.WithField("id", id).Debug("snapshot appeared in metadata during cleanup, skipping removal")
-				continue
-			}
+			_ = setImmutable(layerBlob, false)
 
 			// Remove the entire directory
 			if err := os.RemoveAll(snapshotDir); err != nil {
@@ -329,7 +263,7 @@ func (s *snapshotter) mountBlockRwLayer(ctx context.Context, id string) error {
 	rwMountPath := s.blockRwMountPath(id)
 
 	// Create mount point
-	if err := os.MkdirAll(rwMountPath, 0o755); err != nil {
+	if err := os.MkdirAll(rwMountPath, 0755); err != nil {
 		return fmt.Errorf("failed to create rw mount point: %w", err)
 	}
 
@@ -347,17 +281,13 @@ func (s *snapshotter) mountBlockRwLayer(ctx context.Context, id string) error {
 	upperDir := s.blockUpperPath(id)
 	workDir := filepath.Join(s.blockRwMountPath(id), "work")
 
-	if err := os.MkdirAll(upperDir, 0o755); err != nil {
-		// Cleanup mount on failure - log if unmount also fails
-		if derr := unmountAll(rwMountPath); derr != nil && !isNotMountError(derr) {
-			log.G(ctx).WithError(derr).WithField("path", rwMountPath).Debug("cleanup unmount failed after upper dir creation error")
-		}
+	if err := os.MkdirAll(upperDir, 0755); err != nil {
+		// Cleanup mount on failure
+		_ = unmountAll(rwMountPath)
 		return fmt.Errorf("failed to create upper directory: %w", err)
 	}
-	if err := os.MkdirAll(workDir, 0o755); err != nil {
-		if derr := unmountAll(rwMountPath); derr != nil && !isNotMountError(derr) {
-			log.G(ctx).WithError(derr).WithField("path", rwMountPath).Debug("cleanup unmount failed after work dir creation error")
-		}
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		_ = unmountAll(rwMountPath)
 		return fmt.Errorf("failed to create work directory: %w", err)
 	}
 

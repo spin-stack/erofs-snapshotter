@@ -14,9 +14,9 @@ import (
 // Note: We use errors.As (not errors.Is) for structural error types per Go idioms.
 func TestLayerBlobNotFoundErrorAs(t *testing.T) {
 	err := &LayerBlobNotFoundError{
-		ID:       "test-123",
-		Dir:      "/test/path",
-		Searched: []string{"*.erofs"},
+		SnapshotID: "test-123",
+		Dir:        "/test/path",
+		Searched:   []string{"*.erofs"},
 	}
 
 	// Test errors.As for type-based matching
@@ -24,24 +24,23 @@ func TestLayerBlobNotFoundErrorAs(t *testing.T) {
 	if !errors.As(err, &target) {
 		t.Error("errors.As should match LayerBlobNotFoundError")
 	}
-	if target.ID != "test-123" {
-		t.Errorf("expected snapshot ID test-123, got %s", target.ID)
+	if target.SnapshotID != "test-123" {
+		t.Errorf("expected snapshot ID test-123, got %s", target.SnapshotID)
 	}
 
 	// Test that wrapped error can be unwrapped with errors.As
 	wrapped := &CommitConversionError{
-		ID:       "commit-test",
-		UpperDir: "/upper",
-		Mode:     CommitModeOverlay,
-		Cause:    err,
+		SnapshotID: "commit-test",
+		UpperDir:   "/upper",
+		Cause:      err,
 	}
 
 	var wrappedTarget *LayerBlobNotFoundError
 	if !errors.As(wrapped, &wrappedTarget) {
 		t.Error("errors.As should find LayerBlobNotFoundError in chain")
 	}
-	if wrappedTarget.ID != "test-123" {
-		t.Errorf("expected snapshot ID test-123, got %s", wrappedTarget.ID)
+	if wrappedTarget.SnapshotID != "test-123" {
+		t.Errorf("expected snapshot ID test-123, got %s", wrappedTarget.SnapshotID)
 	}
 }
 
@@ -50,10 +49,9 @@ func TestErrorChainDepth(t *testing.T) {
 	// Create a 2-level error chain
 	level1 := errors.New("root cause: filesystem full")
 	level2 := &CommitConversionError{
-		ID:       "snap-abc",
-		UpperDir: "/var/lib/snapshotter/abc/upper",
-		Mode:     CommitModeBlock,
-		Cause:    level1,
+		SnapshotID: "snap-abc",
+		UpperDir:   "/var/lib/snapshotter/abc/upper",
+		Cause:      level1,
 	}
 
 	// Should find root cause
@@ -86,11 +84,11 @@ func TestReverseStringsEmpty(t *testing.T) {
 // TestFindLayerBlobNotFound verifies findLayerBlob returns correct error type.
 func TestFindLayerBlobNotFound(t *testing.T) {
 	root := t.TempDir()
-	s := newTestSnapshotterWithRoot(t, root)
+	s := &snapshotter{root: root}
 
 	// Create empty snapshot directory
 	snapshotDir := filepath.Join(root, "snapshots", "missing-blob")
-	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -106,8 +104,8 @@ func TestFindLayerBlobNotFound(t *testing.T) {
 		t.Errorf("expected LayerBlobNotFoundError, got %T: %v", err, err)
 	}
 
-	if notFoundErr.ID != "missing-blob" {
-		t.Errorf("expected snapshot ID 'missing-blob', got %q", notFoundErr.ID)
+	if notFoundErr.SnapshotID != "missing-blob" {
+		t.Errorf("expected snapshot ID 'missing-blob', got %q", notFoundErr.SnapshotID)
 	}
 
 	if len(notFoundErr.Searched) == 0 {
@@ -118,17 +116,17 @@ func TestFindLayerBlobNotFound(t *testing.T) {
 // TestFindLayerBlobDigestNaming verifies digest-based blob naming works.
 func TestFindLayerBlobDigestNaming(t *testing.T) {
 	root := t.TempDir()
-	s := newTestSnapshotterWithRoot(t, root)
+	s := &snapshotter{root: root}
 
 	// Create snapshot directory with digest-based layer blob
 	snapshotDir := filepath.Join(root, "snapshots", "digest-test")
-	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
 	// Create digest-named layer blob (64 hex chars for sha256)
 	digestBlob := filepath.Join(snapshotDir, "sha256-a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4.erofs")
-	if err := os.WriteFile(digestBlob, []byte("fake erofs"), 0o644); err != nil {
+	if err := os.WriteFile(digestBlob, []byte("fake erofs"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -146,17 +144,17 @@ func TestFindLayerBlobDigestNaming(t *testing.T) {
 // TestFindLayerBlobFallbackNaming verifies fallback naming works.
 func TestFindLayerBlobFallbackNaming(t *testing.T) {
 	root := t.TempDir()
-	s := newTestSnapshotterWithRoot(t, root)
+	s := &snapshotter{root: root}
 
 	// Create snapshot directory with fallback-named layer blob
 	snapshotDir := filepath.Join(root, "snapshots", "fallback-test")
-	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
 	// Create fallback-named layer blob
 	fallbackBlob := filepath.Join(snapshotDir, "snapshot-fallback-test.erofs")
-	if err := os.WriteFile(fallbackBlob, []byte("fake erofs"), 0o644); err != nil {
+	if err := os.WriteFile(fallbackBlob, []byte("fake erofs"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -174,11 +172,11 @@ func TestFindLayerBlobFallbackNaming(t *testing.T) {
 // TestFindLayerBlobDigestPriority verifies digest-based naming takes priority.
 func TestFindLayerBlobDigestPriority(t *testing.T) {
 	root := t.TempDir()
-	s := newTestSnapshotterWithRoot(t, root)
+	s := &snapshotter{root: root}
 
 	// Create snapshot directory with both naming styles
 	snapshotDir := filepath.Join(root, "snapshots", "priority-test")
-	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -187,7 +185,7 @@ func TestFindLayerBlobDigestPriority(t *testing.T) {
 	fallbackBlob := filepath.Join(snapshotDir, "snapshot-priority-test.erofs")
 
 	for _, blob := range []string{digestBlob, fallbackBlob} {
-		if err := os.WriteFile(blob, []byte("fake erofs"), 0o644); err != nil {
+		if err := os.WriteFile(blob, []byte("fake erofs"), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -368,7 +366,7 @@ func TestCleanupRemovesOrphanedDirectories(t *testing.T) {
 
 	// Create an orphaned directory (not in metadata)
 	orphanDir := filepath.Join(root, "snapshots", "orphan-123")
-	if err := os.MkdirAll(orphanDir, 0o755); err != nil {
+	if err := os.MkdirAll(orphanDir, 0755); err != nil {
 		t.Fatalf("create orphan dir: %v", err)
 	}
 

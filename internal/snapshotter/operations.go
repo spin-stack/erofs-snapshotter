@@ -19,43 +19,9 @@ import (
 	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 )
 
-// ParentNotCommittedError is returned when a parent snapshot is referenced
-// but hasn't been committed yet. This can happen during parallel layer unpacking
-// when a child layer's Prepare is called before the parent layer's Commit completes.
-// Containerd's unpack logic handles this by retrying with proper ordering.
-type ParentNotCommittedError struct {
-	Parent string
-}
-
-func (e *ParentNotCommittedError) Error() string {
-	return fmt.Sprintf("parent snapshot %q not committed yet", e.Parent)
-}
-
-// Is implements errors.Is for ParentNotCommittedError.
-// Returns true for errdefs.ErrNotFound so containerd's retry logic handles it.
-func (e *ParentNotCommittedError) Is(target error) bool {
-	return errdefs.IsNotFound(target)
-}
-
 // fsmetaTimeout is the maximum time allowed for fsmeta generation.
 // This includes reading layer blobs and running mkfs.erofs.
 const fsmetaTimeout = 5 * time.Minute
-
-const (
-	// parentWaitTimeout is the maximum time to wait for a parent snapshot
-	// to be committed during parallel layer unpacking.
-	// Keep this very short - we just do a few quick retries to handle
-	// the common case where the parent commit is in-flight and finishes quickly.
-	// If the parent isn't ready, return an error and let containerd retry.
-	// A long timeout here can block the gRPC handler, potentially causing
-	// request queuing issues that prevent other operations (like Commit) from running.
-	parentWaitTimeout = 500 * time.Millisecond
-	// parentWaitInterval is the initial interval between checks for parent existence.
-	// Start with a very short interval since most parents are ready quickly.
-	parentWaitInterval = 10 * time.Millisecond
-	// parentWaitMaxInterval is the maximum interval between checks.
-	parentWaitMaxInterval = 100 * time.Millisecond
-)
 
 // isExtractKey returns true if the key indicates an extract/unpack operation.
 // Snapshot keys use forward slashes as separators (e.g., "default/1/extract-12345"),
@@ -71,7 +37,7 @@ func isExtractKey(key string) bool {
 // The marker file is checked by erofs.MountsToLayer() in the EROFS differ
 // to validate that a directory is a genuine EROFS snapshotter layer.
 func ensureMarkerFile(path string) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		if os.IsExist(err) {
 			return nil // File already exists
@@ -92,139 +58,6 @@ func checkContext(ctx context.Context, operation string) error {
 	return nil
 }
 
-// startFsmetaGeneration spawns a background goroutine to generate fsmeta for multi-layer images.
-// The goroutine acquires a semaphore to limit concurrent generations and uses an independent
-// context with timeout to allow completion even if the original request is cancelled.
-func (s *snapshotter) startFsmetaGeneration(parentIDs []string) {
-	s.bgWg.Add(1)
-	//nolint:contextcheck // intentionally using fresh context with timeout for background work
-	go func(ids []string) {
-		defer s.bgWg.Done()
-		// Panic recovery prevents Close() from hanging forever if goroutine panics.
-		defer func() {
-			if r := recover(); r != nil {
-				log.L.WithField("panic", r).Error("fsmeta generation panic recovered")
-			}
-		}()
-
-		bgCtx, cancel := context.WithTimeout(context.Background(), fsmetaTimeout)
-		defer cancel()
-
-		// Acquire semaphore to limit concurrent fsmeta generations.
-		if err := s.fsmetaSem.Acquire(bgCtx, 1); err != nil {
-			return // Context cancelled or timed out waiting for semaphore
-		}
-		defer s.fsmetaSem.Release(1)
-
-		s.generateFsMeta(bgCtx, ids)
-	}(parentIDs)
-}
-
-// waitForParent waits briefly for a parent snapshot to exist in metadata.
-// This handles the race condition during parallel layer unpacking where a child
-// layer's Prepare is called before the parent layer's Commit completes.
-//
-// IMPORTANT: Keep this timeout very short (500ms). If the parent isn't ready,
-// return an error immediately and let containerd's retry logic handle it.
-// A long timeout here blocks the gRPC handler, which can cause request queuing
-// issues that prevent the parent's Commit from being processed (deadlock).
-//
-// Uses exponential backoff starting from a short interval (10ms) since most
-// parents are ready quickly when the commit is genuinely in-flight.
-func (s *snapshotter) waitForParent(ctx context.Context, parent string) error {
-	// Fast path: check if parent already exists
-	if s.snapshotExists(ctx, parent) {
-		return nil
-	}
-
-	log.G(ctx).WithField("parent", parent).Debug("parent not found, brief wait before returning error")
-
-	deadline := time.Now().Add(parentWaitTimeout)
-	interval := parentWaitInterval
-	attempts := 0
-
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(interval):
-			attempts++
-			if s.snapshotExists(ctx, parent) {
-				log.G(ctx).WithFields(log.Fields{
-					"parent":   parent,
-					"attempts": attempts,
-				}).Debug("parent snapshot now available")
-				return nil
-			}
-			// Exponential backoff with cap
-			interval = min(interval*2, parentWaitMaxInterval)
-		}
-	}
-
-	log.G(ctx).WithFields(log.Fields{
-		"parent":   parent,
-		"attempts": attempts,
-		"timeout":  parentWaitTimeout,
-	}).Debug("parent not ready, returning error for containerd retry")
-
-	return &ParentNotCommittedError{Parent: parent}
-}
-
-// snapshotExists checks if a snapshot with the given key exists in metadata.
-// The key may be in proxy format (namespace/txID/name) where the txID varies
-// between gRPC calls. We extract the name part and search for any snapshot
-// that matches it, regardless of the transaction ID prefix.
-func (s *snapshotter) snapshotExists(ctx context.Context, key string) bool {
-	// Extract the actual snapshot name from proxy key format.
-	// Proxy keys have format: namespace/txID/name (e.g., "spinbox-ci/11/sha256:abc...")
-	// The txID changes between calls, so we need to match by name only.
-	targetName := extractSnapshotName(key)
-
-	var exists bool
-	_ = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		// First try exact match (fast path)
-		_, _, _, err := storage.GetInfo(ctx, key)
-		if err == nil {
-			exists = true
-			return nil
-		}
-
-		// If exact match failed and key has proxy format, scan for matching name
-		if targetName != key {
-			return storage.WalkInfo(ctx, func(_ context.Context, info snapshots.Info) error {
-				if extractSnapshotName(info.Name) == targetName {
-					exists = true
-					return errStopWalk
-				}
-				return nil
-			})
-		}
-		return nil
-	})
-	return exists
-}
-
-// errStopWalk is used to stop walking when we find a match.
-var errStopWalk = fmt.Errorf("stop walk")
-
-// extractSnapshotName extracts the snapshot name from a proxy-formatted key.
-// Proxy keys from containerd's metadata layer have format: namespace/txID/name
-// where txID is a transaction ID that changes between gRPC calls.
-// Returns the name part, or the original key if not in proxy format.
-func extractSnapshotName(key string) string {
-	// Format: namespace/txID/name where name may contain slashes (e.g., sha256:abc)
-	parts := strings.SplitN(key, "/", 3)
-	if len(parts) == 3 {
-		// Check if second part looks like a numeric transaction ID
-		if _, err := fmt.Sscanf(parts[1], "%d", new(int)); err == nil {
-			return parts[2]
-		}
-	}
-	// Not in proxy format, return as-is
-	return key
-}
-
-//nolint:cyclop // complexity needed for parallel unpack wait logic and snapshot lifecycle
 func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (_ []mount.Mount, err error) {
 	var (
 		snap     storage.Snapshot
@@ -253,16 +86,6 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		opts = append(opts, snapshots.WithLabels(map[string]string{
 			extractLabel: "true",
 		}))
-	}
-
-	// For parallel layer unpacking, wait for the parent snapshot to be committed.
-	// When containerd unpacks layers in parallel, a child layer's Prepare may be
-	// called before the parent layer's Commit completes. We wait with exponential
-	// backoff to allow the parent commit to finish.
-	if parent != "" && isExtractKey(key) {
-		if err := s.waitForParent(ctx, parent); err != nil {
-			return nil, err
-		}
 	}
 
 	if err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) (err error) {
@@ -297,10 +120,21 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}
 
 	// Generate VMDK for VM runtimes - always generate when there are parent layers.
-	// Run async to avoid blocking Prepare/View.
+	// ParentIDs come from the snapshot chain in newest-first order.
+	// Run async to avoid blocking Prepare/View - fsmeta generation is expensive
+	// but not required for basic snapshot operations.
 	if !isExtractKey(key) && len(snap.ParentIDs) > 0 {
-		//nolint:contextcheck // uses fresh context to complete even if request is cancelled
-		s.startFsmetaGeneration(snap.ParentIDs)
+		parentIDs := snap.ParentIDs // capture for goroutine
+		s.bgWg.Add(1)
+		//nolint:contextcheck // intentionally using fresh context with timeout for background work
+		go func(ids []string) {
+			defer s.bgWg.Done()
+			// Use a fresh context with timeout - intentionally independent of parent
+			// context to allow completion even if the original request is cancelled.
+			bgCtx, cancel := context.WithTimeout(context.Background(), fsmetaTimeout)
+			defer cancel()
+			s.generateFsMeta(bgCtx, ids)
+		}(parentIDs)
 	}
 
 	// For active snapshots, create the writable ext4 layer file.
@@ -398,28 +232,12 @@ func (s *snapshotter) getCleanupDirectories(ctx context.Context) ([]string, erro
 }
 
 // Remove abandons the snapshot identified by key.
-//
-// CONCURRENCY: Remove and Commit are serialized per-key using keyLocks to prevent
-// race conditions where Remove deletes metadata while Commit is processing.
 func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
-	log.G(ctx).WithField("key", key).Debug("remove: entered function, acquiring lock")
-
-	// Acquire per-key lock to serialize with Commit operations.
-	// This prevents removing a snapshot while it's being committed.
-	unlock := s.keyLocks.lock(key)
-	defer unlock()
-
-	log.G(ctx).WithField("key", key).Debug("remove: lock acquired, starting transaction")
-
 	var removals []string
 	var id string
 
 	defer func() {
 		if err == nil {
-			log.G(ctx).WithFields(log.Fields{
-				"key": key,
-				"id":  id,
-			}).Debug("remove: cleanup after successful remove")
 			s.cleanupAfterRemove(ctx, id, removals)
 		}
 	}()
@@ -454,9 +272,6 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 
 // cleanupAfterRemove handles post-removal cleanup.
 func (s *snapshotter) cleanupAfterRemove(ctx context.Context, id string, removals []string) {
-	// Invalidate layer cache for removed snapshot
-	s.invalidateLayerCache(id)
-
 	// Cleanup block rw mount (only exists if commit was in progress)
 	if err := unmountAll(s.blockRwMountPath(id)); err != nil {
 		log.G(ctx).WithError(err).WithField("id", id).Warnf("failed to cleanup block rw mount")
