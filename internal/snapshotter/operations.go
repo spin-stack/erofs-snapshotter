@@ -382,16 +382,24 @@ func (s *snapshotter) getCleanupDirectories(ctx context.Context) ([]string, erro
 // CONCURRENCY: Remove and Commit are serialized per-key using keyLocks to prevent
 // race conditions where Remove deletes metadata while Commit is processing.
 func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
+	log.G(ctx).WithField("key", key).Debug("remove: entered function, acquiring lock")
+
 	// Acquire per-key lock to serialize with Commit operations.
 	// This prevents removing a snapshot while it's being committed.
 	unlock := s.keyLocks.lock(key)
 	defer unlock()
+
+	log.G(ctx).WithField("key", key).Debug("remove: lock acquired, starting transaction")
 
 	var removals []string
 	var id string
 
 	defer func() {
 		if err == nil {
+			log.G(ctx).WithFields(log.Fields{
+				"key": key,
+				"id":  id,
+			}).Debug("remove: cleanup after successful remove")
 			s.cleanupAfterRemove(ctx, id, removals)
 		}
 	}()

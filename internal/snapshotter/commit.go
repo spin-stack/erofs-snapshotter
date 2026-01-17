@@ -431,10 +431,20 @@ func (s *snapshotter) writeLayerManifest(manifestFile string, blobs []string) er
 // CONCURRENCY: Commit and Remove are serialized per-key using keyLocks to prevent
 // race conditions where Remove deletes metadata while Commit is processing.
 func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
+	log.G(ctx).WithFields(log.Fields{
+		"name": name,
+		"key":  key,
+	}).Debug("commit: entered function, acquiring lock")
+
 	// Acquire per-key lock to serialize with Remove operations.
 	// This prevents Remove from deleting the snapshot while we're committing.
 	unlock := s.keyLocks.lock(key)
 	defer unlock()
+
+	log.G(ctx).WithFields(log.Fields{
+		"name": name,
+		"key":  key,
+	}).Debug("commit: lock acquired, starting transaction")
 
 	var layerBlob string
 	var id string
@@ -449,6 +459,10 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		return nil
 	})
 	if err != nil {
+		log.G(ctx).WithError(err).WithFields(log.Fields{
+			"name": name,
+			"key":  key,
+		}).Debug("commit: failed to get snapshot info")
 		return err
 	}
 
@@ -456,7 +470,7 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		"name": name,
 		"key":  key,
 		"id":   id,
-	}).Debug("starting commit")
+	}).Debug("commit: got snapshot ID, finding layer blob")
 
 	// Find existing layer blob or create via fallback
 	layerBlob, err = s.findLayerBlob(id)
