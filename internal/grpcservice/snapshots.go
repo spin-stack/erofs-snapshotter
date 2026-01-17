@@ -105,12 +105,13 @@ func (s *service) Mounts(ctx context.Context, mr *snapshotsapi.MountsRequest) (*
 
 func (s *service) Commit(ctx context.Context, cr *snapshotsapi.CommitSnapshotRequest) (*ptypes.Empty, error) {
 	ns, _ := namespaces.Namespace(ctx)
+	// Log at Info level to ensure visibility when debugging parallel unpack issues
 	log.G(ctx).WithFields(log.Fields{
 		"namespace": ns,
 		"name":      cr.Name,
 		"key":       cr.Key,
 		"parent":    cr.Parent,
-	}).Debug("grpc: received commit request")
+	}).Info("grpcservice: commit request received")
 
 	var opts []snapshots.Opt
 	if cr.Labels != nil {
@@ -127,7 +128,7 @@ func (s *service) Commit(ctx context.Context, cr *snapshotsapi.CommitSnapshotReq
 			"namespace": ns,
 			"name":      cr.Name,
 			"key":       cr.Key,
-		}).Debug("grpc: commit failed")
+		}).Warn("grpcservice: commit failed")
 		return nil, errgrpc.ToGRPC(err)
 	}
 
@@ -135,7 +136,7 @@ func (s *service) Commit(ctx context.Context, cr *snapshotsapi.CommitSnapshotReq
 		"namespace": ns,
 		"name":      cr.Name,
 		"key":       cr.Key,
-	}).Debug("grpc: commit succeeded")
+	}).Info("grpcservice: commit succeeded")
 
 	return empty, nil
 }

@@ -263,17 +263,29 @@ func grpcLoggingInterceptor(ctx context.Context, req interface{}, info *grpc.Una
 		if ns := md.Get("containerd-namespace"); len(ns) > 0 {
 			fields["md.namespace"] = strings.Join(ns, ",")
 		}
-		if auth := md.Get("authorization"); len(auth) > 0 {
-			fields["md.auth"] = "present"
-		}
 	}
 
-	log.G(ctx).WithFields(fields).Debug("grpc: request received")
+	// Log Commit at Info level to ensure visibility (debugging parallel unpack issues)
+	if strings.HasSuffix(info.FullMethod, "/Commit") {
+		log.G(ctx).WithFields(fields).Info("grpc: COMMIT request received")
+	} else {
+		log.G(ctx).WithFields(fields).Debug("grpc: request received")
+	}
+
 	resp, err := handler(ctx, req)
 	if err != nil {
-		log.G(ctx).WithFields(fields).WithError(err).Debug("grpc: request failed")
+		if strings.HasSuffix(info.FullMethod, "/Commit") {
+			log.G(ctx).WithFields(fields).WithError(err).Warn("grpc: COMMIT request failed")
+		} else {
+			log.G(ctx).WithFields(fields).WithError(err).Debug("grpc: request failed")
+		}
 		return resp, err
 	}
-	log.G(ctx).WithFields(fields).Debug("grpc: request completed")
+
+	if strings.HasSuffix(info.FullMethod, "/Commit") {
+		log.G(ctx).WithFields(fields).Info("grpc: COMMIT request completed")
+	} else {
+		log.G(ctx).WithFields(fields).Debug("grpc: request completed")
+	}
 	return resp, nil
 }
