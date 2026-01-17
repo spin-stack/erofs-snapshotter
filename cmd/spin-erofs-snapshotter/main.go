@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	diffapi "github.com/containerd/containerd/api/services/diff/v1"
@@ -36,6 +37,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/grpclog"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/spin-stack/erofs-snapshotter/internal/differ"
 	"github.com/spin-stack/erofs-snapshotter/internal/grpcservice"
@@ -210,8 +212,8 @@ func run(cliCtx *cli.Context) error {
 	// Create differ
 	df := differ.NewErofsDiffer(contentStore, differOpts...)
 
-	// Create gRPC server
-	rpc := grpc.NewServer()
+	// Create gRPC server with request logging for debugging.
+	rpc := grpc.NewServer(grpc.UnaryInterceptor(grpcLoggingInterceptor))
 
 	// Register snapshot service (using our fixed service that supports rebase)
 	snapshotsapi.RegisterSnapshotsServer(rpc, grpcservice.FromSnapshotter(sn))
@@ -251,4 +253,27 @@ func run(cliCtx *cli.Context) error {
 
 	log.G(ctx).Info("Shutting down")
 	return nil
+}
+
+func grpcLoggingInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	fields := log.Fields{
+		"method": info.FullMethod,
+	}
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if ns := md.Get("containerd-namespace"); len(ns) > 0 {
+			fields["md.namespace"] = strings.Join(ns, ",")
+		}
+		if auth := md.Get("authorization"); len(auth) > 0 {
+			fields["md.auth"] = "present"
+		}
+	}
+
+	log.G(ctx).WithFields(fields).Debug("grpc: request received")
+	resp, err := handler(ctx, req)
+	if err != nil {
+		log.G(ctx).WithFields(fields).WithError(err).Debug("grpc: request failed")
+		return resp, err
+	}
+	log.G(ctx).WithFields(fields).Debug("grpc: request completed")
+	return resp, nil
 }
