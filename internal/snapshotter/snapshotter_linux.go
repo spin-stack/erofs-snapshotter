@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -110,7 +111,8 @@ func (s *snapshotter) snapshotIDExists(ctx context.Context, targetID string) boo
 	_ = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		ids, err := storage.IDMap(ctx)
 		if err != nil {
-			return err
+			// "bucket does not exist" means empty database - no snapshots exist
+			return nil
 		}
 		_, found = ids[targetID]
 		return nil
@@ -160,7 +162,10 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 	if err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		ids, err := storage.IDMap(ctx)
 		if err != nil {
-			return fmt.Errorf("get snapshot ID map: %w", err)
+			// "bucket does not exist" means empty database - no snapshots exist yet.
+			// This is expected on first startup, so treat it as empty validIDs.
+			log.L.WithError(err).Debug("no snapshots in metadata (empty database)")
+			return nil
 		}
 		for id := range ids {
 			validIDs[id] = true
@@ -182,6 +187,14 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 			continue
 		}
 		id := entry.Name()
+
+		// Skip "new-*" directories - these are temporary work directories created by
+		// Prepare() that haven't been renamed yet. They're not orphans, just in-progress
+		// operations that may complete at any moment.
+		if strings.HasPrefix(id, "new-") {
+			continue
+		}
+
 		snapshotDir := filepath.Join(snapshotsDir, id)
 
 		if !validIDs[id] {

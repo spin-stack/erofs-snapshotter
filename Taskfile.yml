@@ -58,7 +58,7 @@ tasks:
           -v "{{.ROOT_DIR}}:/workspace" \
           -w /workspace \
           {{.DOCKER_IMAGE}} \
-          sh -c "apt-get update && apt-get install -y e2fsprogs erofs-utils && go test -v ./internal/... -test.root 2>&1"
+          sh -c "apt-get update && apt-get install -y e2fsprogs erofs-utils && go test -race -v ./internal/... -test.root 2>&1"
 
   lint:
     desc: Run linter

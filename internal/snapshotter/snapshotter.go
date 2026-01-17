@@ -158,17 +158,10 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 	}
 
 	// Clean up any orphaned mounts from previous runs.
-	// Run asynchronously to avoid blocking server startup on large snapshot stores.
-	s.bgWg.Add(1)
-	go func() {
-		defer s.bgWg.Done()
-		defer func() {
-			if r := recover(); r != nil {
-				log.L.WithField("panic", r).Error("orphan cleanup panic recovered")
-			}
-		}()
-		s.cleanupOrphanedMounts()
-	}()
+	// Run synchronously to ensure cleanup completes before accepting operations.
+	// This prevents race conditions where cleanup might delete directories that
+	// are being created by concurrent Prepare operations.
+	s.cleanupOrphanedMounts()
 
 	return s, nil
 }
