@@ -251,6 +251,55 @@ func TestParallelUnpackStress(t *testing.T) {
 	}
 }
 
+// TestExtractSnapshotName verifies the proxy key format parsing.
+func TestExtractSnapshotName(t *testing.T) {
+	tests := []struct {
+		name     string
+		key      string
+		expected string
+	}{
+		{
+			name:     "proxy format with namespace and txID",
+			key:      "spinbox-ci/11/sha256:f3e19efe7a6e0d7ab914ba1ee295a0e04c1da384b50879a9cad95057a6f6473a",
+			expected: "sha256:f3e19efe7a6e0d7ab914ba1ee295a0e04c1da384b50879a9cad95057a6f6473a",
+		},
+		{
+			name:     "proxy format with different namespace",
+			key:      "default/42/layer-5",
+			expected: "layer-5",
+		},
+		{
+			name:     "simple key without prefix",
+			key:      "sha256:abc123",
+			expected: "sha256:abc123",
+		},
+		{
+			name:     "key with slash but not proxy format",
+			key:      "some/path",
+			expected: "some/path",
+		},
+		{
+			name:     "key with non-numeric txID",
+			key:      "namespace/notanid/name",
+			expected: "namespace/notanid/name",
+		},
+		{
+			name:     "extract key with embedded slashes",
+			key:      "ns/123/path/to/something",
+			expected: "path/to/something",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractSnapshotName(tt.key)
+			if result != tt.expected {
+				t.Errorf("extractSnapshotName(%q) = %q, want %q", tt.key, result, tt.expected)
+			}
+		})
+	}
+}
+
 // TestParentNotCommittedError verifies the custom error type works correctly.
 func TestParentNotCommittedError(t *testing.T) {
 	err := &ParentNotCommittedError{Parent: "test-parent"}

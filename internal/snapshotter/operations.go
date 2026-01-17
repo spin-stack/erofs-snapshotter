@@ -151,14 +151,57 @@ func (s *snapshotter) waitForParent(ctx context.Context, parent string) error {
 }
 
 // snapshotExists checks if a snapshot with the given key exists in metadata.
+// The key may be in proxy format (namespace/txID/name) where the txID varies
+// between gRPC calls. We extract the name part and search for any snapshot
+// that matches it, regardless of the transaction ID prefix.
 func (s *snapshotter) snapshotExists(ctx context.Context, key string) bool {
+	// Extract the actual snapshot name from proxy key format.
+	// Proxy keys have format: namespace/txID/name (e.g., "spinbox-ci/11/sha256:abc...")
+	// The txID changes between calls, so we need to match by name only.
+	targetName := extractSnapshotName(key)
+
 	var exists bool
 	_ = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		// First try exact match (fast path)
 		_, _, _, err := storage.GetInfo(ctx, key)
-		exists = err == nil
+		if err == nil {
+			exists = true
+			return nil
+		}
+
+		// If exact match failed and key has proxy format, scan for matching name
+		if targetName != key {
+			return storage.WalkInfo(ctx, func(_ context.Context, info snapshots.Info) error {
+				if extractSnapshotName(info.Name) == targetName {
+					exists = true
+					return errStopWalk
+				}
+				return nil
+			})
+		}
 		return nil
 	})
 	return exists
+}
+
+// errStopWalk is used to stop walking when we find a match.
+var errStopWalk = fmt.Errorf("stop walk")
+
+// extractSnapshotName extracts the snapshot name from a proxy-formatted key.
+// Proxy keys from containerd's metadata layer have format: namespace/txID/name
+// where txID is a transaction ID that changes between gRPC calls.
+// Returns the name part, or the original key if not in proxy format.
+func extractSnapshotName(key string) string {
+	// Format: namespace/txID/name where name may contain slashes (e.g., sha256:abc)
+	parts := strings.SplitN(key, "/", 3)
+	if len(parts) == 3 {
+		// Check if second part looks like a numeric transaction ID
+		if _, err := fmt.Sscanf(parts[1], "%d", new(int)); err == nil {
+			return parts[2]
+		}
+	}
+	// Not in proxy format, return as-is
+	return key
 }
 
 //nolint:cyclop // complexity needed for parallel unpack wait logic and snapshot lifecycle
