@@ -48,17 +48,24 @@ tasks:
     cmds:
       - sudo env PATH="$PATH" GOPATH="$GOPATH" GOCACHE="$GOCACHE" go test -race -count=1 ./... -test.root
 
+  test-docker-build:
+    desc: Build the Docker test image
+    cmds:
+      - docker build -t erofs-snapshotter-test -f Dockerfile.test .
+    sources:
+      - Dockerfile.test
+      - scripts/build-erofs-utils.sh
+
   test-docker:
     desc: Run tests in Docker with required tools (mkfs.erofs, etc.)
-    vars:
-      DOCKER_IMAGE: '{{.DOCKER_IMAGE | default "golang:1.25"}}'
+    deps: [test-docker-build]
     cmds:
       - |
         docker run --privileged --rm \
           -v "{{.ROOT_DIR}}:/workspace" \
           -w /workspace \
-          {{.DOCKER_IMAGE}} \
-          sh -c "apt-get update && apt-get install -y e2fsprogs erofs-utils && go test -race -v ./internal/... -test.root 2>&1"
+          erofs-snapshotter-test \
+          go test -race -v ./internal/... -test.root 2>&1
 
   lint:
     desc: Run linter
