@@ -1541,15 +1541,13 @@ func findVMDKWithMostLayers(snapshotsDir string) (string, int) {
 	return vmdkPath, maxLayers
 }
 
-// TestParallelUnpackWithRebase tests parallel layer unpacking with rebase capability.
-// This verifies that when containerd uses parallel unpacking (enabled by the "rebase"
-// capability), the layer order in the VMDK is correct.
+// TestSequentialUnpackLayerOrder tests sequential layer unpacking and VMDK layer order.
+// This verifies that when containerd uses sequential unpacking (no "rebase" capability),
+// the layer order in the VMDK is correct.
 //
-// Background: Parallel unpacking creates layers without parents initially, then
-// "rebases" them to the correct parent chain during commit. This requires the
-// snapshotter's gRPC service to properly pass the Parent field in CommitSnapshotRequest.
-// See: https://github.com/containerd/containerd/issues/8881
-func TestParallelUnpackWithRebase(t *testing.T) {
+// Note: This snapshotter intentionally does NOT support parallel unpacking (rebase)
+// because it matches stargz-snapshotter's proven approach of sequential unpacking.
+func TestSequentialUnpackLayerOrder(t *testing.T) {
 	testutil.RequiresRoot(t)
 
 	if err := checkPrerequisites(); err != nil {
@@ -1572,10 +1570,10 @@ func TestParallelUnpackWithRebase(t *testing.T) {
 	ss := env.SnapshotService()
 	assert := NewAssertions(t, env)
 
-	t.Log("=== Testing Parallel Unpack with Rebase Capability ===")
+	t.Log("=== Testing Sequential Unpack Layer Order ===")
 
-	// Pull multi-layer image (parallel unpacking will be used)
-	t.Log("--- Pull multi-layer image with parallel unpacking ---")
+	// Pull multi-layer image (sequential unpacking will be used)
+	t.Log("--- Pull multi-layer image with sequential unpacking ---")
 	if err := pullImage(ctx, c, multiLayerImage); err != nil {
 		t.Fatalf("pull image: %v", err)
 	}
@@ -1583,7 +1581,7 @@ func TestParallelUnpackWithRebase(t *testing.T) {
 	// Create view to trigger VMDK generation
 	t.Log("--- Create view snapshot ---")
 	topSnap := assert.FindCommittedSnapshot(ctx)
-	viewKey := fmt.Sprintf("test-rebase-view-%d", time.Now().UnixNano())
+	viewKey := fmt.Sprintf("test-layer-order-view-%d", time.Now().UnixNano())
 	if _, err := ss.View(ctx, viewKey, topSnap); err != nil {
 		t.Fatalf("create view: %v", err)
 	}
@@ -1592,15 +1590,15 @@ func TestParallelUnpackWithRebase(t *testing.T) {
 	// Wait for VMDK and verify layer order
 	t.Log("--- Verify layer order ---")
 	snapshotsDir := filepath.Join(env.SnapshotterRoot(), "snapshots")
-	if err := verifyRebaseLayerOrder(t, snapshotsDir, assert); err != nil {
+	if err := verifyLayerOrder(t, snapshotsDir, assert); err != nil {
 		t.Fatal(err)
 	}
 
-	t.Log("SUCCESS: Layer order is correct with parallel unpacking + rebase")
+	t.Log("SUCCESS: Layer order is correct with sequential unpacking")
 }
 
-// verifyRebaseLayerOrder waits for VMDK generation and verifies layer order.
-func verifyRebaseLayerOrder(t *testing.T, snapshotsDir string, assert *Assertions) error {
+// verifyLayerOrder waits for VMDK generation and verifies layer order.
+func verifyLayerOrder(t *testing.T, snapshotsDir string, assert *Assertions) error {
 	t.Helper()
 
 	var vmdkPath string
@@ -1661,7 +1659,7 @@ func compareLayerOrder(t *testing.T, vmdkDigests, manifestDigests []string) erro
 	}
 
 	if len(vmdkDigests) < 2 {
-		return fmt.Errorf("expected at least 2 layers, got %d (rebase may not be working)", len(vmdkDigests))
+		return fmt.Errorf("expected at least 2 layers, got %d", len(vmdkDigests))
 	}
 
 	for i := range vmdkDigests {

@@ -358,7 +358,6 @@ version = 2
 | Section | Purpose |
 |---------|---------|
 | `proxy_plugins` | Registers the external snapshotter and differ services |
-| `proxy_plugins.*.capabilities` | Enables parallel layer unpacking with `["rebase"]` |
 | `diff-service.default` | Prioritizes spin-erofs-diff for layer application |
 | `transfer.v1.local.unpack_config` | Tells containerd which snapshotter/differ to use for unpacking |
 | `cri.v1.images.snapshotter` | (Optional) Makes CRI use spin-erofs for Kubernetes workloads |
