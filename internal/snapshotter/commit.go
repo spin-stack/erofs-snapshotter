@@ -17,6 +17,8 @@ import (
 	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 )
 
+const fsmetaLockStaleAge = fsmetaTimeout + time.Minute
+
 // getCommitUpperDir returns the upper directory path for EROFS conversion.
 //
 // WHY TWO MODES EXIST:
@@ -69,6 +71,97 @@ func (s *snapshotter) commitBlock(ctx context.Context, layerBlob string, id stri
 	return nil
 }
 
+func removeFsmetaArtifacts(paths ...string) error {
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func isStaleFsmetaLock(lockFile string, maxAge time.Duration) (bool, error) {
+	info, err := os.Stat(lockFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return time.Since(info.ModTime()) > maxAge, nil
+}
+
+func (s *snapshotter) cleanupFsmetaArtifacts() {
+	entries, err := os.ReadDir(s.snapshotsDir())
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		snapshotID := entry.Name()
+		lockFile := s.fsMetaPath(snapshotID) + ".lock"
+		tmpMeta := s.fsMetaPath(snapshotID) + ".tmp"
+		tmpVmdk := s.vmdkPath(snapshotID) + ".tmp"
+
+		if err := removeFsmetaArtifacts(lockFile, tmpMeta, tmpVmdk); err != nil {
+			log.L.WithError(err).WithField("snapshot", snapshotID).Debug("failed to cleanup fsmeta startup artifacts")
+		}
+	}
+}
+
+func (s *snapshotter) tryAcquireFsmetaLock(ctx context.Context, snapshotID string) (bool, error) {
+	mergedMeta := s.fsMetaPath(snapshotID)
+	lockFile := mergedMeta + ".lock"
+	tmpMeta := mergedMeta + ".tmp"
+	tmpVmdk := s.vmdkPath(snapshotID) + ".tmp"
+
+	if _, err := os.Stat(mergedMeta); err == nil {
+		return false, nil
+	}
+
+	for range 2 {
+		lockFd, err := os.OpenFile(lockFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			if cerr := lockFd.Close(); cerr != nil {
+				_ = os.Remove(lockFile)
+				return false, fmt.Errorf("close fsmeta lock: %w", cerr)
+			}
+			return true, nil
+		}
+		if !os.IsExist(err) {
+			return false, fmt.Errorf("create fsmeta lock: %w", err)
+		}
+
+		if _, statErr := os.Stat(mergedMeta); statErr == nil {
+			return false, nil
+		}
+
+		stale, staleErr := isStaleFsmetaLock(lockFile, fsmetaLockStaleAge)
+		if staleErr != nil {
+			return false, fmt.Errorf("stat fsmeta lock: %w", staleErr)
+		}
+		if !stale {
+			return false, nil
+		}
+
+		if err := removeFsmetaArtifacts(lockFile, tmpMeta, tmpVmdk); err != nil {
+			return false, fmt.Errorf("cleanup stale fsmeta lock: %w", err)
+		}
+
+		log.G(ctx).WithFields(log.Fields{
+			"snapshot": snapshotID,
+			"lock":     lockFile,
+		}).Warn("removed stale fsmeta generation lock")
+	}
+
+	return false, nil
+}
+
 // generateFsMeta creates a merged fsmeta.erofs and VMDK descriptor for VM runtimes.
 // The VMDK allows QEMU to present all EROFS layers as a single concatenated block device.
 //
@@ -103,19 +196,14 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 		return
 	}
 
-	// Atomic lock file creation - only one goroutine wins
-	lockFd, err := os.OpenFile(lockFile, os.O_CREATE|os.O_EXCL, 0o600)
+	locked, err := s.tryAcquireFsmetaLock(ctx, newestID)
 	if err != nil {
-		// Another goroutine is generating or lock file is stale
-		// Check if final file exists now (generation completed while we waited)
-		if _, statErr := os.Stat(mergedMeta); statErr == nil {
-			return
-		}
-		// Lock file exists but no final file - could be stale from crash.
-		// Let the other holder finish or fail; don't compete.
+		log.G(ctx).WithError(err).WithField("snapshot", newestID).Warn("fsmeta generation skipped: cannot acquire lock")
 		return
 	}
-	lockFd.Close()
+	if !locked {
+		return
+	}
 
 	// Always remove lock file when done
 	defer os.Remove(lockFile)

@@ -132,6 +132,7 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 
 	// Clean up any orphaned mounts from previous runs.
 	s.cleanupOrphanedMounts() //nolint:contextcheck // startup cleanup uses background context
+	s.cleanupFsmetaArtifacts()
 
 	return s, nil
 }
