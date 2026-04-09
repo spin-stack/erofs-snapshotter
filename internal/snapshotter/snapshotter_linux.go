@@ -155,9 +155,8 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 				log.L.WithError(err).WithField("path", rwDir).Debug("failed to unmount orphan rw")
 			}
 
-			// Clear immutable flag if present
-			layerBlob := filepath.Join(snapshotDir, "layer.erofs")
-			_ = setImmutable(layerBlob, false)
+			// Clear immutable flags on any EROFS blobs before removal.
+			clearImmutableFlags(ctx, snapshotDir)
 
 			// Remove the entire directory
 			if err := os.RemoveAll(snapshotDir); err != nil {

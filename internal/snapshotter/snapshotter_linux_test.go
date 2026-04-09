@@ -96,6 +96,39 @@ func skipIfNoImmutableSupport(t *testing.T, dir string) {
 	}
 }
 
+func TestCleanupOrphanedMountsClearsImmutableBlobVariants(t *testing.T) {
+	for _, blobName := range []string{
+		"sha256-a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4.erofs",
+		"snapshot-orphan.erofs",
+	} {
+		t.Run(blobName, func(t *testing.T) {
+			root := t.TempDir()
+			s := newTestSnapshotterWithRoot(t, root, WithImmutable())
+
+			skipIfNoImmutableSupport(t, root)
+
+			orphanDir := filepath.Join(s.snapshotsDir(), "orphan")
+			if err := os.MkdirAll(orphanDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			layerBlob := filepath.Join(orphanDir, blobName)
+			if err := os.WriteFile(layerBlob, []byte("orphan"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := setImmutable(layerBlob, true); err != nil {
+				t.Fatalf("set immutable: %v", err)
+			}
+
+			s.cleanupOrphanedMounts()
+
+			if _, err := os.Stat(orphanDir); !os.IsNotExist(err) {
+				t.Fatalf("expected orphan dir to be removed, got err=%v", err)
+			}
+		})
+	}
+}
+
 const (
 	testFileContent       = "Hello, this is content for testing the EROFS Snapshotter!"
 	testNestedFileContent = "Nested file content"
