@@ -88,7 +88,7 @@ func newTestSnapshotterWithRoot(t *testing.T, root string, opts ...Opt) *snapsho
 	return s.(*snapshotter)
 }
 
-func snapshotID(t *testing.T, s *snapshotter, ctx context.Context, key string) string {
+func snapshotIDForKey(t *testing.T, s *snapshotter, ctx context.Context, key string) string {
 	t.Helper()
 
 	var id string
@@ -308,7 +308,7 @@ func TestSnapshotterUsage(t *testing.T) {
 			t.Fatalf("Prepare failed: %v", err)
 		}
 
-		id := snapshotID(t, s, ctx, "usage-block")
+		id := snapshotIDForKey(t, s, ctx, "usage-block")
 		rwLayerPath := s.writablePath(id)
 		upperPath := s.upperPath(id)
 
@@ -358,7 +358,7 @@ func TestSnapshotterUsage(t *testing.T) {
 			t.Fatalf("Prepare failed: %v", err)
 		}
 
-		id := snapshotID(t, s, ctx, "usage-overlay")
+		id := snapshotIDForKey(t, s, ctx, "usage-overlay")
 		rwLayerPath := s.writablePath(id)
 		upperPath := s.upperPath(id)
 
