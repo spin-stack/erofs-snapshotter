@@ -376,8 +376,15 @@ func (s *snapshotter) Usage(ctx context.Context, key string) (_ snapshots.Usage,
 	}
 
 	if info.Kind == snapshots.KindActive {
-		upperPath := s.upperPath(id)
-		du, err := fs.DiskUsage(ctx, upperPath)
+		usagePath := s.writablePath(id)
+		if _, err := os.Stat(usagePath); err != nil {
+			if !os.IsNotExist(err) {
+				return snapshots.Usage{}, fmt.Errorf("stat writable layer: %w", err)
+			}
+			usagePath = s.upperPath(id)
+		}
+
+		du, err := fs.DiskUsage(ctx, usagePath)
 		if err != nil {
 			return snapshots.Usage{}, err
 		}
