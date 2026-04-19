@@ -39,7 +39,9 @@ import (
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/containerd/v2/pkg/testutil"
 )
 
@@ -377,6 +379,12 @@ type Environment struct {
 
 	// Mutex for concurrent access
 	mu sync.Mutex
+}
+
+type runtimeE2EConfig struct {
+	runtimeType string
+	imageRef    string
+	processArgs []string
 }
 
 // EnvOption configures an Environment.
@@ -771,6 +779,29 @@ func pullImage(ctx context.Context, c *client.Client, ref string) error {
 	return fmt.Errorf("pull image after 3 attempts: %w", lastErr)
 }
 
+func runtimeE2EConfigFromEnv() (runtimeE2EConfig, bool) {
+	runtimeType := strings.TrimSpace(os.Getenv("EROFS_E2E_RUNTIME_TYPE"))
+	if runtimeType == "" {
+		return runtimeE2EConfig{}, false
+	}
+
+	imageRef := strings.TrimSpace(os.Getenv("EROFS_E2E_RUNTIME_IMAGE"))
+	if imageRef == "" {
+		imageRef = defaultTestImage
+	}
+
+	processArgs := strings.Fields(os.Getenv("EROFS_E2E_RUNTIME_ARGS"))
+	if len(processArgs) == 0 {
+		processArgs = []string{"true"}
+	}
+
+	return runtimeE2EConfig{
+		runtimeType: runtimeType,
+		imageRef:    imageRef,
+		processArgs: processArgs,
+	}, true
+}
+
 // TestIntegration runs the integration test suite.
 func TestIntegration(t *testing.T) {
 	testutil.RequiresRoot(t)
@@ -801,6 +832,10 @@ func TestIntegration(t *testing.T) {
 	// Run tests in order (some depend on previous tests)
 	t.Run("pull_image", func(t *testing.T) {
 		testPullImage(t, env)
+	})
+
+	t.Run("runtime_container_start", func(t *testing.T) {
+		testRuntimeContainerStart(t, env)
 	})
 
 	t.Run("prepare_snapshot", func(t *testing.T) {
@@ -849,6 +884,78 @@ func TestIntegration(t *testing.T) {
 	t.Run("full_cleanup", func(t *testing.T) {
 		testFullCleanup(t, env)
 	})
+}
+
+func testRuntimeContainerStart(t *testing.T, env *Environment) {
+	cfg, ok := runtimeE2EConfigFromEnv()
+	if !ok {
+		t.Skip("set EROFS_E2E_RUNTIME_TYPE to run task/container end-to-end validation with a real VM runtime")
+	}
+
+	ctx := env.Context()
+	c := env.Client()
+
+	if err := pullImage(ctx, c, cfg.imageRef); err != nil {
+		t.Fatalf("pull runtime test image %q: %v", cfg.imageRef, err)
+	}
+
+	image, err := c.GetImage(ctx, cfg.imageRef)
+	if err != nil {
+		t.Fatalf("get image %q: %v", cfg.imageRef, err)
+	}
+
+	containerID := fmt.Sprintf("runtime-e2e-%d", time.Now().UnixNano())
+	container, err := c.NewContainer(
+		ctx,
+		containerID,
+		client.WithImage(image),
+		client.WithImageConfigLabels(image),
+		client.WithNewSnapshot(containerID, image),
+		client.WithNewSpec(oci.WithImageConfig(image), oci.WithProcessArgs(cfg.processArgs...)),
+		client.WithRuntime(cfg.runtimeType, nil),
+	)
+	if err != nil {
+		t.Fatalf("create container with runtime %q: %v", cfg.runtimeType, err)
+	}
+	defer func() {
+		if err := container.Delete(ctx, client.WithSnapshotCleanup); err != nil {
+			t.Logf("delete container %s: %v", containerID, err)
+		}
+	}()
+
+	task, err := container.NewTask(ctx, cio.NullIO)
+	if err != nil {
+		t.Fatalf("create task with runtime %q: %v", cfg.runtimeType, err)
+	}
+	defer func() {
+		if _, err := task.Delete(ctx); err != nil {
+			t.Logf("delete task %s: %v", containerID, err)
+		}
+	}()
+
+	exitC, err := task.Wait(ctx)
+	if err != nil {
+		t.Fatalf("wait for task %s: %v", containerID, err)
+	}
+
+	if err := task.Start(ctx); err != nil {
+		t.Fatalf("start task with runtime %q: %v", cfg.runtimeType, err)
+	}
+
+	select {
+	case status := <-exitC:
+		code, _, err := status.Result()
+		if err != nil {
+			t.Fatalf("task %s returned wait error: %v", containerID, err)
+		}
+		if code != 0 {
+			t.Fatalf("task %s exited with code %d", containerID, code)
+		}
+	case <-time.After(2 * time.Minute):
+		t.Fatalf("timed out waiting for task %s to exit", containerID)
+	}
+
+	t.Logf("runtime %q started and completed a container using snapshotter %q", cfg.runtimeType, snapshotterName)
 }
 
 // checkPrerequisites verifies that required tools are available.
@@ -1526,7 +1633,7 @@ func findVMDKWithMostLayers(snapshotsDir string) (string, int) {
 		if filepath.Base(path) != mergedVMDKFile {
 			return nil
 		}
-		data, readErr := os.ReadFile(path)
+		data, readErr := os.ReadFile(path) //nolint:gosec // G122: test helper walking a controlled snapshots directory, no symlink risk
 		if readErr != nil {
 			return nil //nolint:nilerr // intentionally skip files we can't read
 		}

@@ -157,6 +157,58 @@ retry_command() {
     return 1
 }
 
+# Find the committed snapshot with the deepest ancestor chain (topmost layer).
+# ctr snapshots ls output is sorted by key (sha256 hash), NOT by chain depth,
+# so head -1 / tail -1 picks a random snapshot. This function correctly finds
+# the leaf committed snapshot with the most ancestors.
+find_deepest_committed_snapshot() {
+    local -A parents  # key -> parent
+    local -a keys     # all committed keys
+
+    # Parse ctr snapshots ls output. Columns are space-padded, so use awk:
+    # - $1 is always the key
+    # - If $2 looks like a snapshot key (sha256:...) it's the parent
+    # - "Committed" appears somewhere in the line
+    while IFS=$'\t' read -r key parent; do
+        keys+=("$key")
+        parents["$key"]="$parent"
+    done < <(ctr_cmd snapshots --snapshotter spin-erofs ls 2>/dev/null | \
+        awk '/Committed/ && !/^KEY/ {
+            key=$1;
+            parent="";
+            if ($2 ~ /^sha256:/) parent=$2;
+            print key "\t" parent
+        }')
+
+    # Find leaves: committed snapshots not used as a parent by any other
+    local -A is_parent
+    for k in "${keys[@]}"; do
+        local p="${parents[$k]}"
+        if [ -n "$p" ]; then
+            is_parent["$p"]=1
+        fi
+    done
+
+    local best_key=""
+    local best_depth=-1
+    for k in "${keys[@]}"; do
+        [ -n "${is_parent[$k]:-}" ] && continue  # skip non-leaves
+        # Count chain depth
+        local depth=0
+        local cur="$k"
+        while [ -n "${parents[$cur]:-}" ]; do
+            depth=$((depth + 1))
+            cur="${parents[$cur]}"
+        done
+        if [ "$depth" -gt "$best_depth" ]; then
+            best_depth=$depth
+            best_key="$k"
+        fi
+    done
+
+    echo "$best_key"
+}
+
 # =============================================================================
 # Assertion Helpers
 # =============================================================================
@@ -1122,10 +1174,11 @@ test_multi_layer() {
         return 1
     fi
 
-    # Find the top-level committed snapshot from the multi-layer image
-    # Look for snapshots with nginx in the name or the most recent one
+    # Find the top-level committed snapshot (deepest in the chain).
+    # ctr snapshots ls is sorted by key hash, not chain depth, so we must
+    # walk the parent chain to find the true topmost layer.
     local top_snap
-    top_snap=$(ctr_cmd snapshots --snapshotter spin-erofs ls | grep -v "^KEY" | grep "Committed" | tail -1 | awk '{print $1}')
+    top_snap=$(find_deepest_committed_snapshot)
 
     if [ -z "$top_snap" ]; then
         log_error "Could not find top-level committed snapshot"
@@ -1144,32 +1197,32 @@ test_multi_layer() {
         return 1
     fi
 
-    # Small delay to ensure files are written
-    sleep 0.5
+    # Wait for a multi-layer VMDK to be generated (fsmeta generation is async).
+    # Previous tests may have created a single-layer VMDK for the alpine image,
+    # so we must specifically wait for a VMDK with ≥2 layers from this image.
+    log_info "Waiting for multi-layer VMDK generation..."
+    local found_multi_layer=false
+    if wait_for_condition '
+        local best=0
+        while IFS= read -r f; do
+            local c
+            c=$(grep -c "sha256-.*\.erofs" "$f" 2>/dev/null || echo 0)
+            [ "$c" -gt "$best" ] && best=$c
+        done < <(find "${SNAPSHOTTER_ROOT}/snapshots" -name "merged.vmdk" 2>/dev/null)
+        [ "$best" -ge 2 ]
+    ' 15 1 "multi-layer VMDK with ≥2 layers"; then
+        found_multi_layer=true
+    fi
 
-    # Verify VMDK generation (required for multi-layer images)
-    local vmdk_count
-    vmdk_count=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "merged.vmdk" 2>/dev/null | wc -l)
-
-    if [ "$vmdk_count" -eq 0 ]; then
-        log_error "No VMDK descriptors found for multi-layer image"
+    if [ "$found_multi_layer" != "true" ]; then
+        log_error "No multi-layer VMDK generated after waiting"
+        log_error "VMDKs found:"
+        find "${SNAPSHOTTER_ROOT}/snapshots" -name "merged.vmdk" -exec sh -c 'echo "  $1: $(grep -c "sha256-.*\.erofs" "$1" 2>/dev/null || echo 0) layers"' _ {} \; 2>/dev/null
         ctr_cmd snapshots --snapshotter spin-erofs rm "$MULTI_LAYER_VIEW_NAME" 2>/dev/null || true
         MULTI_LAYER_VIEW_NAME=""
         return 1
     fi
-    log_info "VMDK descriptors generated: $vmdk_count"
-
-    # Verify fsmeta.erofs exists for multi-layer
-    local fsmeta_count
-    fsmeta_count=$(find "${SNAPSHOTTER_ROOT}/snapshots" -name "fsmeta.erofs" 2>/dev/null | wc -l)
-
-    if [ "$fsmeta_count" -eq 0 ]; then
-        log_error "No fsmeta.erofs found for multi-layer image"
-        ctr_cmd snapshots --snapshotter spin-erofs rm "$MULTI_LAYER_VIEW_NAME" 2>/dev/null || true
-        MULTI_LAYER_VIEW_NAME=""
-        return 1
-    fi
-    log_info "Fsmeta files generated: $fsmeta_count"
+    log_info "Multi-layer VMDK generated successfully"
 
     # Don't clean up - leave view for test_vmdk_layer_order to verify
     log_info "View snapshot preserved for dependent tests: $MULTI_LAYER_VIEW_NAME"
@@ -1244,20 +1297,34 @@ test_erofs_layers() {
 #   - Layer order matches the layers.manifest file (authoritative source)
 # =============================================================================
 test_vmdk_layer_order() {
-    # Find the VMDK file with multiple layers (from the multi-layer image)
+    # Find the VMDK file with the most layers (should already exist from test_multi_layer).
+    # Poll briefly in case fsmeta generation is still completing.
     local vmdk_file=""
     local best_layer_count=0
 
-    while IFS= read -r candidate; do
-        local layer_count
-        layer_count=$(grep -c "sha256-.*\.erofs" "$candidate" 2>/dev/null || echo 0)
-        log_debug "VMDK $candidate has $layer_count layers"
+    local attempts=0
+    while [ "$attempts" -lt 10 ]; do
+        vmdk_file=""
+        best_layer_count=0
 
-        if [ "$layer_count" -gt "$best_layer_count" ]; then
-            best_layer_count=$layer_count
-            vmdk_file="$candidate"
+        while IFS= read -r candidate; do
+            local layer_count
+            layer_count=$(grep -c "sha256-.*\.erofs" "$candidate" 2>/dev/null || echo 0)
+            log_debug "VMDK $candidate has $layer_count layers"
+
+            if [ "$layer_count" -gt "$best_layer_count" ]; then
+                best_layer_count=$layer_count
+                vmdk_file="$candidate"
+            fi
+        done < <(find "${SNAPSHOTTER_ROOT}/snapshots" -name "merged.vmdk" 2>/dev/null)
+
+        if [ "$best_layer_count" -ge 2 ]; then
+            break
         fi
-    done < <(find "${SNAPSHOTTER_ROOT}/snapshots" -name "merged.vmdk" 2>/dev/null)
+
+        attempts=$((attempts + 1))
+        sleep 1
+    done
 
     if [ -z "$vmdk_file" ]; then
         log_error "No VMDK file found"

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/snapshots"
 )
@@ -226,6 +227,112 @@ func TestFsmetaLockFileRace(t *testing.T) {
 	// Verify lock file exists
 	if _, err := os.Stat(lockFile); err != nil {
 		t.Errorf("lock file should exist: %v", err)
+	}
+}
+
+func TestTryAcquireFsmetaLockRejectsFreshLock(t *testing.T) {
+	root := t.TempDir()
+	s := &snapshotter{root: root}
+
+	snapshotDir := filepath.Join(root, "snapshots", "test-parent")
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	lockFile := s.fsMetaPath("test-parent") + ".lock"
+	if err := os.WriteFile(lockFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	locked, err := s.tryAcquireFsmetaLock(context.Background(), "test-parent")
+	if err != nil {
+		t.Fatalf("tryAcquireFsmetaLock: %v", err)
+	}
+	if locked {
+		t.Fatal("expected fresh lock to prevent acquisition")
+	}
+
+	if _, err := os.Stat(lockFile); err != nil {
+		t.Fatalf("fresh lock should remain in place: %v", err)
+	}
+}
+
+func TestTryAcquireFsmetaLockRecoversStaleLock(t *testing.T) {
+	root := t.TempDir()
+	s := &snapshotter{root: root}
+
+	snapshotDir := filepath.Join(root, "snapshots", "test-parent")
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	lockFile := s.fsMetaPath("test-parent") + ".lock"
+	tmpMeta := s.fsMetaPath("test-parent") + ".tmp"
+	tmpVmdk := s.vmdkPath("test-parent") + ".tmp"
+
+	for _, path := range []string{lockFile, tmpMeta, tmpVmdk} {
+		if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	old := time.Now().Add(-fsmetaLockStaleAge - time.Minute)
+	if err := os.Chtimes(lockFile, old, old); err != nil {
+		t.Fatalf("chtimes lock: %v", err)
+	}
+
+	locked, err := s.tryAcquireFsmetaLock(context.Background(), "test-parent")
+	if err != nil {
+		t.Fatalf("tryAcquireFsmetaLock: %v", err)
+	}
+	if !locked {
+		t.Fatal("expected stale lock to be recovered")
+	}
+
+	if _, err := os.Stat(lockFile); err != nil {
+		t.Fatalf("expected lock file to be reacquired: %v", err)
+	}
+	if _, err := os.Stat(tmpMeta); !os.IsNotExist(err) {
+		t.Fatalf("expected stale temp fsmeta to be removed, got err=%v", err)
+	}
+	if _, err := os.Stat(tmpVmdk); !os.IsNotExist(err) {
+		t.Fatalf("expected stale temp vmdk to be removed, got err=%v", err)
+	}
+}
+
+func TestCleanupFsmetaArtifactsRemovesStartupArtifacts(t *testing.T) {
+	root := t.TempDir()
+	s := &snapshotter{root: root}
+
+	snapshotDir := filepath.Join(root, "snapshots", "test-parent")
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	lockFile := s.fsMetaPath("test-parent") + ".lock"
+	tmpMeta := s.fsMetaPath("test-parent") + ".tmp"
+	tmpVmdk := s.vmdkPath("test-parent") + ".tmp"
+	finalMeta := s.fsMetaPath("test-parent")
+	finalVmdk := s.vmdkPath("test-parent")
+
+	for _, path := range []string{lockFile, tmpMeta, tmpVmdk, finalMeta, finalVmdk} {
+		if err := os.WriteFile(path, []byte("artifact"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s.cleanupFsmetaArtifacts()
+
+	for _, path := range []string{lockFile, tmpMeta, tmpVmdk} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("expected startup artifact %s to be removed, got err=%v", path, err)
+		}
+	}
+
+	for _, path := range []string{finalMeta, finalVmdk} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected final artifact %s to remain: %v", path, err)
+		}
 	}
 }
 

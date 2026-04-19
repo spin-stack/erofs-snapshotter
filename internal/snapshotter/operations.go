@@ -126,7 +126,7 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	if !isExtractKey(key) && len(snap.ParentIDs) > 0 {
 		parentIDs := snap.ParentIDs // capture for goroutine
 		s.bgWg.Add(1)
-		//nolint:contextcheck // intentionally using fresh context with timeout for background work
+		//nolint:contextcheck,gosec // intentionally using fresh context with timeout for background work
 		go func(ids []string) {
 			defer s.bgWg.Done()
 			// Use a fresh context with timeout - intentionally independent of parent
@@ -376,8 +376,15 @@ func (s *snapshotter) Usage(ctx context.Context, key string) (_ snapshots.Usage,
 	}
 
 	if info.Kind == snapshots.KindActive {
-		upperPath := s.upperPath(id)
-		du, err := fs.DiskUsage(ctx, upperPath)
+		usagePath := s.writablePath(id)
+		if _, err := os.Stat(usagePath); err != nil {
+			if !os.IsNotExist(err) {
+				return snapshots.Usage{}, fmt.Errorf("stat writable layer: %w", err)
+			}
+			usagePath = s.upperPath(id)
+		}
+
+		du, err := fs.DiskUsage(ctx, usagePath)
 		if err != nil {
 			return snapshots.Usage{}, err
 		}

@@ -1,12 +1,16 @@
 package snapshotter
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/containerd/containerd/v2/core/snapshots/storage"
+	"github.com/containerd/continuity/fs"
 
 	"github.com/containerd/containerd/v2/core/snapshots"
 
@@ -82,6 +86,21 @@ func newTestSnapshotterWithRoot(t *testing.T, root string, opts ...Opt) *snapsho
 	}
 	t.Cleanup(func() { s.Close() })
 	return s.(*snapshotter)
+}
+
+func snapshotIDForKey(t *testing.T, s *snapshotter, ctx context.Context, key string) string {
+	t.Helper()
+
+	var id string
+	if err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		var err error
+		id, _, _, err = storage.GetInfo(ctx, key)
+		return err
+	}); err != nil {
+		t.Fatalf("get snapshot info for %q: %v", key, err)
+	}
+
+	return id
 }
 
 func TestNewSnapshotter(t *testing.T) {
@@ -281,23 +300,92 @@ func TestSnapshotterWalk(t *testing.T) {
 }
 
 func TestSnapshotterUsage(t *testing.T) {
-	s := newTestSnapshotter(t)
+	s := newTestSnapshotterInternal(t, WithDefaultSize(2*1024*1024))
 	ctx := t.Context()
 
-	_, err := s.Prepare(ctx, "usage-test", "")
-	if err != nil {
-		t.Fatalf("Prepare failed: %v", err)
-	}
+	t.Run("active snapshot reports writable image usage", func(t *testing.T) {
+		if _, err := s.Prepare(ctx, "usage-block", ""); err != nil {
+			t.Fatalf("Prepare failed: %v", err)
+		}
 
-	usage, err := s.Usage(ctx, "usage-test")
-	if err != nil {
-		t.Fatalf("Usage failed: %v", err)
-	}
+		id := snapshotIDForKey(t, s, ctx, "usage-block")
+		rwLayerPath := s.writablePath(id)
+		upperPath := s.upperPath(id)
 
-	// Usage should be non-negative
-	if usage.Size < 0 {
-		t.Errorf("expected non-negative size, got %d", usage.Size)
-	}
+		f, err := os.OpenFile(rwLayerPath, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatalf("open writable layer: %v", err)
+		}
+
+		payload := bytes.Repeat([]byte("x"), 64*1024)
+		offset := s.defaultWritable - int64(len(payload))
+		if _, err := f.WriteAt(payload, offset); err != nil {
+			f.Close()
+			t.Fatalf("write writable layer: %v", err)
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			t.Fatalf("sync writable layer: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("close writable layer: %v", err)
+		}
+
+		expected, err := fs.DiskUsage(ctx, rwLayerPath)
+		if err != nil {
+			t.Fatalf("disk usage for writable layer: %v", err)
+		}
+		upperUsage, err := fs.DiskUsage(ctx, upperPath)
+		if err != nil {
+			t.Fatalf("disk usage for upper path: %v", err)
+		}
+		if expected.Size <= upperUsage.Size {
+			t.Fatalf("test setup invalid: rwlayer usage=%d upper usage=%d", expected.Size, upperUsage.Size)
+		}
+
+		usage, err := s.Usage(ctx, "usage-block")
+		if err != nil {
+			t.Fatalf("Usage failed: %v", err)
+		}
+
+		if usage != snapshots.Usage(expected) {
+			t.Fatalf("usage = %+v, want %+v", usage, snapshots.Usage(expected))
+		}
+	})
+
+	t.Run("active snapshot falls back to upper directory when writable image is missing", func(t *testing.T) {
+		if _, err := s.Prepare(ctx, "usage-overlay", ""); err != nil {
+			t.Fatalf("Prepare failed: %v", err)
+		}
+
+		id := snapshotIDForKey(t, s, ctx, "usage-overlay")
+		rwLayerPath := s.writablePath(id)
+		upperPath := s.upperPath(id)
+
+		if err := os.Remove(rwLayerPath); err != nil {
+			t.Fatalf("remove writable layer: %v", err)
+		}
+
+		payloadPath := filepath.Join(upperPath, "payload.bin")
+		payload := bytes.Repeat([]byte("y"), 32*1024)
+		if err := os.WriteFile(payloadPath, payload, 0o644); err != nil {
+			t.Fatalf("write payload: %v", err)
+		}
+
+		expected, err := fs.DiskUsage(ctx, upperPath)
+		if err != nil {
+			t.Fatalf("disk usage for upper path: %v", err)
+		}
+
+		usage, err := s.Usage(ctx, "usage-overlay")
+		if err != nil {
+			t.Fatalf("Usage failed: %v", err)
+		}
+
+		if usage != snapshots.Usage(expected) {
+			t.Fatalf("usage = %+v, want %+v", usage, snapshots.Usage(expected))
+		}
+	})
 }
 
 func TestSnapshotterUpdate(t *testing.T) {
