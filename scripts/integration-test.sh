@@ -157,6 +157,58 @@ retry_command() {
     return 1
 }
 
+# Find the committed snapshot with the deepest ancestor chain (topmost layer).
+# ctr snapshots ls output is sorted by key (sha256 hash), NOT by chain depth,
+# so head -1 / tail -1 picks a random snapshot. This function correctly finds
+# the leaf committed snapshot with the most ancestors.
+find_deepest_committed_snapshot() {
+    local -A parents  # key -> parent
+    local -a keys     # all committed keys
+
+    # Parse ctr snapshots ls output. Columns are space-padded, so use awk:
+    # - $1 is always the key
+    # - If $2 looks like a snapshot key (sha256:...) it's the parent
+    # - "Committed" appears somewhere in the line
+    while IFS=$'\t' read -r key parent; do
+        keys+=("$key")
+        parents["$key"]="$parent"
+    done < <(ctr_cmd snapshots --snapshotter spin-erofs ls 2>/dev/null | \
+        awk '/Committed/ && !/^KEY/ {
+            key=$1;
+            parent="";
+            if ($2 ~ /^sha256:/) parent=$2;
+            print key "\t" parent
+        }')
+
+    # Find leaves: committed snapshots not used as a parent by any other
+    local -A is_parent
+    for k in "${keys[@]}"; do
+        local p="${parents[$k]}"
+        if [ -n "$p" ]; then
+            is_parent["$p"]=1
+        fi
+    done
+
+    local best_key=""
+    local best_depth=-1
+    for k in "${keys[@]}"; do
+        [ -n "${is_parent[$k]:-}" ] && continue  # skip non-leaves
+        # Count chain depth
+        local depth=0
+        local cur="$k"
+        while [ -n "${parents[$cur]:-}" ]; do
+            depth=$((depth + 1))
+            cur="${parents[$cur]}"
+        done
+        if [ "$depth" -gt "$best_depth" ]; then
+            best_depth=$depth
+            best_key="$k"
+        fi
+    done
+
+    echo "$best_key"
+}
+
 # =============================================================================
 # Assertion Helpers
 # =============================================================================
@@ -1122,10 +1174,11 @@ test_multi_layer() {
         return 1
     fi
 
-    # Find the top-level committed snapshot from the multi-layer image
-    # Look for snapshots with nginx in the name or the most recent one
+    # Find the top-level committed snapshot (deepest in the chain).
+    # ctr snapshots ls is sorted by key hash, not chain depth, so we must
+    # walk the parent chain to find the true topmost layer.
     local top_snap
-    top_snap=$(ctr_cmd snapshots --snapshotter spin-erofs ls | grep -v "^KEY" | grep "Committed" | tail -1 | awk '{print $1}')
+    top_snap=$(find_deepest_committed_snapshot)
 
     if [ -z "$top_snap" ]; then
         log_error "Could not find top-level committed snapshot"
