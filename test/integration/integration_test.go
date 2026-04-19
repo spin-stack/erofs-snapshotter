@@ -1633,7 +1633,7 @@ func findVMDKWithMostLayers(snapshotsDir string) (string, int) {
 		if filepath.Base(path) != mergedVMDKFile {
 			return nil
 		}
-		data, readErr := os.ReadFile(path)
+		data, readErr := os.ReadFile(path) //nolint:gosec // G122: test helper walking a controlled snapshots directory, no symlink risk
 		if readErr != nil {
 			return nil //nolint:nilerr // intentionally skip files we can't read
 		}

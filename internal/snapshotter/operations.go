@@ -126,7 +126,7 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	if !isExtractKey(key) && len(snap.ParentIDs) > 0 {
 		parentIDs := snap.ParentIDs // capture for goroutine
 		s.bgWg.Add(1)
-		//nolint:contextcheck // intentionally using fresh context with timeout for background work
+		//nolint:contextcheck,gosec // intentionally using fresh context with timeout for background work
 		go func(ids []string) {
 			defer s.bgWg.Done()
 			// Use a fresh context with timeout - intentionally independent of parent
