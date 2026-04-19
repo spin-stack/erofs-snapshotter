@@ -28,6 +28,7 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/continuity/fs"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"golang.org/x/sys/unix"
 
@@ -134,8 +135,12 @@ func (s *snapshotter) cleanupOrphanedMounts() {
 			return nil
 		})
 	}); err != nil {
-		log.L.WithError(err).Warn("failed to enumerate snapshots during orphan cleanup")
-		return
+		// "not found" means the metadata bucket hasn't been created yet (fresh DB).
+		// This implies zero valid snapshots, so we should still clean up orphans.
+		if !errdefs.IsNotFound(err) {
+			log.L.WithError(err).Warn("failed to enumerate snapshots during orphan cleanup")
+			return
+		}
 	}
 
 	for _, entry := range entries {
