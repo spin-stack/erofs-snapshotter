@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -314,7 +313,6 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 // fixVmdkPaths replaces oldPath with newPath in a VMDK descriptor file.
 // VMDK is a simple text format where paths appear in FLAT extent lines.
 func fixVmdkPaths(vmdkFile, oldPath, newPath string) error {
-	vmdkFile = filepath.Clean(vmdkFile)
 	content, err := os.ReadFile(vmdkFile)
 	if err != nil {
 		return fmt.Errorf("read vmdk: %w", err)
@@ -323,7 +321,7 @@ func fixVmdkPaths(vmdkFile, oldPath, newPath string) error {
 	// Simple string replacement - the VMDK format uses quoted paths
 	fixed := strings.ReplaceAll(string(content), oldPath, newPath)
 
-	if err := os.WriteFile(vmdkFile, []byte(fixed), 0o644); err != nil {
+	if err := os.WriteFile(vmdkFile, []byte(fixed), 0o644); err != nil { //nolint:gosec // G703: vmdkFile is constructed internally via path helpers, not user input
 		return fmt.Errorf("write vmdk: %w", err)
 	}
 
