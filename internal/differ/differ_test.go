@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -84,14 +85,20 @@ func TestIsErofsMediaType(t *testing.T) {
 		mediaType string
 		want      bool
 	}{
-		// Valid EROFS media types
+		// Valid EROFS media types (legacy ".erofs" suffix)
 		{"application/vnd.oci.image.layer.erofs", true},
 		{"application/vnd.erofs", true},
 		{"some/type.erofs", true},
 
-		// Invalid - has suffix (not allowed per code comment)
+		// Valid - official containerd EROFS media type (no ".erofs" suffix)
+		{images.MediaTypeErofsLayer, true},                 // application/vnd.erofs.layer.v1
+		{"application/vnd.erofs.layer.v1", true},           // literal form
+		{"application/vnd.erofs.layer.experimental", true}, // any vendor variant under the prefix
+
+		// Invalid - has suffix (reserved for images.DiffCompression)
 		{"application/vnd.oci.image.layer.erofs+gzip", false},
 		{"application/vnd.erofs+zstd", false},
+		{"application/vnd.erofs.layer.v1+zstd", false},
 
 		// Invalid - not EROFS
 		{"application/vnd.oci.image.layer.v1.tar", false},
@@ -102,7 +109,7 @@ func TestIsErofsMediaType(t *testing.T) {
 		// Edge cases
 		{"", false},
 		{".erofs", true}, // technically valid per the code
-		{"erofs", false}, // doesn't end with .erofs
+		{"erofs", false}, // doesn't end with .erofs and missing vnd prefix
 	}
 
 	for _, tc := range tests {

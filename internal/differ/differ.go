@@ -86,7 +86,9 @@ func NewErofsDiffer(store content.Store, opts ...DifferOpt) *ErofsDiff {
 	return d
 }
 
-// A valid EROFS native layer media type should end with ".erofs".
+// A valid EROFS native layer media type is either the official OCI/containerd
+// constant (images.MediaTypeErofsLayer, "application/vnd.erofs.layer.v1") or a
+// legacy/vendor name ending in ".erofs".
 //
 // Please avoid using any +suffix to list the algorithms used inside EROFS
 // blobs, since:
@@ -97,11 +99,11 @@ func NewErofsDiffer(store content.Store, opts ...DifferOpt) *ErofsDiff {
 // Since `images.DiffCompression` doesn't support arbitrary media types,
 // disallow non-empty suffixes for now.
 func isErofsMediaType(mt string) bool {
-	mediaType, _, hasExt := strings.Cut(mt, "+")
-	if hasExt {
+	if !strings.HasSuffix(mt, ".erofs") && !strings.HasPrefix(mt, "application/vnd.erofs.layer") {
 		return false
 	}
-	return strings.HasSuffix(mediaType, ".erofs")
+	_, _, hasExt := strings.Cut(mt, "+")
+	return !hasExt
 }
 
 func (s *ErofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []mount.Mount, opts ...diff.ApplyOpt) (d ocispec.Descriptor, err error) {
