@@ -97,15 +97,24 @@ differ := NewErofsDiffer(store, WithMountManager(mm)) // May fail in plugins
 
 **File**: `differ.go:isErofsMediaType()`
 
+A media type is treated as native EROFS when it either ends in `.erofs`
+(legacy/vendor naming) or starts with `application/vnd.erofs.layer` (the
+official prefix from `images.MediaTypeErofsLayer`). `+suffix` is always
+rejected.
+
 ```go
-// Valid: ends with ".erofs", no suffix
+// Valid: legacy ".erofs" suffix
 "application/vnd.oci.image.layer.v1.erofs" ✅
+
+// Valid: official prefix (images.MediaTypeErofsLayer)
+"application/vnd.erofs.layer.v1" ✅
 
 // Invalid: has +suffix (reserved for DiffCompression)
 "application/vnd.oci.image.layer.v1.erofs+gzip" ❌
+"application/vnd.erofs.layer.v1+zstd"           ❌
 ```
 
-**DO**: Keep media type detection simple (suffix matching)
+**DO**: Accept both legacy suffix and official prefix forms
 **DON'T**: Add +suffix support (breaks DiffCompression)
 
 ---
@@ -238,7 +247,8 @@ sudo go test -v ./internal/differ/... -test.root
 
 ### Media Type Rules
 
-- **MUST** accept any media type ending with `.erofs` as native
+- **MUST** accept media types ending with `.erofs` (legacy/vendor naming) as native
+- **MUST** accept media types starting with `application/vnd.erofs.layer` (official `images.MediaTypeErofsLayer` prefix) as native
 - **MUST NOT** accept media types with `+suffix` (reserved for DiffCompression)
 - **SHOULD** support standard OCI tar media types via decompression chain
 
