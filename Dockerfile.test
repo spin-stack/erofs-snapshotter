@@ -2,7 +2,7 @@
 # Build: docker build -t erofs-test -f Dockerfile.test .
 # Run:   docker run --privileged --rm -v $(pwd):/workspace -w /workspace erofs-test
 
-ARG GO_VERSION=1.25
+ARG GO_VERSION=1.26
 FROM golang:${GO_VERSION}
 
 # Install runtime dependencies (build deps are installed by build-erofs-utils.sh)
