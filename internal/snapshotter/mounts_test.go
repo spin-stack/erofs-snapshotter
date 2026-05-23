@@ -1,6 +1,7 @@
 package snapshotter
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -274,6 +275,62 @@ func TestActiveMountsForKindDecisionTree(t *testing.T) {
 			t.Errorf("mount.Type = %q, want %q", mounts[0].Type, testMountExt4)
 		}
 	})
+}
+
+func TestBuildErofsLayerMountsRefusesTooManyLayersWithoutFsmeta(t *testing.T) {
+	// When fsmeta is unavailable and the parent chain exceeds maxLayersForFallback,
+	// we must fail loud rather than return many individual mounts that a microVM
+	// would later fail to attach.
+
+	root := t.TempDir()
+	s := &snapshotter{root: root}
+
+	layerCount := maxLayersForFallback + 1
+	parentIDs := make([]string, layerCount)
+	for i := range parentIDs {
+		pid := "p" + string(rune('a'+i%26)) + string(rune('a'+(i/26)%26))
+		// Disambiguate when index repeats (keeps fake digests unique enough)
+		pid += string(rune('0' + i%10))
+		parentIDs[i] = pid
+
+		snapshotDir := filepath.Join(root, "snapshots", pid)
+		if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Pad the fake digest to 64 hex chars so glob matching mimics real blobs
+		fakeDigest := pid
+		for len(fakeDigest) < 64 {
+			fakeDigest += "0"
+		}
+		layerPath := filepath.Join(snapshotDir, "sha256-"+fakeDigest[:64]+".erofs")
+		if err := os.WriteFile(layerPath, []byte("fake"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	snap := storage.Snapshot{
+		ID:        "child",
+		Kind:      snapshots.KindView,
+		ParentIDs: parentIDs,
+	}
+
+	_, err := s.buildErofsLayerMounts(snap)
+	if err == nil {
+		t.Fatal("expected FsmetaFallbackTooManyLayersError, got nil")
+	}
+	var tooMany *FsmetaFallbackTooManyLayersError
+	if !errors.As(err, &tooMany) {
+		t.Fatalf("expected *FsmetaFallbackTooManyLayersError, got %T: %v", err, err)
+	}
+	if tooMany.LayerCount != layerCount {
+		t.Errorf("LayerCount = %d, want %d", tooMany.LayerCount, layerCount)
+	}
+	if tooMany.Limit != maxLayersForFallback {
+		t.Errorf("Limit = %d, want %d", tooMany.Limit, maxLayersForFallback)
+	}
+	if tooMany.ParentID != parentIDs[0] {
+		t.Errorf("ParentID = %q, want %q", tooMany.ParentID, parentIDs[0])
+	}
 }
 
 func TestSingleLayerMountsRequiresActive(t *testing.T) {
