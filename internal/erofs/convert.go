@@ -398,20 +398,47 @@ func GetBlockSize(path string) (int, error) {
 	return blockSize, nil
 }
 
-// CanMergeFsmeta checks if all EROFS layers have block sizes compatible with fsmeta merge.
-// Returns true if all layers have block size >= 4096, false otherwise.
-func CanMergeFsmeta(layerPaths []string) bool {
+// FsmetaCompatError indicates a layer is incompatible with fsmeta merge.
+// Either the block size is below the minimum (e.g., tar-index layers use 512-byte
+// blocks) or the superblock could not be read. When this error is returned, the
+// snapshotter cannot produce a merged fsmeta+VMDK and will fall back to mounting
+// each layer as a separate block device, which the VM may not be able to attach
+// for images with many layers.
+type FsmetaCompatError struct {
+	Path        string
+	BlockSize   int // 0 if the superblock could not be read
+	MinRequired int
+	Cause       error // non-nil when the superblock read failed
+}
+
+func (e *FsmetaCompatError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("layer %q is incompatible with fsmeta merge: %v", e.Path, e.Cause)
+	}
+	return fmt.Sprintf("layer %q has block size %d, fsmeta merge requires >= %d",
+		e.Path, e.BlockSize, e.MinRequired)
+}
+
+func (e *FsmetaCompatError) Unwrap() error {
+	return e.Cause
+}
+
+// CheckFsmetaCompat verifies that all EROFS layers have block sizes compatible
+// with fsmeta merge (>= 4096 bytes). Returns nil if all layers are compatible,
+// or a *FsmetaCompatError identifying the first incompatible layer.
+//
+// Empty input is treated as compatible (nothing to merge).
+func CheckFsmetaCompat(layerPaths []string) error {
 	for _, path := range layerPaths {
 		blockSize, err := GetBlockSize(path)
 		if err != nil {
-			// If we can't read the block size, assume it's incompatible
-			return false
+			return &FsmetaCompatError{Path: path, MinRequired: erofsMinBlockSizeForFsmeta, Cause: err}
 		}
 		if blockSize < erofsMinBlockSizeForFsmeta {
-			return false
+			return &FsmetaCompatError{Path: path, BlockSize: blockSize, MinRequired: erofsMinBlockSizeForFsmeta}
 		}
 	}
-	return true
+	return nil
 }
 
 // LayerBlobFilename returns the filename for an EROFS layer blob based on its digest.

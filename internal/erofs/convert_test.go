@@ -20,6 +20,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -960,22 +961,33 @@ func TestConvertErofsNonexistentSource(t *testing.T) {
 	}
 }
 
-// TestCanMergeFsmeta tests the compatibility check for fsmeta merge.
-func TestCanMergeFsmeta(t *testing.T) {
+// TestCheckFsmetaCompat tests the compatibility check for fsmeta merge.
+func TestCheckFsmetaCompat(t *testing.T) {
 	t.Run("empty list", func(t *testing.T) {
 		// Empty list is compatible (nothing to merge)
-		if !CanMergeFsmeta(nil) {
-			t.Error("CanMergeFsmeta(nil) = false, want true")
+		if err := CheckFsmetaCompat(nil); err != nil {
+			t.Errorf("CheckFsmetaCompat(nil) = %v, want nil", err)
 		}
-		if !CanMergeFsmeta([]string{}) {
-			t.Error("CanMergeFsmeta([]) = false, want true")
+		if err := CheckFsmetaCompat([]string{}); err != nil {
+			t.Errorf("CheckFsmetaCompat([]) = %v, want nil", err)
 		}
 	})
 
 	t.Run("nonexistent files", func(t *testing.T) {
 		paths := []string{"/nonexistent/file1.erofs", "/nonexistent/file2.erofs"}
-		if CanMergeFsmeta(paths) {
-			t.Error("CanMergeFsmeta with nonexistent files should return false")
+		err := CheckFsmetaCompat(paths)
+		if err == nil {
+			t.Fatal("CheckFsmetaCompat with nonexistent files should return error")
+		}
+		var compatErr *FsmetaCompatError
+		if !errors.As(err, &compatErr) {
+			t.Fatalf("expected *FsmetaCompatError, got %T: %v", err, err)
+		}
+		if compatErr.Path != paths[0] {
+			t.Errorf("compatErr.Path = %q, want %q", compatErr.Path, paths[0])
+		}
+		if compatErr.Cause == nil {
+			t.Error("compatErr.Cause should be non-nil for read failures")
 		}
 	})
 
@@ -999,8 +1011,8 @@ func TestCanMergeFsmeta(t *testing.T) {
 			paths = append(paths, layerPath)
 		}
 
-		if !CanMergeFsmeta(paths) {
-			t.Error("CanMergeFsmeta should return true for compatible layers")
+		if err := CheckFsmetaCompat(paths); err != nil {
+			t.Errorf("CheckFsmetaCompat should return nil for compatible layers, got: %v", err)
 		}
 	})
 
@@ -1041,11 +1053,20 @@ func TestCanMergeFsmeta(t *testing.T) {
 
 		// Mixed layers should be incompatible if tar index has 512-byte blocks
 		paths := []string{normalPath, tarIndexPath}
-		canMerge := CanMergeFsmeta(paths)
+		compatErr := CheckFsmetaCompat(paths)
 
-		// If tar index has 512-byte blocks, should be incompatible
-		if tarIndexBlockSize < 4096 && canMerge {
-			t.Error("CanMergeFsmeta should return false for mixed layers with small block size")
+		// If tar index has 512-byte blocks, should report the offending path
+		if tarIndexBlockSize < 4096 {
+			if compatErr == nil {
+				t.Error("CheckFsmetaCompat should return error for mixed layers with small block size")
+			} else {
+				var e *FsmetaCompatError
+				if !errors.As(compatErr, &e) {
+					t.Errorf("expected *FsmetaCompatError, got %T: %v", compatErr, compatErr)
+				} else if e.Path != tarIndexPath {
+					t.Errorf("FsmetaCompatError.Path = %q, want %q", e.Path, tarIndexPath)
+				}
+			}
 		}
 	})
 }

@@ -42,6 +42,13 @@ const (
 
 	// manifestFilename is the filename for the layer manifest (stores digests in VMDK order).
 	manifestFilename = "layers.manifest"
+
+	// maxLayersForFallback is the hard cap on layers we will return as individual
+	// EROFS mounts when fsmeta generation has not produced a merged image.
+	// Practical microVM virtio-blk-pci slot counts cap out near this number, so
+	// returning more individual mounts only delays a guest-side attach failure.
+	// When fsmeta works, a single device covers any number of layers.
+	maxLayersForFallback = 32
 )
 
 // upperPath returns the path to the overlay upper directory for a snapshot.

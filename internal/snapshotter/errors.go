@@ -45,3 +45,26 @@ func (e *CommitConversionError) Error() string {
 func (e *CommitConversionError) Unwrap() error {
 	return e.Cause
 }
+
+// FsmetaFallbackTooManyLayersError is returned when fsmeta is unavailable and
+// the snapshot has more parent layers than we are willing to expose as
+// individual block devices. Returning N mounts in this case would shift the
+// failure to the guest, where attach errors are harder to diagnose.
+//
+// Recovery: investigate the fsmeta generation logs for the parent snapshot
+// (look for "fsmeta generation" warnings). Most often this means a layer was
+// produced with a block size below erofs.erofsMinBlockSizeForFsmeta, or
+// mkfs.erofs failed during the merge.
+type FsmetaFallbackTooManyLayersError struct {
+	SnapshotID string
+	ParentID   string
+	LayerCount int
+	Limit      int
+}
+
+func (e *FsmetaFallbackTooManyLayersError) Error() string {
+	return fmt.Sprintf(
+		"snapshot %s has %d parent layers but fsmeta is not available for parent %s; "+
+			"refusing to return individual mounts above %d (fix the underlying fsmeta failure)",
+		e.SnapshotID, e.LayerCount, e.ParentID, e.Limit)
+}

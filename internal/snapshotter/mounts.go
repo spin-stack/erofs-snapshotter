@@ -8,9 +8,26 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
+	"github.com/containerd/log"
 
 	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 )
+
+// fsmetaGenerationInProgress reports whether async fsmeta generation is still
+// running (or crashed mid-write) for the given parent snapshot. The lock and
+// .tmp files are written by generateFsMeta in commit.go.
+func (s *snapshotter) fsmetaGenerationInProgress(parentID string) bool {
+	fsmetaFile := s.fsMetaPath(parentID)
+	for _, suffix := range []string{".lock", ".tmp"} {
+		if _, err := os.Stat(fsmetaFile + suffix); err == nil {
+			return true
+		}
+	}
+	if _, err := os.Stat(s.vmdkPath(parentID) + ".tmp"); err == nil {
+		return true
+	}
+	return false
+}
 
 // mountFsMeta returns a mount for merged fsmeta.erofs if VMDK exists.
 // When VMDK exists, the consumer can use a single virtio-blk device for all layers.
@@ -236,6 +253,32 @@ func (s *snapshotter) buildErofsLayerMounts(snap storage.Snapshot) ([]mount.Moun
 	}
 
 	// Fallback: individual EROFS mounts (fsmeta not ready or generation failed)
+	layerCount := len(snap.ParentIDs)
+	if layerCount > maxLayersForFallback {
+		parentID := ""
+		if layerCount > 0 {
+			parentID = snap.ParentIDs[0]
+		}
+		return nil, &FsmetaFallbackTooManyLayersError{
+			SnapshotID: snap.ID,
+			ParentID:   parentID,
+			LayerCount: layerCount,
+			Limit:      maxLayersForFallback,
+		}
+	}
+
+	// Warn when fsmeta is permanently unavailable for a multi-layer snapshot.
+	// During normal operation fsmeta generation is async, so a transient miss
+	// right after Prepare is expected and silent. We only warn once it is clear
+	// no generation attempt is in flight.
+	if layerCount >= 2 && !s.fsmetaGenerationInProgress(snap.ParentIDs[0]) {
+		log.L.WithFields(log.Fields{
+			"snapshot":   snap.ID,
+			"parent":     snap.ParentIDs[0],
+			"layerCount": layerCount,
+		}).Warn("fsmeta unavailable; returning individual layer mounts (guest may hit device limits)")
+	}
+
 	layerPaths, err := s.getErofsLayerPaths(snap)
 	if err != nil {
 		return nil, err

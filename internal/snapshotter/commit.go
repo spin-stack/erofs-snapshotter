@@ -240,12 +240,15 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 		blobs = append(blobs, blob)
 	}
 
-	// Check block size compatibility for fsmeta merge
-	if !erofs.CanMergeFsmeta(blobs) {
-		log.G(ctx).WithFields(log.Fields{
+	// Check block size compatibility for fsmeta merge. This is a permanent
+	// failure (block sizes never change), so future mount calls will keep
+	// falling back to per-layer mounts until the layer blobs are regenerated.
+	// Logged at Warn so operators can spot the problematic layer.
+	if err := erofs.CheckFsmetaCompat(blobs); err != nil {
+		log.G(ctx).WithError(err).WithFields(log.Fields{
 			"layerCount": len(blobs),
 			"stage":      "check_compat",
-		}).Debug("fsmeta generation skipped: incompatible block sizes")
+		}).Warn("fsmeta generation permanently disabled: incompatible layer")
 		return
 	}
 
