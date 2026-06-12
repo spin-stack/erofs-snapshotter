@@ -547,3 +547,68 @@ func TestWriteAndCommitDiff(t *testing.T) {
 		}
 	})
 }
+
+func TestRejectStackedErofsLayers(t *testing.T) {
+	erofsMount := func(src string, opts ...string) mount.Mount {
+		return mount.Mount{Type: "erofs", Source: src, Options: append([]string{"ro", "loop"}, opts...)}
+	}
+
+	tests := []struct {
+		name    string
+		mounts  []mount.Mount
+		wantErr bool
+	}{
+		{
+			name:   "empty mounts",
+			mounts: nil,
+		},
+		{
+			name:   "single erofs layer",
+			mounts: []mount.Mount{erofsMount("/s/1/layer.erofs")},
+		},
+		{
+			name: "fsmeta multi-device mount",
+			mounts: []mount.Mount{{
+				Type:    "format/erofs",
+				Source:  "/s/1/fsmeta.erofs",
+				Options: []string{"ro", "loop", "device=/s/1/layer.erofs", "device=/s/2/layer.erofs"},
+			}},
+		},
+		{
+			name: "active snapshot: single erofs plus ext4",
+			mounts: []mount.Mount{
+				erofsMount("/s/1/layer.erofs"),
+				{Type: "ext4", Source: "/s/2/rwlayer.img", Options: []string{"rw", "loop"}},
+			},
+		},
+		{
+			name: "two stacked erofs layers without fsmeta",
+			mounts: []mount.Mount{
+				erofsMount("/s/2/layer.erofs"),
+				erofsMount("/s/1/layer.erofs"),
+			},
+			wantErr: true,
+		},
+		{
+			name: "stacked erofs layers plus ext4 without fsmeta",
+			mounts: []mount.Mount{
+				erofsMount("/s/2/layer.erofs"),
+				erofsMount("/s/1/layer.erofs"),
+				{Type: "ext4", Source: "/s/3/rwlayer.img", Options: []string{"rw", "loop"}},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := rejectStackedErofsLayers(tc.mounts)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected error for stacked EROFS layers, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}

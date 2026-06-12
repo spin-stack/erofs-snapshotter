@@ -127,7 +127,11 @@ func writeCompressedDiff(ctx context.Context, cw content.Writer, config diff.Con
 	}
 
 	err = writeFn(ctx, io.MultiWriter(compressed, dgstr.Hash()))
-	compressed.Close()
+	// Close flushes the compressor trailer; ignoring its error would commit
+	// a silently truncated blob.
+	if cerr := compressed.Close(); err == nil && cerr != nil {
+		err = fmt.Errorf("failed to close compressed stream: %w", cerr)
+	}
 	if err != nil {
 		return "", fmt.Errorf("failed to write compressed diff: %w", err)
 	}
@@ -238,6 +242,10 @@ func (s *ErofsDiff) writeAndCommitDiff(ctx context.Context, config diff.Config, 
 // If mounts require the mount manager (formatted mounts, templates, or EROFS),
 // it activates them through the mount manager first.
 func withLowerMount(ctx context.Context, lower []mount.Mount, mm mount.Manager, f func(root string) error) error {
+	if err := rejectStackedErofsLayers(lower); err != nil {
+		return err
+	}
+
 	// Handle EROFS multi-device mounts directly - the containerd mount manager
 	// cannot handle EROFS with device= options (fsmeta multi-device).
 	if mountutils.HasErofsMultiDevice(lower) {
@@ -286,6 +294,10 @@ func withLowerMount(ctx context.Context, lower []mount.Mount, mm mount.Manager, 
 // If mounts require the mount manager (formatted mounts, templates, or EROFS),
 // it activates them through the mount manager first.
 func withUpperMount(ctx context.Context, upper []mount.Mount, mm mount.Manager, f func(root string) error) error {
+	if err := rejectStackedErofsLayers(upper); err != nil {
+		return err
+	}
+
 	// Handle active snapshot mounts (EROFS + ext4) - create overlay on host
 	if mountutils.HasActiveSnapshotMounts(upper) {
 		return withActiveSnapshotMount(ctx, upper, f)
@@ -331,9 +343,41 @@ func withUpperMount(ctx context.Context, upper []mount.Mount, mm mount.Manager, 
 	return mount.WithReadonlyTempMount(ctx, upper, f)
 }
 
-// withActiveSnapshotMount handles active snapshot mounts (EROFS + ext4) by creating
-// an overlay on the host. The EROFS layers form the lowerdir, and the ext4's /upper
-// forms the upperdir. This allows Compare to see the changes made in the container.
+// rejectStackedErofsLayers fails when the mounts contain more than one plain
+// EROFS layer mount (no merged fsmeta with device= options). mount.All and the
+// mount manager would stack them all on the same target, leaving only the
+// last layer visible, so any diff computed from such a view is silently
+// wrong. The snapshotter only returns individual layer mounts when fsmeta
+// generation has not completed; the caller should retry once it has.
+func rejectStackedErofsLayers(mounts []mount.Mount) error {
+	layers := 0
+	for _, m := range mounts {
+		if mountutils.TypeSuffix(m.Type) != "erofs" {
+			continue
+		}
+		multiDevice := false
+		for _, opt := range m.Options {
+			if strings.HasPrefix(opt, "device=") {
+				multiDevice = true
+				break
+			}
+		}
+		if !multiDevice {
+			layers++
+		}
+	}
+	if layers > 1 {
+		return fmt.Errorf("cannot diff %d individual EROFS layer mounts without a merged fsmeta (layers would be stacked on a single mount point): %w", layers, errdefs.ErrFailedPrecondition)
+	}
+	return nil
+}
+
+// withActiveSnapshotMount handles active snapshot mounts (EROFS + ext4) by
+// creating a read-only overlay on the host: the guest's upper directory inside
+// the ext4 is stacked as the top lower layer over the EROFS layers, so its
+// whiteouts are honored without requiring a writable upperdir/workdir. This
+// allows Compare to see the changes made in the container without mutating
+// the snapshot.
 func withActiveSnapshotMount(ctx context.Context, mounts []mount.Mount, f func(root string) error) error {
 	// Separate EROFS and ext4 mounts
 	var erofsMounts []mount.Mount
@@ -357,7 +401,18 @@ func withActiveSnapshotMount(ctx context.Context, mounts []mount.Mount, f func(r
 	if err != nil {
 		return fmt.Errorf("failed to create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tempBase)
+	// Remove the temp tree only if every unmount succeeded: RemoveAll under a
+	// still-attached mount would traverse into it and delete snapshot data.
+	unmountFailed := false
+	defer func() {
+		if unmountFailed {
+			log.G(ctx).WithField("dir", tempBase).Warn("leaving temp dir in place: unmount failed and removal could destroy mounted snapshot data")
+			return
+		}
+		if rerr := os.RemoveAll(tempBase); rerr != nil {
+			log.G(ctx).WithError(rerr).WithField("dir", tempBase).Warn("failed to remove temp dir")
+		}
+	}()
 
 	erofsDir := filepath.Join(tempBase, "erofs")
 	ext4Dir := filepath.Join(tempBase, "ext4")
@@ -376,48 +431,46 @@ func withActiveSnapshotMount(ctx context.Context, mounts []mount.Mount, f func(r
 	}
 	defer func() {
 		if cerr := erofsCleanup(); cerr != nil {
+			unmountFailed = true
 			log.G(ctx).WithError(cerr).Warn("failed to cleanup EROFS mount")
 		}
 	}()
 
-	// Mount ext4 writable layer
+	// Mount ext4 writable layer (read-only, image lock held until cleanup)
 	ext4Cleanup, err := mountutils.MountExt4(ext4Mount.Source, ext4Dir)
 	if err != nil {
 		return fmt.Errorf("failed to mount ext4: %w", err)
 	}
 	defer func() {
 		if cerr := ext4Cleanup(); cerr != nil {
+			unmountFailed = true
 			log.G(ctx).WithError(cerr).Warn("failed to cleanup ext4 mount")
 		}
 	}()
 
-	// The ext4 contains /upper and /work for overlay at its root.
+	// The guest creates /upper and /work at the ext4 root (same layout that
+	// mountBlockRwLayer prepares for extract snapshots).
 	// Note: The "rw" in blockRwMountPath is the HOST mount point, not a directory inside ext4.
 	upperDir := filepath.Join(ext4Dir, "upper")
-	workDir := filepath.Join(ext4Dir, "work")
-
-	// Ensure directories exist (they should from VM usage)
 	if _, err := os.Stat(upperDir); err != nil {
-		// If upper doesn't exist, the container had no changes
-		log.G(ctx).Debug("ext4 upper directory doesn't exist, using empty overlay")
-		if err := os.MkdirAll(upperDir, 0o755); err != nil {
-			return fmt.Errorf("failed to create upper dir: %w", err)
-		}
-	}
-	if _, err := os.Stat(workDir); err != nil {
-		if err := os.MkdirAll(workDir, 0o755); err != nil {
-			return fmt.Errorf("failed to create work dir: %w", err)
-		}
+		// No upper directory means the container made no changes: the merged
+		// view equals the lower layers. The ext4 is mounted read-only, so the
+		// directory cannot be created here.
+		log.G(ctx).Debug("ext4 upper directory doesn't exist, diffing against lower layers only")
+		return f(erofsDir)
 	}
 
-	// Create overlay mount
-	overlayOpts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", erofsDir, upperDir, workDir)
-	if err := unix.Mount("overlay", overlayDir, "overlay", 0, overlayOpts); err != nil {
+	// Read-only overlay: stacking the guest upper as the top lowerdir keeps
+	// whiteout/opaque handling intact and needs no writable upperdir/workdir
+	// (the ext4 is mounted read-only).
+	overlayOpts := fmt.Sprintf("lowerdir=%s:%s", upperDir, erofsDir)
+	if err := unix.Mount("overlay", overlayDir, "overlay", unix.MS_RDONLY, overlayOpts); err != nil {
 		return fmt.Errorf("failed to mount overlay: %w", err)
 	}
 	defer func() {
-		if err := unix.Unmount(overlayDir, 0); err != nil {
-			log.G(ctx).WithError(err).Warn("failed to unmount overlay")
+		if uerr := unix.Unmount(overlayDir, 0); uerr != nil {
+			unmountFailed = true
+			log.G(ctx).WithError(uerr).Warn("failed to unmount overlay")
 		}
 	}()
 
@@ -432,7 +485,18 @@ func withErofsTempMount(ctx context.Context, mounts []mount.Mount, f func(root s
 	if err != nil {
 		return fmt.Errorf("failed to create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tempDir)
+	// Remove the temp dir only if the unmount succeeded (see
+	// withActiveSnapshotMount).
+	unmountFailed := false
+	defer func() {
+		if unmountFailed {
+			log.G(ctx).WithField("dir", tempDir).Warn("leaving temp dir in place: unmount failed")
+			return
+		}
+		if rerr := os.RemoveAll(tempDir); rerr != nil {
+			log.G(ctx).WithError(rerr).WithField("dir", tempDir).Warn("failed to remove temp dir")
+		}
+	}()
 
 	cleanup, err := mountutils.MountAll(mounts, tempDir)
 	if err != nil {
@@ -440,6 +504,7 @@ func withErofsTempMount(ctx context.Context, mounts []mount.Mount, f func(root s
 	}
 	defer func() {
 		if cerr := cleanup(); cerr != nil {
+			unmountFailed = true
 			log.G(ctx).WithError(cerr).Warn("failed to cleanup EROFS mount")
 		}
 	}()
