@@ -548,15 +548,15 @@ func TestWriteAndCommitDiff(t *testing.T) {
 	})
 }
 
-func TestRejectStackedErofsLayers(t *testing.T) {
+func TestStackedErofsLayers(t *testing.T) {
 	erofsMount := func(src string, opts ...string) mount.Mount {
 		return mount.Mount{Type: "erofs", Source: src, Options: append([]string{"ro", "loop"}, opts...)}
 	}
 
 	tests := []struct {
-		name    string
-		mounts  []mount.Mount
-		wantErr bool
+		name   string
+		mounts []mount.Mount
+		want   bool
 	}{
 		{
 			name:   "empty mounts",
@@ -575,39 +575,26 @@ func TestRejectStackedErofsLayers(t *testing.T) {
 			}},
 		},
 		{
-			name: "active snapshot: single erofs plus ext4",
+			name: "active snapshot: erofs plus ext4",
 			mounts: []mount.Mount{
 				erofsMount("/s/1/layer.erofs"),
 				{Type: "ext4", Source: "/s/2/rwlayer.img", Options: []string{"rw", "loop"}},
 			},
 		},
 		{
-			name: "two stacked erofs layers without fsmeta",
+			name: "two individual erofs layers without fsmeta",
 			mounts: []mount.Mount{
 				erofsMount("/s/2/layer.erofs"),
 				erofsMount("/s/1/layer.erofs"),
 			},
-			wantErr: true,
-		},
-		{
-			name: "stacked erofs layers plus ext4 without fsmeta",
-			mounts: []mount.Mount{
-				erofsMount("/s/2/layer.erofs"),
-				erofsMount("/s/1/layer.erofs"),
-				{Type: "ext4", Source: "/s/3/rwlayer.img", Options: []string{"rw", "loop"}},
-			},
-			wantErr: true,
+			want: true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := rejectStackedErofsLayers(tc.mounts)
-			if tc.wantErr && err == nil {
-				t.Fatal("expected error for stacked EROFS layers, got nil")
-			}
-			if !tc.wantErr && err != nil {
-				t.Fatalf("unexpected error: %v", err)
+			if got := stackedErofsLayers(tc.mounts); got != tc.want {
+				t.Fatalf("stackedErofsLayers = %v, want %v", got, tc.want)
 			}
 		})
 	}
