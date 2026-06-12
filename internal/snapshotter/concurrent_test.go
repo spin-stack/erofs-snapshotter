@@ -129,18 +129,22 @@ func TestConcurrentView(t *testing.T) {
 
 	// All View calls have returned, so every background fsmeta generation has
 	// already been registered with bgWg; wait for them to finish and verify
-	// the coordination left no lock or temp artifacts behind.
+	// the coordination left no temp artifacts or held locks behind. The lock
+	// FILE itself legitimately persists: it is never unlinked at runtime
+	// (see fsmetaLock), only the flock on it must have been released.
 	s.bgWg.Wait()
 
 	parentID := snapshotIDForKey(t, s, ctx, "committed-base")
 	for _, path := range []string{
-		s.fsMetaPath(parentID) + ".lock",
 		s.fsMetaPath(parentID) + ".tmp",
 		s.vmdkPath(parentID) + ".tmp",
 	} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Errorf("expected no residual fsmeta artifact %s, got err=%v", path, err)
 		}
+	}
+	if s.fsmetaGenerationInProgress(parentID) {
+		t.Error("fsmeta generation lock still held after all background work finished")
 	}
 
 	// fsmeta and VMDK must be consistent: either both were generated or neither
