@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,9 +19,16 @@ import (
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/archive/compression"
+	"github.com/containerd/containerd/v2/pkg/labels"
+	"github.com/containerd/containerd/v2/pkg/testutil"
 	"github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sys/unix"
+
+	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
+	"github.com/spin-stack/erofs-snapshotter/internal/loop"
 
 	// Import testutil to register the -test.root flag
 	_ "github.com/spin-stack/erofs-snapshotter/internal/testutil"
@@ -791,6 +799,472 @@ func TestWithUpperMountManagerActivation(t *testing.T) {
 			t.Errorf("root = %q, want bind source %q", gotRoot, bindDir)
 		}
 		checkActivationBalanced(t, mm)
+	})
+}
+
+// requireRootAndTools skips the test unless it runs as root (via -test.root)
+// and all the given binaries are installed.
+func requireRootAndTools(t *testing.T, bins ...string) {
+	t.Helper()
+	for _, bin := range bins {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+	testutil.RequiresRoot(t)
+}
+
+// buildErofsLayerBlob creates an EROFS layer blob containing the given files.
+func buildErofsLayerBlob(t *testing.T, files map[string]string) string {
+	t.Helper()
+	src := t.TempDir()
+	for name, contents := range files {
+		p := filepath.Join(src, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("failed to create dir for %s: %v", name, err)
+		}
+		if err := os.WriteFile(p, []byte(contents), 0o644); err != nil {
+			t.Fatalf("failed to write %s: %v", name, err)
+		}
+	}
+	blob := filepath.Join(t.TempDir(), "layer.erofs")
+	if err := erofs.ConvertErofs(context.Background(), blob, src, nil); err != nil {
+		t.Fatalf("mkfs.erofs failed: %v", err)
+	}
+	return blob
+}
+
+// buildFsmeta merges the given layer blobs (oldest-first) into a fsmeta.erofs
+// using the same mkfs.erofs invocation shape as the snapshotter's
+// generateFsMeta (--quiet --vmdk-desc=<vmdk> <fsmeta> <blobs...>).
+func buildFsmeta(t *testing.T, blobs ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	fsmeta := filepath.Join(dir, "fsmeta.erofs")
+	vmdk := filepath.Join(dir, "merged.vmdk")
+	args := append([]string{"--quiet", "--vmdk-desc=" + vmdk, fsmeta}, blobs...)
+	if out, err := exec.Command("mkfs.erofs", args...).CombinedOutput(); err != nil {
+		t.Skipf("mkfs.erofs does not support fsmeta merge: %v: %s", err, out)
+	}
+	return fsmeta
+}
+
+// erofsLayerMount returns the plain EROFS layer mount the snapshotter emits
+// while fsmeta generation has not completed.
+func erofsLayerMount(blob string) mount.Mount {
+	return mount.Mount{Type: "erofs", Source: blob, Options: []string{"ro", "loop"}}
+}
+
+// createExt4Image creates an empty ext4 image of the given size.
+func createExt4Image(t *testing.T, sizeMB int64) string {
+	t.Helper()
+	img := filepath.Join(t.TempDir(), "rwlayer.img")
+	f, err := os.Create(img)
+	if err != nil {
+		t.Fatalf("failed to create ext4 image file: %v", err)
+	}
+	if err := f.Truncate(sizeMB << 20); err != nil {
+		f.Close()
+		t.Fatalf("failed to truncate ext4 image: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("failed to close ext4 image: %v", err)
+	}
+	if out, err := exec.Command("mkfs.ext4", "-q", "-F", img).CombinedOutput(); err != nil {
+		t.Fatalf("mkfs.ext4 failed: %v: %s", err, out)
+	}
+	return img
+}
+
+// populateExt4 temporarily mounts img read-write and runs fill to seed its
+// contents. The image is unmounted (and its loop device released) before
+// returning, so MountExt4 can later take the image locks.
+func populateExt4(t *testing.T, img string, fill func(root string)) {
+	t.Helper()
+	dir := t.TempDir()
+	if out, err := exec.Command("mount", "-o", "loop,rw", img, dir).CombinedOutput(); err != nil {
+		t.Fatalf("failed to mount ext4 read-write: %v: %s", err, out)
+	}
+	defer func() {
+		if out, err := exec.Command("umount", dir).CombinedOutput(); err != nil {
+			t.Fatalf("failed to unmount ext4: %v: %s", err, out)
+		}
+	}()
+	fill(dir)
+}
+
+// checkNoLoopDevice asserts that no loop device remains attached to any of
+// the given backing files after the with*Mount helpers returned.
+func checkNoLoopDevice(t *testing.T, backingFiles ...string) {
+	t.Helper()
+	for _, f := range backingFiles {
+		dev, err := loop.FindByBackingFile(f)
+		if err != nil {
+			t.Fatalf("failed to look up loop device for %s: %v", f, err)
+		}
+		if dev != nil {
+			t.Errorf("loop device %s still attached to %s", dev.Path, f)
+		}
+	}
+}
+
+// readFileString reads a file and fails the test on error.
+func readFileString(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", path, err)
+	}
+	return string(data)
+}
+
+func TestWithStackedErofsTempMount(t *testing.T) {
+	requireRootAndTools(t, "mkfs.erofs")
+	ctx := context.Background()
+
+	older := buildErofsLayerBlob(t, map[string]string{
+		"base.txt":     "from older layer",
+		"conflict.txt": "older wins is a bug",
+	})
+	newer := buildErofsLayerBlob(t, map[string]string{
+		"new.txt":      "from newer layer",
+		"conflict.txt": "newer wins",
+	})
+
+	// Snapshotter fallback mount order: newest first.
+	mounts := []mount.Mount{erofsLayerMount(newer), erofsLayerMount(older)}
+
+	called := false
+	err := withStackedErofsTempMount(ctx, mounts, func(root string) error {
+		called = true
+		// Both layers' files must be visible in the merged view.
+		if got := readFileString(t, filepath.Join(root, "base.txt")); got != "from older layer" {
+			t.Errorf("base.txt = %q, want %q", got, "from older layer")
+		}
+		if got := readFileString(t, filepath.Join(root, "new.txt")); got != "from newer layer" {
+			t.Errorf("new.txt = %q, want %q", got, "from newer layer")
+		}
+		// The newest layer must win for conflicting paths.
+		if got := readFileString(t, filepath.Join(root, "conflict.txt")); got != "newer wins" {
+			t.Errorf("conflict.txt = %q, want %q", got, "newer wins")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withStackedErofsTempMount failed: %v", err)
+	}
+	if !called {
+		t.Fatal("callback was not called")
+	}
+
+	checkNoLoopDevice(t, newer, older)
+}
+
+func TestWithErofsTempMountMultiDevice(t *testing.T) {
+	requireRootAndTools(t, "mkfs.erofs")
+	ctx := context.Background()
+
+	layer1 := buildErofsLayerBlob(t, map[string]string{"a.txt": "from layer one"})
+	layer2 := buildErofsLayerBlob(t, map[string]string{"b.txt": "from layer two"})
+	fsmeta := buildFsmeta(t, layer1, layer2)
+
+	// Merged fsmeta multi-device mount: device= options in oldest-first order,
+	// matching the blob order passed to mkfs.erofs.
+	mounts := []mount.Mount{{
+		Type:    "erofs",
+		Source:  fsmeta,
+		Options: []string{"ro", "loop", "device=" + layer1, "device=" + layer2},
+	}}
+
+	called := false
+	err := withErofsTempMount(ctx, mounts, func(root string) error {
+		called = true
+		if got := readFileString(t, filepath.Join(root, "a.txt")); got != "from layer one" {
+			t.Errorf("a.txt = %q, want %q", got, "from layer one")
+		}
+		if got := readFileString(t, filepath.Join(root, "b.txt")); got != "from layer two" {
+			t.Errorf("b.txt = %q, want %q", got, "from layer two")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withErofsTempMount failed: %v", err)
+	}
+	if !called {
+		t.Fatal("callback was not called")
+	}
+
+	checkNoLoopDevice(t, fsmeta, layer1, layer2)
+}
+
+func TestWithExt4UpperMount(t *testing.T) {
+	requireRootAndTools(t, "mkfs.ext4")
+	ctx := context.Background()
+
+	t.Run("upper directory is the diff root", func(t *testing.T) {
+		img := createExt4Image(t, 8)
+		populateExt4(t, img, func(root string) {
+			for _, dir := range []string{"upper", "work", "rogue-dir"} {
+				if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+					t.Fatalf("failed to create %s: %v", dir, err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(root, "upper", "hello.txt"), []byte("hello from upper"), 0o644); err != nil {
+				t.Fatalf("failed to write upper file: %v", err)
+			}
+			// rogue-dir exercises the warnUnexpectedExt4Entries warning branch.
+			if err := os.WriteFile(filepath.Join(root, "rogue-dir", "stray.txt"), []byte("stray"), 0o644); err != nil {
+				t.Fatalf("failed to write stray file: %v", err)
+			}
+		})
+
+		mounts := []mount.Mount{{Type: "ext4", Source: img, Options: []string{"rw", "loop"}}}
+
+		var gotRoot string
+		err := withUpperMount(ctx, mounts, nil, func(root string) error {
+			gotRoot = root
+			if got := readFileString(t, filepath.Join(root, "hello.txt")); got != "hello from upper" {
+				t.Errorf("hello.txt = %q, want %q", got, "hello from upper")
+			}
+			// The diff root is upper/ itself: ext4 root entries such as
+			// lost+found, work/ and the stray rogue-dir/ must not leak in.
+			entries, err := os.ReadDir(root)
+			if err != nil {
+				return err
+			}
+			if len(entries) != 1 || entries[0].Name() != "hello.txt" {
+				names := make([]string, 0, len(entries))
+				for _, e := range entries {
+					names = append(names, e.Name())
+				}
+				t.Errorf("diff root entries = %v, want [hello.txt]", names)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("withUpperMount failed: %v", err)
+		}
+		if filepath.Base(gotRoot) != "upper" {
+			t.Errorf("diff root = %q, want the ext4 upper/ directory", gotRoot)
+		}
+
+		checkNoLoopDevice(t, img)
+	})
+
+	t.Run("missing upper yields empty diff root", func(t *testing.T) {
+		img := createExt4Image(t, 8)
+
+		mounts := []mount.Mount{{Type: "ext4", Source: img, Options: []string{"rw", "loop"}}}
+
+		called := false
+		err := withUpperMount(ctx, mounts, nil, func(root string) error {
+			called = true
+			entries, err := os.ReadDir(root)
+			if err != nil {
+				return err
+			}
+			if len(entries) != 0 {
+				t.Errorf("expected empty diff root, got %d entries", len(entries))
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("withUpperMount failed: %v", err)
+		}
+		if !called {
+			t.Fatal("callback was not called")
+		}
+
+		checkNoLoopDevice(t, img)
+	})
+}
+
+func TestWithActiveSnapshotMountOverlay(t *testing.T) {
+	requireRootAndTools(t, "mkfs.erofs", "mkfs.ext4")
+	ctx := context.Background()
+
+	layer := buildErofsLayerBlob(t, map[string]string{
+		"keep.txt":    "keep me",
+		"removed.txt": "remove me",
+	})
+
+	img := createExt4Image(t, 8)
+	populateExt4(t, img, func(root string) {
+		for _, dir := range []string{"upper", "work"} {
+			if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+				t.Fatalf("failed to create %s: %v", dir, err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(root, "upper", "added.txt"), []byte("added in container"), 0o644); err != nil {
+			t.Fatalf("failed to write added file: %v", err)
+		}
+		// Overlay whiteout: a 0:0 character device in upper/ hides the
+		// matching file from the EROFS layer below.
+		if err := unix.Mknod(filepath.Join(root, "upper", "removed.txt"), unix.S_IFCHR, 0); err != nil {
+			t.Fatalf("failed to create whiteout: %v", err)
+		}
+	})
+
+	// EROFS layer + ext4 writable layer: HasActiveSnapshotMounts routes this
+	// through withActiveSnapshotMount.
+	mounts := []mount.Mount{
+		erofsLayerMount(layer),
+		{Type: "ext4", Source: img, Options: []string{"rw", "loop"}},
+	}
+
+	called := false
+	err := withUpperMount(ctx, mounts, nil, func(root string) error {
+		called = true
+		// File added by the guest is visible.
+		if got := readFileString(t, filepath.Join(root, "added.txt")); got != "added in container" {
+			t.Errorf("added.txt = %q, want %q", got, "added in container")
+		}
+		// Base layer files remain visible.
+		if got := readFileString(t, filepath.Join(root, "keep.txt")); got != "keep me" {
+			t.Errorf("keep.txt = %q, want %q", got, "keep me")
+		}
+		// The whiteout target must NOT be visible in the merged view.
+		if _, err := os.Stat(filepath.Join(root, "removed.txt")); !os.IsNotExist(err) {
+			t.Errorf("removed.txt should be hidden by the whiteout, stat err = %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withUpperMount failed: %v", err)
+	}
+	if !called {
+		t.Fatal("callback was not called")
+	}
+
+	checkNoLoopDevice(t, layer, img)
+}
+
+func TestEnsureUncompressedLabel(t *testing.T) {
+	ctx := context.Background()
+
+	ingest := func(t *testing.T, store content.Store, data []byte) content.Info {
+		t.Helper()
+		desc := ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageLayer,
+			Digest:    digest.FromBytes(data),
+			Size:      int64(len(data)),
+		}
+		if err := content.WriteBlob(ctx, store, "label-"+desc.Digest.String(), bytes.NewReader(data), desc); err != nil {
+			t.Fatalf("failed to write blob: %v", err)
+		}
+		info, err := store.Info(ctx, desc.Digest)
+		if err != nil {
+			t.Fatalf("failed to get info: %v", err)
+		}
+		if info.Labels == nil {
+			info.Labels = make(map[string]string)
+		}
+		return info
+	}
+
+	t.Run("existing label is left untouched", func(t *testing.T) {
+		store := newTestContentStore(t)
+		d := NewErofsDiffer(store)
+		info := ingest(t, store, []byte("blob with existing label"))
+
+		// Simulate a label already present on the info: no store update must
+		// happen, so the store keeps NO label for this blob.
+		info.Labels[labels.LabelUncompressed] = "sha256:existing"
+		if err := d.ensureUncompressedLabel(ctx, info, "sha256:replacement"); err != nil {
+			t.Fatalf("ensureUncompressedLabel failed: %v", err)
+		}
+
+		stored, err := store.Info(ctx, info.Digest)
+		if err != nil {
+			t.Fatalf("failed to get info: %v", err)
+		}
+		if got := stored.Labels[labels.LabelUncompressed]; got != "" {
+			t.Errorf("store label = %q, want no update when the label already exists", got)
+		}
+	})
+
+	t.Run("missing label is set on the store", func(t *testing.T) {
+		store := newTestContentStore(t)
+		d := NewErofsDiffer(store)
+		info := ingest(t, store, []byte("blob without label"))
+
+		const uncompressed = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		if err := d.ensureUncompressedLabel(ctx, info, uncompressed); err != nil {
+			t.Fatalf("ensureUncompressedLabel failed: %v", err)
+		}
+
+		stored, err := store.Info(ctx, info.Digest)
+		if err != nil {
+			t.Fatalf("failed to get info: %v", err)
+		}
+		if got := stored.Labels[labels.LabelUncompressed]; got != uncompressed {
+			t.Errorf("store label = %q, want %q", got, uncompressed)
+		}
+	})
+}
+
+// errWriteCloser is an io.WriteCloser that fails on demand.
+type errWriteCloser struct {
+	writeErr error
+	closeErr error
+}
+
+func (w *errWriteCloser) Write(p []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return len(p), nil
+}
+
+func (w *errWriteCloser) Close() error {
+	return w.closeErr
+}
+
+func TestWriteCompressedDiffCompressorErrors(t *testing.T) {
+	ctx := context.Background()
+	writePayload := func(_ context.Context, w io.Writer) error {
+		_, err := w.Write([]byte("diff payload"))
+		return err
+	}
+
+	t.Run("compressor constructor error", func(t *testing.T) {
+		cfg := diff.Config{
+			MediaType: ocispec.MediaTypeImageLayerGzip,
+			Compressor: func(io.Writer, string) (io.WriteCloser, error) {
+				return nil, errors.New("no compressor available")
+			},
+		}
+		_, err := writeCompressedDiff(ctx, nil, cfg, compression.Gzip, writePayload)
+		if err == nil || !strings.Contains(err.Error(), "failed to get compressed stream") {
+			t.Fatalf("expected compressed stream error, got: %v", err)
+		}
+	})
+
+	t.Run("compressor write error propagates", func(t *testing.T) {
+		writeErr := errors.New("compressor write failed")
+		cfg := diff.Config{
+			MediaType: ocispec.MediaTypeImageLayerGzip,
+			Compressor: func(io.Writer, string) (io.WriteCloser, error) {
+				return &errWriteCloser{writeErr: writeErr}, nil
+			},
+		}
+		_, err := writeCompressedDiff(ctx, nil, cfg, compression.Gzip, writePayload)
+		if err == nil || !errors.Is(err, writeErr) {
+			t.Fatalf("expected write error, got: %v", err)
+		}
+	})
+
+	t.Run("compressor close error propagates", func(t *testing.T) {
+		cfg := diff.Config{
+			MediaType: ocispec.MediaTypeImageLayerGzip,
+			Compressor: func(io.Writer, string) (io.WriteCloser, error) {
+				return &errWriteCloser{closeErr: errors.New("trailer flush failed")}, nil
+			},
+		}
+		_, err := writeCompressedDiff(ctx, nil, cfg, compression.Gzip, writePayload)
+		if err == nil || !strings.Contains(err.Error(), "failed to close compressed stream") {
+			t.Fatalf("expected close error, got: %v", err)
+		}
 	})
 }
 

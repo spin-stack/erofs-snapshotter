@@ -1,18 +1,29 @@
 package differ
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"errors"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
+	"testing/iotest"
 
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/plugins/content/local"
+	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 	// Import testutil to register the -test.root flag
 	_ "github.com/spin-stack/erofs-snapshotter/internal/testutil"
 )
@@ -338,6 +349,275 @@ func TestDifferStoreAccess(t *testing.T) {
 	if d.store != store {
 		t.Error("differ should retain the store passed to NewErofsDiffer")
 	}
+}
+
+// requireMkfsErofs skips the test when mkfs.erofs is not installed.
+func requireMkfsErofs(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
+		t.Skip("mkfs.erofs not installed")
+	}
+}
+
+// requireTarConversion skips the test when mkfs.erofs lacks tar mode (--tar).
+func requireTarConversion(t *testing.T) {
+	t.Helper()
+	requireMkfsErofs(t)
+	ok, err := erofs.SupportGenerateFromTar()
+	if err != nil || !ok {
+		t.Skip("mkfs.erofs does not support tar conversion mode")
+	}
+}
+
+// newLocalStore creates a plain local content store for Apply tests.
+func newLocalStore(t *testing.T) content.Store {
+	t.Helper()
+	store, err := local.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to create content store: %v", err)
+	}
+	return store
+}
+
+// makeTar returns an uncompressed tar archive containing the given files,
+// written in sorted name order for a deterministic digest.
+func makeTar(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, name := range names {
+		contents := files[name]
+		hdr := &tar.Header{
+			Name: name,
+			Mode: 0o644,
+			Size: int64(len(contents)),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("failed to write tar header for %s: %v", name, err)
+		}
+		if _, err := tw.Write([]byte(contents)); err != nil {
+			t.Fatalf("failed to write tar contents for %s: %v", name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("failed to close tar writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// gzipBytes compresses data with gzip.
+func gzipBytes(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(data); err != nil {
+		t.Fatalf("failed to gzip data: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("failed to close gzip writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// ingestBlob writes data into the content store and returns its descriptor.
+func ingestBlob(ctx context.Context, t *testing.T, store content.Store, mediaType string, data []byte) ocispec.Descriptor {
+	t.Helper()
+	desc := ocispec.Descriptor{
+		MediaType: mediaType,
+		Digest:    digest.FromBytes(data),
+		Size:      int64(len(data)),
+	}
+	if err := content.WriteBlob(ctx, store, "ingest-"+desc.Digest.String(), bytes.NewReader(data), desc); err != nil {
+		t.Fatalf("failed to write blob to content store: %v", err)
+	}
+	return desc
+}
+
+// newApplyTarget creates a snapshot-like layer directory (with the
+// .erofslayer marker) and the extract-style bind mounts the snapshotter hands
+// to the differ: a bind mount of the snapshot's fs/ directory, whose parent
+// must contain the marker for MountsToLayer validation.
+func newApplyTarget(t *testing.T) (string, []mount.Mount) {
+	t.Helper()
+	layerDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(layerDir, erofs.ErofsLayerMarker), nil, 0o644); err != nil {
+		t.Fatalf("failed to write layer marker: %v", err)
+	}
+	fsDir := filepath.Join(layerDir, "fs")
+	if err := os.MkdirAll(fsDir, 0o755); err != nil {
+		t.Fatalf("failed to create fs dir: %v", err)
+	}
+	mounts := []mount.Mount{{Type: "bind", Source: fsDir, Options: []string{"rw", "rbind"}}}
+	return layerDir, mounts
+}
+
+func TestApplyConvertsTarLayer(t *testing.T) {
+	requireTarConversion(t)
+	ctx := context.Background()
+
+	tarData := makeTar(t, map[string]string{
+		"hello.txt":      "hello world",
+		"dir/nested.txt": "nested contents",
+	})
+	tarDigest := digest.FromBytes(tarData)
+
+	tests := []struct {
+		name      string
+		mediaType string
+		blob      []byte
+	}{
+		{"uncompressed tar", ocispec.MediaTypeImageLayer, tarData},
+		{"gzip compressed tar", ocispec.MediaTypeImageLayerGzip, gzipBytes(t, tarData)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newLocalStore(t)
+			d := NewErofsDiffer(store)
+			desc := ingestBlob(ctx, t, store, tc.mediaType, tc.blob)
+			layerDir, mounts := newApplyTarget(t)
+
+			got, err := d.Apply(ctx, desc, mounts)
+			if err != nil {
+				t.Fatalf("Apply failed: %v", err)
+			}
+
+			// Apply must return the descriptor of the UNCOMPRESSED tar
+			// stream regardless of the input compression.
+			if got.MediaType != ocispec.MediaTypeImageLayer {
+				t.Errorf("media type = %q, want %q", got.MediaType, ocispec.MediaTypeImageLayer)
+			}
+			if got.Digest != tarDigest {
+				t.Errorf("digest = %s, want uncompressed tar digest %s", got.Digest, tarDigest)
+			}
+			if got.Size != int64(len(tarData)) {
+				t.Errorf("size = %d, want %d", got.Size, len(tarData))
+			}
+
+			// The EROFS blob must exist under the digest-based name and be a
+			// valid EROFS image with fsmeta-compatible block size.
+			blobPath := filepath.Join(layerDir, erofs.LayerBlobFilename(desc.Digest.String()))
+			blockSize, err := erofs.GetBlockSize(blobPath)
+			if err != nil {
+				t.Fatalf("layer blob is not a valid EROFS image: %v", err)
+			}
+			if blockSize < 4096 {
+				t.Errorf("block size = %d, want >= 4096 (fsmeta merge compatibility)", blockSize)
+			}
+
+			// No partially-written temp file may remain.
+			if _, err := os.Stat(blobPath + ".tmp"); !os.IsNotExist(err) {
+				t.Errorf("temporary blob file still present: %v", err)
+			}
+		})
+	}
+}
+
+func TestApplyNativeErofsLayer(t *testing.T) {
+	requireMkfsErofs(t)
+	ctx := context.Background()
+
+	// Build a small native EROFS blob from a directory.
+	srcDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(srcDir, "native.txt"), []byte("native erofs contents"), 0o644); err != nil {
+		t.Fatalf("failed to write source file: %v", err)
+	}
+	erofsPath := filepath.Join(t.TempDir(), "native.erofs")
+	if err := erofs.ConvertErofs(ctx, erofsPath, srcDir, nil); err != nil {
+		t.Fatalf("mkfs.erofs failed: %v", err)
+	}
+	blob, err := os.ReadFile(erofsPath)
+	if err != nil {
+		t.Fatalf("failed to read EROFS blob: %v", err)
+	}
+
+	t.Run("copies blob and returns descriptor unchanged", func(t *testing.T) {
+		store := newLocalStore(t)
+		d := NewErofsDiffer(store)
+		desc := ingestBlob(ctx, t, store, images.MediaTypeErofsLayer, blob)
+		layerDir, mounts := newApplyTarget(t)
+
+		got, err := d.Apply(ctx, desc, mounts)
+		if err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Native EROFS layers pass through: the descriptor is unchanged.
+		if got.MediaType != desc.MediaType || got.Digest != desc.Digest || got.Size != desc.Size {
+			t.Errorf("descriptor changed: got %+v, want %+v", got, desc)
+		}
+
+		blobPath := filepath.Join(layerDir, erofs.LayerBlobFilename(desc.Digest.String()))
+		copied, err := os.ReadFile(blobPath)
+		if err != nil {
+			t.Fatalf("failed to read copied blob: %v", err)
+		}
+		if !bytes.Equal(copied, blob) {
+			t.Error("copied blob differs from original EROFS blob")
+		}
+		if _, err := erofs.GetBlockSize(blobPath); err != nil {
+			t.Errorf("copied blob is not a valid EROFS image: %v", err)
+		}
+		if _, err := os.Stat(blobPath + ".tmp"); !os.IsNotExist(err) {
+			t.Errorf("temporary blob file still present: %v", err)
+		}
+	})
+
+	t.Run("rejects native media type with compression suffix", func(t *testing.T) {
+		store := newLocalStore(t)
+		d := NewErofsDiffer(store)
+		desc := ingestBlob(ctx, t, store, images.MediaTypeErofsLayer+"+zstd", blob)
+		_, mounts := newApplyTarget(t)
+
+		_, err := d.Apply(ctx, desc, mounts)
+		if err == nil || !strings.Contains(err.Error(), "unsupported media type") {
+			t.Fatalf("expected unsupported media type error, got: %v", err)
+		}
+	})
+}
+
+func TestCopyBlobAtomic(t *testing.T) {
+	t.Run("writes file atomically", func(t *testing.T) {
+		dst := filepath.Join(t.TempDir(), "blob.erofs")
+		data := []byte("blob contents")
+
+		if err := copyBlobAtomic(dst, bytes.NewReader(data)); err != nil {
+			t.Fatalf("copyBlobAtomic failed: %v", err)
+		}
+
+		got, err := os.ReadFile(dst)
+		if err != nil {
+			t.Fatalf("failed to read destination: %v", err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Errorf("content = %q, want %q", got, data)
+		}
+		if _, err := os.Stat(dst + ".tmp"); !os.IsNotExist(err) {
+			t.Errorf("temporary file still present: %v", err)
+		}
+	})
+
+	t.Run("read error removes temp file and final name never appears", func(t *testing.T) {
+		dst := filepath.Join(t.TempDir(), "blob.erofs")
+		readErr := errors.New("read failed")
+
+		err := copyBlobAtomic(dst, iotest.ErrReader(readErr))
+		if !errors.Is(err, readErr) {
+			t.Fatalf("expected read error, got: %v", err)
+		}
+		if _, err := os.Stat(dst); !os.IsNotExist(err) {
+			t.Errorf("destination file must not exist after failure: %v", err)
+		}
+		if _, err := os.Stat(dst + ".tmp"); !os.IsNotExist(err) {
+			t.Errorf("temporary file must be removed after failure: %v", err)
+		}
+	})
 }
 
 func TestApplyWithDifferentMountTypes(t *testing.T) {
