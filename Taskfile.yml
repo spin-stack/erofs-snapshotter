@@ -67,6 +67,20 @@ tasks:
           erofs-snapshotter-test \
           go test -race -v ./internal/... -test.root 2>&1
 
+  coverage:
+    desc: Generate the Linux coverage profile in Docker with cross-package attribution
+    deps: [test-docker-build]
+    cmds:
+      - |
+        docker run --privileged --rm \
+          -v "{{.ROOT_DIR}}:/workspace" \
+          -w /workspace \
+          erofs-snapshotter-test \
+          go test -coverprofile=/workspace/coverage.out -covermode=atomic \
+            -coverpkg=./internal/... ./internal/... -test.root
+      - go tool cover -func=coverage.out | tail -1
+      - echo "HTML report -> go tool cover -html=coverage.out"
+
   lint:
     desc: Run linter
     cmds:
