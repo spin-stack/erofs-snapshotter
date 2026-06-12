@@ -3,11 +3,15 @@
 package differ
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -387,9 +391,30 @@ func TestCompareWithContentStore(t *testing.T) {
 			t.Fatalf("Compare failed: %v", err)
 		}
 
-		// For identical directories, we should get an empty diff (minimal size)
 		if desc.Digest == "" {
 			t.Error("expected non-empty digest")
+		}
+
+		// The diff of identical directories must be an empty tar: any entry
+		// here means Compare produced a full diff instead of an empty one.
+		ra, err := store.ReaderAt(ctx, desc)
+		if err != nil {
+			t.Fatalf("failed to get reader: %v", err)
+		}
+		defer ra.Close()
+
+		gz, err := gzip.NewReader(content.NewReader(ra))
+		if err != nil {
+			t.Fatalf("failed to create gzip reader: %v", err)
+		}
+		defer gz.Close()
+
+		hdr, err := tar.NewReader(gz).Next()
+		if err == nil {
+			t.Fatalf("expected empty diff for identical directories, got entry %q", hdr.Name)
+		}
+		if err != io.EOF {
+			t.Fatalf("failed to read diff tar: %v", err)
 		}
 	})
 }
@@ -597,5 +622,188 @@ func TestStackedErofsLayers(t *testing.T) {
 				t.Fatalf("stackedErofsLayers = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// recordingMountManager is a configurable mount.Manager that records
+// Activate/Deactivate calls so the mount-manager activation paths of
+// withLowerMount/withUpperMount can be tested without root or real mounts.
+type recordingMountManager struct {
+	info        mount.ActivationInfo
+	activateErr error
+	activated   []string
+	deactivated []string
+}
+
+func (m *recordingMountManager) Activate(_ context.Context, name string, _ []mount.Mount, _ ...mount.ActivateOpt) (mount.ActivationInfo, error) {
+	if m.activateErr != nil {
+		return mount.ActivationInfo{}, m.activateErr
+	}
+	m.activated = append(m.activated, name)
+	info := m.info
+	info.Name = name
+	return info, nil
+}
+
+func (m *recordingMountManager) Deactivate(_ context.Context, name string) error {
+	m.deactivated = append(m.deactivated, name)
+	return nil
+}
+
+func (m *recordingMountManager) Info(_ context.Context, _ string) (mount.ActivationInfo, error) {
+	return mount.ActivationInfo{}, nil
+}
+
+func (m *recordingMountManager) Update(_ context.Context, _ mount.ActivationInfo, _ ...string) (mount.ActivationInfo, error) {
+	return mount.ActivationInfo{}, nil
+}
+
+func (m *recordingMountManager) List(_ context.Context, _ ...string) ([]mount.ActivationInfo, error) {
+	return nil, nil
+}
+
+// checkActivationBalanced asserts exactly one Activate call with a matching
+// Deactivate call (no leaked activations).
+func checkActivationBalanced(t *testing.T, mm *recordingMountManager) {
+	t.Helper()
+	if len(mm.activated) != 1 {
+		t.Fatalf("Activate called %d times, want 1", len(mm.activated))
+	}
+	if len(mm.deactivated) != 1 || mm.deactivated[0] != mm.activated[0] {
+		t.Fatalf("Deactivate calls = %v, want [%s]", mm.deactivated, mm.activated[0])
+	}
+}
+
+// formattedErofsMount returns a single formatted EROFS mount without device=
+// options: not a stacked layer set and not multi-device, so it exercises the
+// mount-manager activation branch of withLowerMount/withUpperMount.
+func formattedErofsMount() []mount.Mount {
+	return []mount.Mount{{
+		Type:    "format/erofs",
+		Source:  "/snapshots/1/fsmeta.erofs",
+		Options: []string{"ro", "loop"},
+	}}
+}
+
+func TestWithLowerMountManagerActivation(t *testing.T) {
+	ctx := context.Background()
+	lower := formattedErofsMount()
+
+	t.Run("fails without mount manager", func(t *testing.T) {
+		err := withLowerMount(ctx, lower, nil, func(string) error { return nil })
+		if err == nil || !strings.Contains(err.Error(), "mount manager is required") {
+			t.Fatalf("expected mount manager required error, got: %v", err)
+		}
+	})
+
+	t.Run("single bind shortcut uses source directly", func(t *testing.T) {
+		bindDir := t.TempDir()
+		mm := &recordingMountManager{info: mount.ActivationInfo{
+			System: []mount.Mount{{Type: "bind", Source: bindDir}},
+		}}
+
+		var gotRoot string
+		if err := withLowerMount(ctx, lower, mm, func(root string) error {
+			gotRoot = root
+			return nil
+		}); err != nil {
+			t.Fatalf("withLowerMount failed: %v", err)
+		}
+		if gotRoot != bindDir {
+			t.Errorf("root = %q, want bind source %q", gotRoot, bindDir)
+		}
+		checkActivationBalanced(t, mm)
+	})
+
+	t.Run("merged fsmeta shortcut uses erofs mount point", func(t *testing.T) {
+		mergedDir := t.TempDir()
+		mm := &recordingMountManager{info: mount.ActivationInfo{
+			// Lower-only overlay as the system mount plus an active merged
+			// fsmeta mount: withLowerMount must use the EROFS mount point
+			// directly instead of re-mounting the overlay.
+			System: []mount.Mount{{
+				Type:    "overlay",
+				Options: []string{"lowerdir=/lower1:/lower2"},
+			}},
+			Active: []mount.ActiveMount{{
+				Mount:      mount.Mount{Type: "erofs", Source: "/snapshots/1/fsmeta.erofs"},
+				MountPoint: mergedDir,
+			}},
+		}}
+
+		var gotRoot string
+		if err := withLowerMount(ctx, lower, mm, func(root string) error {
+			gotRoot = root
+			return nil
+		}); err != nil {
+			t.Fatalf("withLowerMount failed: %v", err)
+		}
+		if gotRoot != mergedDir {
+			t.Errorf("root = %q, want fsmeta mount point %q", gotRoot, mergedDir)
+		}
+		checkActivationBalanced(t, mm)
+	})
+
+	t.Run("activation error propagates without deactivation", func(t *testing.T) {
+		mm := &recordingMountManager{activateErr: errors.New("activation failed")}
+		called := false
+		err := withLowerMount(ctx, lower, mm, func(string) error {
+			called = true
+			return nil
+		})
+		if err == nil || !strings.Contains(err.Error(), "activation failed") {
+			t.Fatalf("expected activation error, got: %v", err)
+		}
+		if called {
+			t.Error("callback should not run when activation fails")
+		}
+		if len(mm.deactivated) != 0 {
+			t.Errorf("Deactivate called %d times after failed activation, want 0", len(mm.deactivated))
+		}
+	})
+}
+
+func TestWithUpperMountManagerActivation(t *testing.T) {
+	ctx := context.Background()
+	upper := formattedErofsMount()
+
+	t.Run("fails without mount manager", func(t *testing.T) {
+		err := withUpperMount(ctx, upper, nil, func(string) error { return nil })
+		if err == nil || !strings.Contains(err.Error(), "mount manager is required") {
+			t.Fatalf("expected mount manager required error, got: %v", err)
+		}
+	})
+
+	t.Run("single bind shortcut uses source directly", func(t *testing.T) {
+		bindDir := t.TempDir()
+		mm := &recordingMountManager{info: mount.ActivationInfo{
+			System: []mount.Mount{{Type: "bind", Source: bindDir}},
+		}}
+
+		var gotRoot string
+		if err := withUpperMount(ctx, upper, mm, func(root string) error {
+			gotRoot = root
+			return nil
+		}); err != nil {
+			t.Fatalf("withUpperMount failed: %v", err)
+		}
+		if gotRoot != bindDir {
+			t.Errorf("root = %q, want bind source %q", gotRoot, bindDir)
+		}
+		checkActivationBalanced(t, mm)
+	})
+}
+
+func TestWithActiveSnapshotMountMissingExt4(t *testing.T) {
+	// Active snapshot handling must fail loud when the ext4 writable layer
+	// is missing instead of silently diffing only the EROFS layers.
+	err := withActiveSnapshotMount(context.Background(), []mount.Mount{
+		{Type: "erofs", Source: "/snapshots/1/layer.erofs", Options: []string{"ro", "loop"}},
+	}, func(string) error {
+		t.Fatal("callback should not be called")
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing ext4 writable layer") {
+		t.Fatalf("expected missing ext4 error, got: %v", err)
 	}
 }

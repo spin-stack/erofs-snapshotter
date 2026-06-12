@@ -60,10 +60,16 @@ func TestViewMountsFallbackToIndividualLayers(t *testing.T) {
 		t.Fatalf("expected 3 mounts (fallback), got %d", len(mounts))
 	}
 
-	// All should be type "erofs" (not "format/erofs")
+	// All should be type "erofs" (not "format/erofs"), and sources must follow
+	// ParentIDs order: newest-first (unlike mountFsMeta, which emits device=
+	// options oldest-first). A VM runtime stacking these layers depends on
+	// this order.
 	for i, m := range mounts {
 		if m.Type != testMountErofs {
 			t.Errorf("mount[%d].Type = %q, want %q", i, m.Type, testMountErofs)
+		}
+		if want := layerPaths[parentIDs[i]]; m.Source != want {
+			t.Errorf("mount[%d].Source = %q, want %q", i, m.Source, want)
 		}
 	}
 }
@@ -111,9 +117,12 @@ func TestActiveMountsFallbackToIndividualLayers(t *testing.T) {
 		t.Fatalf("expected 2 mounts, got %d", len(mounts))
 	}
 
-	// First should be EROFS (read-only layer)
+	// First should be EROFS (read-only layer) pointing at the parent's blob
 	if mounts[0].Type != testMountErofs {
 		t.Errorf("mounts[0].Type = %q, want %q", mounts[0].Type, testMountErofs)
+	}
+	if mounts[0].Source != layerPath {
+		t.Errorf("mounts[0].Source = %q, want %q", mounts[0].Source, layerPath)
 	}
 
 	// Last should be ext4 (writable layer)

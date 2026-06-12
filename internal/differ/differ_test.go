@@ -10,6 +10,7 @@ import (
 
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/plugins/content/local"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	// Import testutil to register the -test.root flag
@@ -325,27 +326,17 @@ func TestApplySupportedMediaTypes(t *testing.T) {
 // Compare is only implemented on Linux. Those tests use local.NewStore to
 // create a real content store for testing writeAndCommitDiff and Compare.
 
-func TestDiffWriteFuncNil(t *testing.T) {
-	// Test that the differ handles nil writeFn gracefully
-	// This is an internal test for edge cases
-	d := NewErofsDiffer(nil)
-	if d.store != nil {
-		t.Error("expected nil store")
-	}
-}
-
 func TestDifferStoreAccess(t *testing.T) {
-	// Test that the differ correctly stores and accesses the content store
-	d := NewErofsDiffer(nil)
-	if d.store != nil {
-		t.Error("expected nil store when passed nil")
+	// The differ must retain the content store it is constructed with
+	// (the nil case is covered by TestNewErofsDiffer).
+	store, err := local.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to create content store: %v", err)
 	}
 
-	// Create a minimal mock store (we can't easily mock content.Store interface
-	// but we can verify the differ stores what we give it)
-	d2 := NewErofsDiffer(nil)
-	if d2.store != nil {
-		t.Error("expected nil store")
+	d := NewErofsDiffer(store)
+	if d.store != store {
+		t.Error("differ should retain the store passed to NewErofsDiffer")
 	}
 }
 

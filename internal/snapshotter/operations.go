@@ -128,30 +128,8 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	// Run async to avoid blocking Prepare/View - fsmeta generation is expensive
 	// but not required for basic snapshot operations.
 	if !isExtractKey(key) && len(snap.ParentIDs) > 0 {
-		parentIDs := snap.ParentIDs // capture for goroutine
-		s.bgWg.Add(1)
-		//nolint:contextcheck,gosec // intentionally derived from the service-lifetime context, not the request context
-		go func(ids []string) {
-			defer s.bgWg.Done()
-			// Skip cheaply if another generation already produced the fsmeta.
-			if _, err := os.Stat(s.fsMetaPath(ids[0])); err == nil {
-				return
-			}
-			// Bound concurrent mkfs.erofs runs; bail out if the snapshotter
-			// is shutting down while we wait for a slot.
-			select {
-			case s.bgSem <- struct{}{}:
-			case <-s.bgCtx.Done():
-				return
-			}
-			defer func() { <-s.bgSem }()
-			// Derived from the service-lifetime context (not the request
-			// context) so generation survives request cancellation but is
-			// aborted on Close.
-			bgCtx, cancel := context.WithTimeout(s.bgCtx, fsmetaTimeout)
-			defer cancel()
-			s.generateFsMeta(bgCtx, ids)
-		}(parentIDs)
+		//nolint:contextcheck // background generation derives from the service-lifetime context, not the request context
+		s.spawnFsmetaGeneration(snap.ParentIDs)
 	}
 
 	// For active snapshots, create the writable ext4 layer file.
@@ -172,6 +150,33 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}
 
 	return s.mounts(snap, info)
+}
+
+// spawnFsmetaGeneration starts background fsmeta/VMDK generation for the
+// given parent chain (newest-first). Concurrency is bounded by bgSem and the
+// goroutine derives from the service-lifetime context (not the request
+// context) so generation survives request cancellation but is aborted on
+// Close.
+func (s *snapshotter) spawnFsmetaGeneration(parentIDs []string) {
+	s.bgWg.Add(1)
+	go func(ids []string) {
+		defer s.bgWg.Done()
+		// Skip cheaply if another generation already produced the fsmeta.
+		if _, err := os.Stat(s.fsMetaPath(ids[0])); err == nil {
+			return
+		}
+		// Bound concurrent mkfs.erofs runs; bail out if the snapshotter is
+		// shutting down while we wait for a slot.
+		select {
+		case s.bgSem <- struct{}{}:
+		case <-s.bgCtx.Done():
+			return
+		}
+		defer func() { <-s.bgSem }()
+		bgCtx, cancel := context.WithTimeout(s.bgCtx, fsmetaTimeout)
+		defer cancel()
+		s.generateFsMeta(bgCtx, ids)
+	}(parentIDs)
 }
 
 // cleanupFailedSnapshot removes temporary and final directories on failure.

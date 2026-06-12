@@ -176,31 +176,39 @@ func run(address, namespace, snapshotterName, sourceImage, targetImage, markerFi
 	}
 	fmt.Printf("\n✓ Created image %s (digest %s)\n", created.Name, created.Target.Digest)
 
-	// 8. Verify the new image is usable: it must resolve, contain one more
-	// layer than the source, and report as unpacked for this snapshotter.
-	verifyImg, err := c.GetImage(ctx, targetImage)
+	// 8. Verify the new image is usable.
+	if err := verifyCommittedImage(ctx, c, snapshotterName, targetImage, len(diffIDs)+1, newDiffID); err != nil {
+		return err
+	}
+	fmt.Printf("✓ New image has %d layers and is unpacked (snapshot %s exists)\n", len(diffIDs)+1, newChainID)
+
+	return nil
+}
+
+// verifyCommittedImage checks the committed image resolves, has the expected
+// layer count with newDiffID on top, and reports as unpacked.
+func verifyCommittedImage(ctx context.Context, c *client.Client, snapshotterName, targetImage string, wantLayers int, newDiffID digest.Digest) error {
+	img, err := c.GetImage(ctx, targetImage)
 	if err != nil {
 		return fmt.Errorf("get new image: %w", err)
 	}
-	verifyDiffIDs, err := verifyImg.RootFS(ctx)
+	diffIDs, err := img.RootFS(ctx)
 	if err != nil {
 		return fmt.Errorf("new image rootfs: %w", err)
 	}
-	if len(verifyDiffIDs) != len(diffIDs)+1 {
-		return fmt.Errorf("new image has %d layers, want %d", len(verifyDiffIDs), len(diffIDs)+1)
+	if len(diffIDs) != wantLayers {
+		return fmt.Errorf("new image has %d layers, want %d", len(diffIDs), wantLayers)
 	}
-	if verifyDiffIDs[len(verifyDiffIDs)-1] != newDiffID {
-		return fmt.Errorf("new image top diff ID = %s, want %s", verifyDiffIDs[len(verifyDiffIDs)-1], newDiffID)
+	if diffIDs[len(diffIDs)-1] != newDiffID {
+		return fmt.Errorf("new image top diff ID = %s, want %s", diffIDs[len(diffIDs)-1], newDiffID)
 	}
-	unpacked, err := verifyImg.IsUnpacked(ctx, snapshotterName)
+	unpacked, err := img.IsUnpacked(ctx, snapshotterName)
 	if err != nil {
 		return fmt.Errorf("check unpacked: %w", err)
 	}
 	if !unpacked {
 		return fmt.Errorf("new image reports as not unpacked for %s", snapshotterName)
 	}
-	fmt.Printf("✓ New image has %d layers and is unpacked (snapshot %s exists)\n", len(verifyDiffIDs), newChainID)
-
 	return nil
 }
 

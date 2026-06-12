@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
@@ -35,6 +36,19 @@ func newTestSnapshotter(t *testing.T, opts ...Opt) snapshots.Snapshotter {
 	return newTestSnapshotterInternal(t, opts...)
 }
 
+// handleSnapshotterCreationError skips the test only when NewSnapshotter failed
+// because the environment lacks EROFS support (the preflight/compatibility
+// check). Any other constructor error (metadata store, config validation,
+// directory creation) is a real regression and fails the test instead of being
+// silently masked by a skip.
+func handleSnapshotterCreationError(t *testing.T, err error) {
+	t.Helper()
+	if runtime.GOOS == osLinux && strings.Contains(err.Error(), "compatibility check") {
+		t.Skipf("snapshotter creation failed (EROFS not available): %v", err)
+	}
+	t.Fatalf("failed to create snapshotter: %v", err)
+}
+
 // newTestSnapshotterInternal creates a test snapshotter and returns the internal type.
 // Use this for tests that need access to internal methods (paths, mounts, etc.).
 func newTestSnapshotterInternal(t *testing.T, opts ...Opt) *snapshotter {
@@ -54,11 +68,7 @@ func newTestSnapshotterInternal(t *testing.T, opts ...Opt) *snapshotter {
 
 	s, err := NewSnapshotter(root, opts...)
 	if err != nil {
-		// On Linux, this may fail if EROFS isn't available
-		if runtime.GOOS == osLinux {
-			t.Skipf("snapshotter creation failed (EROFS likely not available): %v", err)
-		}
-		t.Fatalf("failed to create snapshotter: %v", err)
+		handleSnapshotterCreationError(t, err)
 	}
 	t.Cleanup(func() { s.Close() })
 	return s.(*snapshotter)
@@ -79,10 +89,7 @@ func newTestSnapshotterWithRoot(t *testing.T, root string, opts ...Opt) *snapsho
 
 	s, err := NewSnapshotter(root, opts...)
 	if err != nil {
-		if runtime.GOOS == osLinux {
-			t.Skipf("snapshotter creation failed (EROFS likely not available): %v", err)
-		}
-		t.Fatalf("failed to create snapshotter: %v", err)
+		handleSnapshotterCreationError(t, err)
 	}
 	t.Cleanup(func() { s.Close() })
 	return s.(*snapshotter)
