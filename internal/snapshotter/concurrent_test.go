@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/containerd/containerd/v2/core/snapshots"
 )
@@ -205,8 +204,8 @@ func TestConcurrentRemove(t *testing.T) {
 }
 
 // TestFsmetaLockFileRace verifies that concurrent fsmeta lock acquisition
-// via tryAcquireFsmetaLock (the coordination used by generateFsMeta) admits
-// exactly one winner.
+// via acquireFsmetaLock (the coordination used by spawnFsmetaGeneration)
+// admits exactly one winner.
 func TestFsmetaLockFileRace(t *testing.T) {
 	root := t.TempDir()
 	s := &snapshotter{root: root}
@@ -221,7 +220,7 @@ func TestFsmetaLockFileRace(t *testing.T) {
 	const numGoroutines = 20
 	var wg sync.WaitGroup
 	start := make(chan struct{})
-	winners := make(chan int, numGoroutines)
+	winners := make(chan *fsmetaLock, numGoroutines)
 	errs := make(chan error, numGoroutines)
 
 	for i := range numGoroutines {
@@ -229,15 +228,15 @@ func TestFsmetaLockFileRace(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			<-start
-			locked, err := s.tryAcquireFsmetaLock(context.Background(), "test-parent")
+			lock, err := s.acquireFsmetaLock("test-parent")
 			if err != nil {
 				errs <- fmt.Errorf("goroutine %d: %w", id, err)
 				return
 			}
-			if locked {
-				winners <- id
+			if lock != nil {
+				winners <- lock
 			}
-			// Losers see the fresh lock held by the winner - that's expected
+			// Losers see the flock held by the winner - that's expected
 		}(i)
 	}
 
@@ -251,23 +250,32 @@ func TestFsmetaLockFileRace(t *testing.T) {
 	}
 
 	// Exactly one goroutine should win
-	winnerCount := 0
-	for range winners {
-		winnerCount++
+	var held []*fsmetaLock
+	for lock := range winners {
+		held = append(held, lock)
+	}
+	if len(held) != 1 {
+		t.Errorf("expected exactly 1 goroutine to acquire the fsmeta lock, got %d", len(held))
 	}
 
-	if winnerCount != 1 {
-		t.Errorf("expected exactly 1 goroutine to acquire the fsmeta lock, got %d", winnerCount)
+	// While held, the lock must be observable and the lock file must exist
+	if !s.fsmetaGenerationInProgress("test-parent") {
+		t.Error("fsmetaGenerationInProgress = false while the lock is held")
 	}
-
-	// The winner still holds the lock, so the lock file must exist
-	lockFile := s.fsMetaPath("test-parent") + ".lock"
+	lockFile := s.fsMetaPath("test-parent") + lockSuffix
 	if _, err := os.Stat(lockFile); err != nil {
 		t.Errorf("lock file should exist: %v", err)
 	}
+
+	for _, lock := range held {
+		lock.release()
+	}
+	if s.fsmetaGenerationInProgress("test-parent") {
+		t.Error("fsmetaGenerationInProgress = true after the lock was released")
+	}
 }
 
-func TestTryAcquireFsmetaLockRejectsFreshLock(t *testing.T) {
+func TestAcquireFsmetaLockRejectsHeldLock(t *testing.T) {
 	root := t.TempDir()
 	s := &snapshotter{root: root}
 
@@ -276,25 +284,30 @@ func TestTryAcquireFsmetaLockRejectsFreshLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lockFile := s.fsMetaPath("test-parent") + ".lock"
-	if err := os.WriteFile(lockFile, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	locked, err := s.tryAcquireFsmetaLock(context.Background(), "test-parent")
+	lock, err := s.acquireFsmetaLock("test-parent")
 	if err != nil {
-		t.Fatalf("tryAcquireFsmetaLock: %v", err)
+		t.Fatalf("acquireFsmetaLock: %v", err)
 	}
-	if locked {
-		t.Fatal("expected fresh lock to prevent acquisition")
+	if lock == nil {
+		t.Fatal("expected first acquisition to succeed")
 	}
+	defer lock.release()
 
-	if _, err := os.Stat(lockFile); err != nil {
-		t.Fatalf("fresh lock should remain in place: %v", err)
+	second, err := s.acquireFsmetaLock("test-parent")
+	if err != nil {
+		t.Fatalf("acquireFsmetaLock (second): %v", err)
+	}
+	if second != nil {
+		second.release()
+		t.Fatal("expected held lock to prevent a second acquisition")
 	}
 }
 
-func TestTryAcquireFsmetaLockRecoversStaleLock(t *testing.T) {
+// TestAcquireFsmetaLockRecoversAfterCrash simulates a crashed generation: the
+// lock FILE is left behind but no process holds the flock (the kernel
+// releases it on process death), so the next acquisition must succeed
+// immediately - no age-based staleness heuristics involved.
+func TestAcquireFsmetaLockRecoversAfterCrash(t *testing.T) {
 	root := t.TempDir()
 	s := &snapshotter{root: root}
 
@@ -303,37 +316,45 @@ func TestTryAcquireFsmetaLockRecoversStaleLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lockFile := s.fsMetaPath("test-parent") + ".lock"
-	tmpMeta := s.fsMetaPath("test-parent") + ".tmp"
-	tmpVmdk := s.vmdkPath("test-parent") + ".tmp"
-
-	for _, path := range []string{lockFile, tmpMeta, tmpVmdk} {
-		if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+	lockFile := s.fsMetaPath("test-parent") + lockSuffix
+	if err := os.WriteFile(lockFile, []byte("crashed"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
-	old := time.Now().Add(-fsmetaLockStaleAge - time.Minute)
-	if err := os.Chtimes(lockFile, old, old); err != nil {
-		t.Fatalf("chtimes lock: %v", err)
+	// An unheld lock file must not report a generation in progress.
+	if s.fsmetaGenerationInProgress("test-parent") {
+		t.Fatal("fsmetaGenerationInProgress = true for an unheld lock file")
 	}
 
-	locked, err := s.tryAcquireFsmetaLock(context.Background(), "test-parent")
+	lock, err := s.acquireFsmetaLock("test-parent")
 	if err != nil {
-		t.Fatalf("tryAcquireFsmetaLock: %v", err)
+		t.Fatalf("acquireFsmetaLock: %v", err)
 	}
-	if !locked {
-		t.Fatal("expected stale lock to be recovered")
+	if lock == nil {
+		t.Fatal("expected acquisition to succeed over an unheld lock file")
+	}
+	defer lock.release()
+}
+
+func TestAcquireFsmetaLockSkipsWhenFsmetaExists(t *testing.T) {
+	root := t.TempDir()
+	s := &snapshotter{root: root}
+
+	snapshotDir := filepath.Join(root, "snapshots", "test-parent")
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.fsMetaPath("test-parent"), []byte("fsmeta"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	if _, err := os.Stat(lockFile); err != nil {
-		t.Fatalf("expected lock file to be reacquired: %v", err)
+	lock, err := s.acquireFsmetaLock("test-parent")
+	if err != nil {
+		t.Fatalf("acquireFsmetaLock: %v", err)
 	}
-	if _, err := os.Stat(tmpMeta); !os.IsNotExist(err) {
-		t.Fatalf("expected stale temp fsmeta to be removed, got err=%v", err)
-	}
-	if _, err := os.Stat(tmpVmdk); !os.IsNotExist(err) {
-		t.Fatalf("expected stale temp vmdk to be removed, got err=%v", err)
+	if lock != nil {
+		lock.release()
+		t.Fatal("expected no lock when fsmeta already exists")
 	}
 }
 

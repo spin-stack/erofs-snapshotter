@@ -18,8 +18,6 @@ import (
 	"github.com/spin-stack/erofs-snapshotter/internal/mountutils"
 )
 
-const fsmetaLockStaleAge = fsmetaTimeout + time.Minute
-
 // getCommitUpperDir returns the upper directory to convert to EROFS, a
 // cleanup function (releases any mount this function created) and whether the
 // upper directory may be pruned after conversion.
@@ -113,18 +111,6 @@ func removeFsmetaArtifacts(paths ...string) error {
 	return nil
 }
 
-func isStaleFsmetaLock(lockFile string, maxAge time.Duration) (bool, error) {
-	info, err := os.Stat(lockFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, err
-	}
-
-	return time.Since(info.ModTime()) > maxAge, nil
-}
-
 func (s *snapshotter) cleanupFsmetaArtifacts() {
 	entries, err := os.ReadDir(s.snapshotsDir())
 	if err != nil {
@@ -147,54 +133,6 @@ func (s *snapshotter) cleanupFsmetaArtifacts() {
 	}
 }
 
-func (s *snapshotter) tryAcquireFsmetaLock(ctx context.Context, snapshotID string) (bool, error) {
-	mergedMeta := s.fsMetaPath(snapshotID)
-	lockFile := mergedMeta + ".lock"
-	tmpMeta := mergedMeta + ".tmp"
-	tmpVmdk := s.vmdkPath(snapshotID) + ".tmp"
-
-	if _, err := os.Stat(mergedMeta); err == nil {
-		return false, nil
-	}
-
-	for range 2 {
-		lockFd, err := os.OpenFile(lockFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			if cerr := lockFd.Close(); cerr != nil {
-				_ = os.Remove(lockFile)
-				return false, fmt.Errorf("close fsmeta lock: %w", cerr)
-			}
-			return true, nil
-		}
-		if !os.IsExist(err) {
-			return false, fmt.Errorf("create fsmeta lock: %w", err)
-		}
-
-		if _, statErr := os.Stat(mergedMeta); statErr == nil {
-			return false, nil
-		}
-
-		stale, staleErr := isStaleFsmetaLock(lockFile, fsmetaLockStaleAge)
-		if staleErr != nil {
-			return false, fmt.Errorf("stat fsmeta lock: %w", staleErr)
-		}
-		if !stale {
-			return false, nil
-		}
-
-		if err := removeFsmetaArtifacts(lockFile, tmpMeta, tmpVmdk); err != nil {
-			return false, fmt.Errorf("cleanup stale fsmeta lock: %w", err)
-		}
-
-		log.G(ctx).WithFields(log.Fields{
-			"snapshot": snapshotID,
-			"lock":     lockFile,
-		}).Warn("removed stale fsmeta generation lock")
-	}
-
-	return false, nil
-}
-
 // generateFsMeta creates a merged fsmeta.erofs and VMDK descriptor for VM runtimes.
 // The VMDK allows QEMU to present all EROFS layers as a single concatenated block device.
 //
@@ -202,12 +140,13 @@ func (s *snapshotter) tryAcquireFsmetaLock(ctx context.Context, snapshotID strin
 // This is the order returned by containerd's snapshot storage. We convert to
 // OCI manifest order (oldest-first) internally for mkfs.erofs.
 //
-// CONCURRENCY: Multiple goroutines may try to generate fsmeta for the same parent
-// chain. A lock file (O_EXCL) ensures only one wins. Others exit silently.
+// CONCURRENCY: the caller (spawnFsmetaGeneration) holds the fsmeta flock for
+// the chain while this runs; concurrent generation attempts for the same
+// chain are deduplicated at acquisition time.
 //
 // CRASH SAFETY: Generation uses temporary files (.tmp suffix) with atomic rename
-// on success. If the process crashes mid-generation, only .tmp files remain,
-// allowing retry on next access. The lock file is removed on completion/failure.
+// on success. If the process crashes mid-generation, only .tmp files remain
+// (the kernel releases the flock), allowing retry on next access.
 //
 // SILENT FAILURE: If fsmeta generation fails, callers fall back to individual
 // layer mounts. This is slightly slower but functionally correct.
@@ -222,24 +161,18 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 	newestID := parentIDs[0]
 	mergedMeta := s.fsMetaPath(newestID)
 	vmdkFile := s.vmdkPath(newestID)
-	lockFile := mergedMeta + ".lock"
 
 	// Check if already generated (fast path)
 	if _, err := os.Stat(mergedMeta); err == nil {
 		return
 	}
 
-	locked, err := s.tryAcquireFsmetaLock(ctx, newestID)
-	if err != nil {
-		log.G(ctx).WithError(err).WithField("snapshot", newestID).Warn("fsmeta generation skipped: cannot acquire lock")
+	// The parent snapshot may have been removed while this generation waited
+	// for a semaphore slot; don't write artifacts into a directory that is
+	// being deleted.
+	if _, err := os.Stat(s.snapshotDir(newestID)); err != nil {
 		return
 	}
-	if !locked {
-		return
-	}
-
-	// Always remove lock file when done
-	defer os.Remove(lockFile)
 
 	// Temporary file paths for atomic generation
 	tmpMeta := mergedMeta + ".tmp"
@@ -276,12 +209,17 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 	// Check block size compatibility for fsmeta merge. This is a permanent
 	// failure (block sizes never change), so future mount calls will keep
 	// falling back to per-layer mounts until the layer blobs are regenerated.
+	// A marker file records the verdict so the check (and a Warn per Prepare)
+	// isn't repeated for every snapshot of the same chain.
 	// Logged at Warn so operators can spot the problematic layer.
 	if err := erofs.CheckFsmetaCompat(blobs); err != nil {
 		log.G(ctx).WithError(err).WithFields(log.Fields{
 			"layerCount": len(blobs),
 			"stage":      "check_compat",
 		}).Warn("fsmeta generation permanently disabled: incompatible layer")
+		if werr := os.WriteFile(s.fsmetaIncompatPath(newestID), []byte(err.Error()+"\n"), 0o644); werr != nil {
+			log.G(ctx).WithError(werr).Debug("failed to write fsmeta incompat marker")
+		}
 		return
 	}
 
@@ -313,21 +251,21 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 
 	// Atomic rename: first fsmeta, then VMDK (VMDK references fsmeta)
 	if err := os.Rename(tmpMeta, mergedMeta); err != nil {
-		log.G(ctx).WithError(err).WithFields(log.Fields{
+		s.logFsmetaWriteFailure(ctx, newestID, err, log.Fields{
 			"layerCount": len(blobs),
 			"stage":      "rename_fsmeta",
 			"from":       tmpMeta,
 			"to":         mergedMeta,
-		}).Warn("fsmeta generation failed: cannot rename fsmeta file")
+		})
 		return
 	}
 	if err := os.Rename(tmpVmdk, vmdkFile); err != nil {
-		log.G(ctx).WithError(err).WithFields(log.Fields{
+		s.logFsmetaWriteFailure(ctx, newestID, err, log.Fields{
 			"layerCount": len(blobs),
 			"stage":      "rename_vmdk",
 			"from":       tmpVmdk,
 			"to":         vmdkFile,
-		}).Warn("fsmeta generation failed: cannot rename VMDK file")
+		})
 		_ = os.Remove(mergedMeta) // Clean up the renamed fsmeta
 		return
 	}
@@ -344,6 +282,19 @@ func (s *snapshotter) generateFsMeta(ctx context.Context, parentIDs []string) {
 		"duration": time.Since(t1),
 		"layers":   len(blobs),
 	}).Debug("fsmeta and VMDK generated")
+}
+
+// logFsmetaWriteFailure logs a failed fsmeta/VMDK write. When the parent
+// snapshot directory no longer exists the failure is expected - the snapshot
+// was removed while the background generation ran - so it is logged at Debug
+// instead of alarming operators with a Warn.
+func (s *snapshotter) logFsmetaWriteFailure(ctx context.Context, parentID string, err error, fields log.Fields) {
+	logger := log.G(ctx).WithError(err).WithFields(fields)
+	if _, serr := os.Stat(s.snapshotDir(parentID)); os.IsNotExist(serr) {
+		logger.Debug("fsmeta generation aborted: snapshot removed during generation")
+		return
+	}
+	logger.Warn("fsmeta generation failed")
 }
 
 // fixVmdkPaths replaces oldPath with newPath in a VMDK descriptor file.
