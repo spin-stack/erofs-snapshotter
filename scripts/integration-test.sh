@@ -770,6 +770,7 @@ TEST_DEPENDS[test_snapshot_cleanup]="test_pull_image"
 TEST_DEPENDS[test_vmdk_layer_order]="test_multi_layer"
 TEST_DEPENDS[test_vmdk_format_valid]="test_multi_layer"
 TEST_DEPENDS[test_commit_lifecycle]="test_pull_image"
+TEST_DEPENDS[test_image_commit]="test_pull_image"
 
 # Check if test dependencies are met
 check_test_dependencies() {
@@ -2126,6 +2127,48 @@ test_full_cleanup_no_leaks() {
 # =============================================================================
 
 # List of all tests in execution order
+# =============================================================================
+# Test: test_image_commit
+# =============================================================================
+# Goal: Exercise the full container-commit flow (the nerdctl/ctr commit
+#       sequence) via the integration-commit tool: Prepare an active snapshot
+#       from the image chain, write into the rwlayer upper/ (guest overlay
+#       contract), diff.Compare through the EROFS differ, build a new OCI
+#       config/manifest, Prepare+Apply+Commit the new layer and register the
+#       image.
+#
+# Expectations:
+#   - integration-commit exits 0 (it self-verifies: the new image must have
+#     one more layer than the source and report as unpacked)
+#   - The target image is registered in containerd
+test_image_commit() {
+    local target_image="localhost/it-commit:latest"
+
+    if [ ! -x /usr/local/bin/integration-commit ]; then
+        log_warn "integration-commit binary not available, skipping"
+        TEST_MESSAGES[test_image_commit]="binary not built"
+        return 0
+    fi
+
+    if ! /usr/local/bin/integration-commit \
+        -address "${CONTAINERD_SOCKET}" \
+        -source "${TEST_IMAGE}" \
+        -target "${target_image}" \
+        -marker "/it-commit-marker.txt" 2>&1; then
+        log_error "integration-commit failed"
+        return 1
+    fi
+
+    assert_command_success "ctr_cmd images ls | grep -q '${target_image}'" \
+        "Committed image should be registered" || return 1
+
+    log_info "Image commit flow verified: ${target_image}"
+
+    # Remove the image so the final no-leaks test sees a clean state
+    # (snapshots/content become unreferenced and are GC'd).
+    ctr_cmd images rm "${target_image}" >/dev/null 2>&1 || true
+}
+
 ALL_TESTS=(
     test_pull_image
     test_parallel_unpack_detection
@@ -2140,6 +2183,7 @@ ALL_TESTS=(
     test_commit_lifecycle
     test_snapshot_cleanup
     test_commit
+    test_image_commit
     test_nerdctl
     test_full_cleanup_no_leaks  # Must be last - removes everything
 )
