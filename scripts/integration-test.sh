@@ -2164,9 +2164,27 @@ test_image_commit() {
 
     log_info "Image commit flow verified: ${target_image}"
 
-    # Remove the image so the final no-leaks test sees a clean state
+    # Same flow emitting a native EROFS layer (Compare converts the diff
+    # through mkfs.erofs; Apply consumes it without reconversion on unpack).
+    local native_image="localhost/it-commit-native:latest"
+    if ! /usr/local/bin/integration-commit \
+        -address "${CONTAINERD_SOCKET}" \
+        -source "${TEST_IMAGE}" \
+        -target "${native_image}" \
+        -marker "/it-commit-marker-native.txt" \
+        -native-erofs 2>&1; then
+        log_error "integration-commit with -native-erofs failed"
+        return 1
+    fi
+
+    assert_command_success "ctr_cmd images ls | grep -q '${native_image}'" \
+        "Native EROFS committed image should be registered" || return 1
+
+    log_info "Native EROFS image commit flow verified: ${native_image}"
+
+    # Remove the images so the final no-leaks test sees a clean state
     # (snapshots/content become unreferenced and are GC'd).
-    ctr_cmd images rm "${target_image}" >/dev/null 2>&1 || true
+    ctr_cmd images rm "${target_image}" "${native_image}" >/dev/null 2>&1 || true
 }
 
 ALL_TESTS=(

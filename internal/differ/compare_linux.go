@@ -18,6 +18,7 @@ package differ
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -38,6 +39,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/spin-stack/erofs-snapshotter/internal/cleanup"
+	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 	"github.com/spin-stack/erofs-snapshotter/internal/mountutils"
 )
 
@@ -92,13 +94,87 @@ func (s *ErofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opt
 	// the mount manager plugin is available
 	mm := s.mountManager()
 
-	return s.writeAndCommitDiff(ctx, config, func(ctx context.Context, w io.Writer) error {
+	writeFn := func(ctx context.Context, w io.Writer) error {
 		return writeDiffFromMounts(ctx, w, lower, upper, mm)
-	})
+	}
+
+	// Native EROFS layers: the tar diff is converted through mkfs.erofs and
+	// the resulting image is stored directly. Consumers within this stack
+	// (Apply accepts the media type) then skip the tar->EROFS reconversion
+	// on unpack.
+	if isErofsMediaType(config.MediaType) {
+		writeFn = erofsLayerWriteFn(writeFn)
+	}
+
+	return s.writeAndCommitDiff(ctx, config, writeFn)
+}
+
+// erofsLayerWriteFn wraps a tar-producing write function into one that emits
+// a native EROFS layer: the tar diff is streamed into mkfs.erofs (same
+// conversion and options as the pull/Apply path, so the layer stays
+// fsmeta-merge compatible) and the staged image is copied to w. mkfs.erofs
+// needs a seekable output file, so the blob cannot be streamed straight into
+// the content store.
+//
+// The resulting blob is not byte-reproducible across runs (mkfs.erofs embeds
+// a random UUID when none is supplied; a deterministic one cannot be derived
+// here because the pull path keys it on the layer digest, which is unknown
+// until conversion finishes).
+func erofsLayerWriteFn(writeTar diffWriteFunc) diffWriteFunc {
+	return func(ctx context.Context, w io.Writer) error {
+		tmpDir, err := os.MkdirTemp("", "erofs-compare-")
+		if err != nil {
+			return fmt.Errorf("failed to create temp dir: %w", err)
+		}
+		defer func() {
+			if rerr := os.RemoveAll(tmpDir); rerr != nil {
+				log.G(ctx).WithError(rerr).WithField("dir", tmpDir).Warn("failed to remove temp dir")
+			}
+		}()
+		blobPath := filepath.Join(tmpDir, "layer.erofs")
+
+		pr, pw := io.Pipe()
+		convDone := make(chan error, 1)
+		go func() {
+			cerr := erofs.ConvertTarErofs(ctx, pr, blobPath, "", defaultMkfsOpts())
+			// Unblock the tar producer: mkfs.erofs may stop reading at the
+			// tar end-of-archive marker before stream EOF, and io.Pipe
+			// writes block until read.
+			pr.CloseWithError(cerr)
+			convDone <- cerr
+		}()
+
+		werr := writeTar(ctx, pw)
+		pw.CloseWithError(werr)
+		if cerr := <-convDone; cerr != nil {
+			return fmt.Errorf("failed to convert diff to erofs: %w", cerr)
+		}
+		// ErrClosedPipe means mkfs.erofs finished reading before the
+		// producer finished writing trailing data - the conversion above
+		// already succeeded, so the diff is complete.
+		if werr != nil && !errors.Is(werr, io.ErrClosedPipe) {
+			return fmt.Errorf("failed to write diff: %w", werr)
+		}
+
+		f, err := os.Open(blobPath)
+		if err != nil {
+			return fmt.Errorf("failed to open converted erofs layer: %w", err)
+		}
+		defer f.Close()
+		if _, err := io.Copy(w, f); err != nil {
+			return fmt.Errorf("failed to copy erofs layer: %w", err)
+		}
+		return nil
+	}
 }
 
 // compressionTypeFromMediaType returns the compression type for a media type.
+// Native EROFS layers are stored as-is (mkfs.erofs output is deliberately
+// uncompressed for fsmeta-merge compatibility).
 func compressionTypeFromMediaType(mediaType string) (compression.Compression, error) {
+	if isErofsMediaType(mediaType) {
+		return compression.Uncompressed, nil
+	}
 	switch mediaType {
 	case ocispec.MediaTypeImageLayer:
 		return compression.Uncompressed, nil

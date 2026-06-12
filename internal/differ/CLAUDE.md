@@ -251,6 +251,12 @@ sudo go test -v ./internal/differ/... -test.root
 - **MUST** accept media types starting with `application/vnd.erofs.layer` (official `images.MediaTypeErofsLayer` prefix) as native
 - **MUST NOT** accept media types with `+suffix` (reserved for DiffCompression)
 - **SHOULD** support standard OCI tar media types via decompression chain
+- Compare emits native EROFS layers when requested via
+  `diff.WithMediaType(images.MediaTypeErofsLayer)`: the tar diff is converted
+  through mkfs.erofs (same options as Apply, fsmeta-merge compatible) and the
+  diff ID is the blob digest itself (recorded in the
+  `containerd.io/uncompressed` label). Default stays tar+gzip for OCI
+  portability.
 
 ### Platform Rules
 

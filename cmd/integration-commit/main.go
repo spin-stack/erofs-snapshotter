@@ -50,16 +50,22 @@ func main() {
 		sourceImage   = flag.String("source", "ghcr.io/containerd/alpine:3.14.0", "source image")
 		targetImage   = flag.String("target", "localhost/alpine:with-new-layer", "target image name")
 		markerFile    = flag.String("marker", "/root/committed-marker.txt", "marker file to create")
+		nativeErofs   = flag.Bool("native-erofs", false, "emit the committed layer as a native EROFS blob instead of tar+gzip")
 	)
 	flag.Parse()
 
-	if err := run(*address, *namespace, *snapshotterNm, *sourceImage, *targetImage, *markerFile); err != nil {
+	mediaType := ocispec.MediaTypeImageLayerGzip
+	if *nativeErofs {
+		mediaType = images.MediaTypeErofsLayer
+	}
+
+	if err := run(*address, *namespace, *snapshotterNm, *sourceImage, *targetImage, *markerFile, mediaType); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(address, namespace, snapshotterName, sourceImage, targetImage, markerFile string) error {
+func run(address, namespace, snapshotterName, sourceImage, targetImage, markerFile, layerMediaType string) error {
 	ctx := namespaces.WithNamespace(context.Background(), namespace)
 
 	c, err := client.New(address)
@@ -131,7 +137,7 @@ func run(address, namespace, snapshotterName, sourceImage, targetImage, markerFi
 	defer removeSnapshot(ctx, sn, viewKey)
 
 	layerDesc, err := c.DiffService().Compare(ctx, lowerMounts, upperMounts,
-		diff.WithMediaType(ocispec.MediaTypeImageLayerGzip),
+		diff.WithMediaType(layerMediaType),
 		diff.WithReference(fmt.Sprintf("commit-layer-%d", time.Now().UnixNano())))
 	if err != nil {
 		return fmt.Errorf("diff.Compare: %w", err)

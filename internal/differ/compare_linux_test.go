@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,6 +25,10 @@ import (
 
 	// Import testutil to register the -test.root flag
 	_ "github.com/spin-stack/erofs-snapshotter/internal/testutil"
+
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/pkg/archive/compression"
+	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 )
 
 // newTestContentStore creates a content store for testing with label support.
@@ -805,5 +810,94 @@ func TestWithActiveSnapshotMountMissingExt4(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "missing ext4 writable layer") {
 		t.Fatalf("expected missing ext4 error, got: %v", err)
+	}
+}
+
+// TestWriteAndCommitDiffNativeErofs verifies the native EROFS layer path:
+// the tar diff is converted through mkfs.erofs and the staged image is
+// committed as-is, with the uncompressed label set to the blob digest (the
+// diff ID convention for native EROFS layers).
+func TestWriteAndCommitDiffNativeErofs(t *testing.T) {
+	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
+		t.Skip("mkfs.erofs not installed")
+	}
+	supported, err := erofs.SupportGenerateFromTar()
+	if err != nil || !supported {
+		t.Skipf("mkfs.erofs lacks --tar support (err=%v)", err)
+	}
+
+	ctx := context.Background()
+	store := newTestContentStore(t)
+	d := NewErofsDiffer(store)
+
+	writeFn := func(ctx context.Context, w io.Writer) error {
+		tw := tar.NewWriter(w)
+		content := []byte("hello from a native erofs layer")
+		if err := tw.WriteHeader(&tar.Header{
+			Name: "hello.txt",
+			Mode: 0o644,
+			Size: int64(len(content)),
+		}); err != nil {
+			return err
+		}
+		if _, err := tw.Write(content); err != nil {
+			return err
+		}
+		return tw.Close()
+	}
+
+	config := diff.Config{MediaType: images.MediaTypeErofsLayer}
+	// Mirror Compare's wiring for EROFS media types.
+	desc, err := d.writeAndCommitDiff(ctx, config, erofsLayerWriteFn(writeFn))
+	if err != nil {
+		t.Fatalf("writeAndCommitDiff failed: %v", err)
+	}
+
+	if desc.MediaType != images.MediaTypeErofsLayer {
+		t.Errorf("media type = %s, want %s", desc.MediaType, images.MediaTypeErofsLayer)
+	}
+
+	// The committed blob must be a valid EROFS image with 4KiB blocks
+	// (fsmeta-merge compatible, like layers produced by the pull path).
+	blob, err := content.ReadBlob(ctx, store, desc)
+	if err != nil {
+		t.Fatalf("read committed blob: %v", err)
+	}
+	blobPath := filepath.Join(t.TempDir(), "layer.erofs")
+	if err := os.WriteFile(blobPath, blob, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	blockSize, err := erofs.GetBlockSize(blobPath)
+	if err != nil {
+		t.Fatalf("committed blob is not a valid EROFS image: %v", err)
+	}
+	if blockSize != 4096 {
+		t.Errorf("block size = %d, want 4096 (fsmeta-merge compatibility)", blockSize)
+	}
+
+	// For native EROFS layers the diff ID is the blob digest itself.
+	info, err := store.Info(ctx, desc.Digest)
+	if err != nil {
+		t.Fatalf("blob info: %v", err)
+	}
+	if got := info.Labels["containerd.io/uncompressed"]; got != desc.Digest.String() {
+		t.Errorf("uncompressed label = %q, want blob digest %q", got, desc.Digest)
+	}
+}
+
+// TestCompressionTypeFromMediaTypeErofs verifies EROFS media types are
+// accepted as uncompressed while +suffix forms remain rejected.
+func TestCompressionTypeFromMediaTypeErofs(t *testing.T) {
+	for _, mt := range []string{images.MediaTypeErofsLayer, "application/vnd.oci.image.layer.v1.erofs"} {
+		ct, err := compressionTypeFromMediaType(mt)
+		if err != nil {
+			t.Errorf("compressionTypeFromMediaType(%q): %v", mt, err)
+		}
+		if ct != compression.Uncompressed {
+			t.Errorf("compressionTypeFromMediaType(%q) = %v, want Uncompressed", mt, ct)
+		}
+	}
+	if _, err := compressionTypeFromMediaType(images.MediaTypeErofsLayer + "+gzip"); err == nil {
+		t.Error("expected +suffix erofs media type to be rejected")
 	}
 }
