@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
@@ -356,4 +357,61 @@ func TestSingleLayerMountsRequiresActive(t *testing.T) {
 	if err == nil {
 		t.Error("singleLayerMounts should reject non-Active snapshots")
 	}
+}
+
+func TestWaitForFsmeta(t *testing.T) {
+	newSnap := func(t *testing.T) *snapshotter {
+		root := t.TempDir()
+		s := &snapshotter{root: root}
+		if err := os.MkdirAll(filepath.Join(root, "snapshots", "parent"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	t.Run("returns immediately when fsmeta exists", func(t *testing.T) {
+		s := newSnap(t)
+		if err := os.WriteFile(s.fsMetaPath("parent"), []byte("fsmeta"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		if !s.waitForFsmeta("parent", 5*time.Second) {
+			t.Fatal("waitForFsmeta = false, want true when fsmeta exists")
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("waitForFsmeta took %v, expected immediate return", elapsed)
+		}
+	})
+
+	t.Run("times out when fsmeta never appears", func(t *testing.T) {
+		s := newSnap(t)
+		if s.waitForFsmeta("parent", 300*time.Millisecond) {
+			t.Fatal("waitForFsmeta = true, want false when fsmeta never appears")
+		}
+	})
+
+	t.Run("waits while generation lock present then times out", func(t *testing.T) {
+		s := newSnap(t)
+		if err := os.WriteFile(s.fsMetaPath("parent")+".lock", nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		if s.waitForFsmeta("parent", 300*time.Millisecond) {
+			t.Fatal("waitForFsmeta = true, want false (lock present, fsmeta never written)")
+		}
+		if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
+			t.Fatalf("waitForFsmeta returned after %v, expected it to wait for the timeout", elapsed)
+		}
+	})
+
+	t.Run("picks up fsmeta written mid-wait", func(t *testing.T) {
+		s := newSnap(t)
+		go func() {
+			time.Sleep(150 * time.Millisecond)
+			_ = os.WriteFile(s.fsMetaPath("parent"), []byte("fsmeta"), 0o644)
+		}()
+		if !s.waitForFsmeta("parent", 5*time.Second) {
+			t.Fatal("waitForFsmeta = false, want true once fsmeta appears")
+		}
+	})
 }

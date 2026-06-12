@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -12,6 +13,42 @@ import (
 
 	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 )
+
+// fsmetaWaitTimeout bounds how long mount resolution waits for the async
+// fsmeta generation when the merged image is mandatory (more layers than
+// maxLayersForFallback). fsmeta merge is metadata-only work, normally far
+// faster than this.
+const fsmetaWaitTimeout = 30 * time.Second
+
+// waitForFsmeta polls for the merged fsmeta of the chain rooted at parentID,
+// returning true once fsmeta.erofs exists. It keeps waiting while a
+// generation appears to be running and gives up early once it is clear none
+// is. The grace period covers the window between createSnapshot spawning the
+// generation goroutine and the goroutine creating the lock file.
+func (s *snapshotter) waitForFsmeta(parentID string, timeout time.Duration) bool {
+	const (
+		pollInterval = 100 * time.Millisecond
+		spawnGrace   = 2 * time.Second
+	)
+	deadline := time.Now().Add(timeout)
+	graceEnd := time.Now().Add(spawnGrace)
+	for {
+		if _, err := os.Stat(s.fsMetaPath(parentID)); err == nil {
+			return true
+		}
+		now := time.Now()
+		if now.After(deadline) {
+			return false
+		}
+		if now.After(graceEnd) && !s.fsmetaGenerationInProgress(parentID) {
+			// No generation running and none about to start: the miss is
+			// permanent (e.g. incompatible layers), so don't burn the rest
+			// of the timeout.
+			return false
+		}
+		time.Sleep(pollInterval)
+	}
+}
 
 // fsmetaGenerationInProgress reports whether async fsmeta generation is still
 // running (or crashed mid-write) for the given parent snapshot. The lock and
@@ -255,13 +292,19 @@ func (s *snapshotter) buildErofsLayerMounts(snap storage.Snapshot) ([]mount.Moun
 	// Fallback: individual EROFS mounts (fsmeta not ready or generation failed)
 	layerCount := len(snap.ParentIDs)
 	if layerCount > maxLayersForFallback {
-		parentID := ""
-		if layerCount > 0 {
-			parentID = snap.ParentIDs[0]
+		// Per-layer mounts are not viable past the virtio-blk slot budget,
+		// so the merged fsmeta is mandatory here. Generation is async and
+		// was typically kicked off milliseconds ago by createSnapshot: wait
+		// for it instead of deterministically failing the first
+		// Prepare/View of every large image.
+		if s.waitForFsmeta(snap.ParentIDs[0], fsmetaWaitTimeout) {
+			if m, ok := s.mountFsMeta(snap); ok {
+				return []mount.Mount{m}, nil
+			}
 		}
 		return nil, &FsmetaFallbackTooManyLayersError{
 			SnapshotID: snap.ID,
-			ParentID:   parentID,
+			ParentID:   snap.ParentIDs[0],
 			LayerCount: layerCount,
 			Limit:      maxLayersForFallback,
 		}
