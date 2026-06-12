@@ -27,6 +27,9 @@ import (
 	"syscall"
 
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/errdefs"
+	"golang.org/x/sys/unix"
+
 	"github.com/spin-stack/erofs-snapshotter/internal/loop"
 )
 
@@ -39,7 +42,9 @@ import (
 // - The mount options must be rewritten to use loop device paths
 //
 // Returns a cleanup function that must be called to release resources (loop devices).
-// The cleanup function is always non-nil, even on error.
+// On error, MountAll releases everything it acquired itself and returns a nop
+// cleanup function, so callers never need to invoke cleanup on failure
+// (matching MountExt4).
 func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err error) {
 	// Find EROFS mounts with device= options
 	erofsIdx := -1
@@ -53,6 +58,10 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 	// No EROFS multi-device mount - use standard mount.All
 	if erofsIdx == -1 {
 		if err := mount.All(mounts, target); err != nil {
+			// mount.All does not unwind partially-applied mounts on failure.
+			if uerr := mount.UnmountMounts(mounts, target, 0); uerr != nil {
+				err = fmt.Errorf("%w (cleanup of partial mounts failed: %v)", err, uerr)
+			}
 			return nopCleanup, err
 		}
 		return func() error {
@@ -88,11 +97,19 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 		}
 		return nil
 	}
+	// failMount releases already-attached loop devices before returning err,
+	// folding any detach failure into the returned error.
+	failMount := func(err error) error {
+		if cerr := cleanupLoops(); cerr != nil {
+			return fmt.Errorf("%w (loop device cleanup also failed: %v)", err, cerr)
+		}
+		return err
+	}
 
 	// Set up loop device for the main fsmeta
 	mainDev, err := loop.Setup(erofsMount.Source, loop.Config{ReadOnly: true})
 	if err != nil {
-		return cleanupLoops, fmt.Errorf("failed to setup loop device for %s: %w", erofsMount.Source, err)
+		return nopCleanup, fmt.Errorf("failed to setup loop device for %s: %w", erofsMount.Source, err)
 	}
 	loopDevices = append(loopDevices, mainDev)
 
@@ -101,7 +118,7 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 	for _, dev := range devices {
 		loopDev, err := loop.Setup(dev, loop.Config{ReadOnly: true})
 		if err != nil {
-			return cleanupLoops, fmt.Errorf("failed to setup loop device for %s: %w", dev, err)
+			return nopCleanup, failMount(fmt.Errorf("failed to setup loop device for %s: %w", dev, err))
 		}
 		loopDevices = append(loopDevices, loopDev)
 		deviceOpts = append(deviceOpts, fmt.Sprintf("device=%s", loopDev.Path))
@@ -113,7 +130,7 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 	args = append(args, mainDev.Path, target)
 	cmd := exec.Command("mount", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return cleanupLoops, fmt.Errorf("failed to mount multi-device EROFS: %w: %s", err, out)
+		return nopCleanup, failMount(fmt.Errorf("failed to mount multi-device EROFS: %w: %s", err, out))
 	}
 
 	return func() error {
@@ -126,17 +143,29 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 	}, nil
 }
 
-// MountExt4 mounts an ext4 filesystem image to the target directory using a loop device.
-// Returns a cleanup function that unmounts and detaches the loop device.
+// MountExt4 mounts an ext4 filesystem image read-only on the target directory
+// using a loop device. Returns a cleanup function that unmounts, detaches the
+// loop device and releases the image lock.
 //
-// This function checks if the file is in use (e.g., by a running VM) before mounting.
-// If the file is in use, it returns an error indicating the container must be stopped first.
+// The image is locked (flock + OFD fcntl lock) before mounting and the lock is
+// held until cleanup runs. QEMU protects its disk images with OFD locks, so
+// this both detects a running VM and prevents one from starting while the
+// image is mounted on the host - releasing the lock before mounting would
+// leave a window for the guest to attach the image concurrently.
+//
+// The mount is read-only: committing/diffing must never mutate the snapshot.
+// The loop device stays writable so ext4 can replay a dirty journal (e.g.
+// after a guest crash) and present a consistent view.
 func MountExt4(source, target string) (cleanup func() error, err error) {
-	// Check if the file is in use by trying to get an exclusive lock.
-	// If a VM is using it via virtio-blk, we won't be able to get the lock.
-	if err := checkFileNotInUse(source); err != nil {
+	lockFile, err := lockImageFile(source)
+	if err != nil {
 		return nopCleanup, err
 	}
+	defer func() {
+		if err != nil {
+			_ = lockFile.Close()
+		}
+	}()
 
 	// Set up loop device for the ext4 image
 	loopDev, err := loop.Setup(source, loop.Config{ReadOnly: false})
@@ -145,10 +174,11 @@ func MountExt4(source, target string) (cleanup func() error, err error) {
 	}
 
 	// Mount the loop device
-	cmd := exec.Command("mount", "-t", "ext4", loopDev.Path, target)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	cmd := exec.Command("mount", "-t", "ext4", "-o", "ro", loopDev.Path, target)
+	if out, merr := cmd.CombinedOutput(); merr != nil {
 		_ = loopDev.Detach()
-		return nopCleanup, fmt.Errorf("failed to mount ext4: %w: %s", err, out)
+		err = fmt.Errorf("failed to mount ext4: %w: %s", merr, out)
+		return nopCleanup, err
 	}
 
 	return func() error {
@@ -160,32 +190,42 @@ func MountExt4(source, target string) (cleanup func() error, err error) {
 		if err := loopDev.Detach(); err != nil {
 			return fmt.Errorf("failed to detach loop device: %w", err)
 		}
-		return nil
+		return lockFile.Close()
 	}, nil
 }
 
-// checkFileNotInUse verifies that the file is not being used by another process
-// (e.g., a running VM). It attempts to get an exclusive lock on the file.
-// If the lock cannot be acquired, the file is in use and commit cannot proceed.
-func checkFileNotInUse(path string) error {
+// lockImageFile opens the image file and acquires both a flock and an OFD
+// (fcntl) write lock without blocking. Both are needed because the two lock
+// families are independent on Linux: QEMU locks its images with OFD locks
+// (which flock cannot see), while flock guards against other host-side users
+// of this package. Closing the returned file releases both locks, so it must
+// stay open for as long as exclusive access to the image is required.
+func lockImageFile(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
-		return fmt.Errorf("failed to open %s: %w", path, err)
+		return nil, fmt.Errorf("failed to open %s: %w", path, err)
 	}
-	defer f.Close()
 
-	// Try to get an exclusive lock (non-blocking)
-	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-	if err != nil {
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return fmt.Errorf("container is still running: stop the container before committing (ext4 %s is in use)", path)
+			return nil, fmt.Errorf("container is still running: stop the container before committing (ext4 %s is in use): %w", path, errdefs.ErrFailedPrecondition)
 		}
-		return fmt.Errorf("failed to check if file is in use: %w", err)
+		return nil, fmt.Errorf("failed to check if file is in use: %w", err)
 	}
 
-	// Release the lock immediately - we just wanted to check
-	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-	return nil
+	// OFD write lock over the whole file. This conflicts with the byte-range
+	// OFD locks QEMU takes on its images, unlike flock.
+	flk := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0, Len: 0}
+	if err := unix.FcntlFlock(f.Fd(), unix.F_OFD_SETLK, &flk); err != nil {
+		_ = f.Close()
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EACCES) {
+			return nil, fmt.Errorf("container is still running: stop the container before committing (ext4 %s is locked by the VM): %w", path, errdefs.ErrFailedPrecondition)
+		}
+		return nil, fmt.Errorf("failed to check OFD lock on %s: %w", path, err)
+	}
+
+	return f, nil
 }
 
 func nopCleanup() error { return nil }
