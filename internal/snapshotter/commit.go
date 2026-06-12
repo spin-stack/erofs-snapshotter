@@ -481,7 +481,16 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 	if isMounted(rwMount) {
 		if unmountErr := unmountAll(rwMount); unmountErr != nil {
 			log.G(ctx).WithError(unmountErr).WithField("id", id).Warn("failed to cleanup ext4 mount after commit")
+			// Leave rwlayer.img in place: it may still back the live mount.
+			return nil
 		}
+	}
+
+	// Reclaim the ext4 writable layer: the committed EROFS blob holds the
+	// layer content, and a sparse ~64MiB image plus journal would otherwise
+	// linger for every committed layer.
+	if rerr := os.Remove(s.writablePath(id)); rerr != nil && !os.IsNotExist(rerr) {
+		log.G(ctx).WithError(rerr).WithField("id", id).Warn("failed to remove writable layer after commit")
 	}
 
 	return nil

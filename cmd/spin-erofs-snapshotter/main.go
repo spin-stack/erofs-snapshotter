@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	diffapi "github.com/containerd/containerd/api/services/diff/v1"
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
@@ -61,12 +62,6 @@ const (
 )
 
 func main() {
-	// Run preflight checks early to fail fast
-	if err := preflight.Check(); err != nil {
-		fmt.Fprintf(os.Stderr, "preflight check failed: %v\n", err)
-		os.Exit(1)
-	}
-
 	app := &cli.App{
 		Name:    "spin-erofs-snapshotter",
 		Usage:   "External EROFS snapshotter for containerd",
@@ -127,6 +122,12 @@ func main() {
 }
 
 func run(cliCtx *cli.Context) error {
+	// Preflight checks run here (not in main) so --help/--version work on
+	// hosts that don't satisfy the runtime requirements.
+	if err := preflight.Check(); err != nil {
+		return fmt.Errorf("preflight check failed: %w", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -154,16 +155,24 @@ func run(cliCtx *cli.Context) error {
 		return fmt.Errorf("failed to create socket directory: %w", err)
 	}
 
-	// Remove existing socket if present
+	// Remove an existing socket only if no other instance is serving on it:
+	// silently unlinking a live socket would orphan the running snapshotter
+	// and hijack its address.
+	if conn, err := net.DialTimeout("unix", address, time.Second); err == nil {
+		_ = conn.Close()
+		return fmt.Errorf("socket %s is already in use by a running instance", address)
+	}
 	if err := os.Remove(address); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove existing socket: %w", err)
 	}
 
 	// Build snapshotter options
 	var snapshotterOpts []snapshotter.Opt
-	if size := cliCtx.Int64("default-size"); size > 0 {
-		snapshotterOpts = append(snapshotterOpts, snapshotter.WithDefaultSize(size))
+	size := cliCtx.Int64("default-size")
+	if size <= 0 {
+		return fmt.Errorf("default-size must be > 0, got %d", size)
 	}
+	snapshotterOpts = append(snapshotterOpts, snapshotter.WithDefaultSize(size))
 	if cliCtx.Bool("set-immutable") {
 		snapshotterOpts = append(snapshotterOpts, snapshotter.WithImmutable())
 	}
@@ -266,7 +275,7 @@ func grpcStreamLoggingInterceptor(srv interface{}, ss grpc.ServerStream, info *g
 		"method":         info.FullMethod,
 		"isClientStream": info.IsClientStream,
 		"isServerStream": info.IsServerStream,
-	}).Info("grpc: STREAM request received")
+	}).Debug("grpc: STREAM request received")
 	return handler(srv, ss)
 }
 
@@ -280,14 +289,14 @@ func grpcLoggingInterceptor(ctx context.Context, req interface{}, info *grpc.Una
 		}
 	}
 
-	// Log ALL requests at Info level to diagnose missing Commit issue
-	log.G(ctx).WithFields(fields).Info("grpc: request received")
+	// Per-request tracing is debug-level; failures stay at Warn.
+	log.G(ctx).WithFields(fields).Debug("grpc: request received")
 
 	resp, err := handler(ctx, req)
 	if err != nil {
 		log.G(ctx).WithFields(fields).WithError(err).Warn("grpc: request failed")
 		return resp, err
 	}
-	log.G(ctx).WithFields(fields).Info("grpc: request completed")
+	log.G(ctx).WithFields(fields).Debug("grpc: request completed")
 	return resp, nil
 }
