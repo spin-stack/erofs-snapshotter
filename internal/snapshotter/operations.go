@@ -76,10 +76,6 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}
 
 	snapshotDir := s.snapshotsDir()
-	td, err = s.prepareDirectory(snapshotDir, kind)
-	if err != nil {
-		return nil, fmt.Errorf("create prepare snapshot dir: %w", err)
-	}
 
 	// Mark extract snapshots with a label for TOCTOU-safe detection.
 	if isExtractKey(key) {
@@ -89,6 +85,14 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}
 
 	if err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) (err error) {
+		// The temp dir must be created inside the write transaction so that
+		// Cleanup/Remove (which scan the snapshots directory under a write
+		// transaction) cannot observe and delete it before the rename below.
+		td, err = s.prepareDirectory(snapshotDir, kind)
+		if err != nil {
+			return fmt.Errorf("create prepare snapshot dir: %w", err)
+		}
+
 		snap, err = storage.CreateSnapshot(ctx, kind, key, parent, opts...)
 		if err != nil {
 			return fmt.Errorf("create snapshot: %w", err)
@@ -288,7 +292,10 @@ func (s *snapshotter) cleanupAfterRemove(ctx context.Context, id string, removal
 // Errors are logged but don't stop cleanup (best-effort).
 func (s *snapshotter) Cleanup(ctx context.Context) error {
 	var removals []string
-	if err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+	// Use a write transaction so no snapshot can be created or removed while
+	// the scan runs: a read transaction would race with an in-flight Prepare
+	// whose directory has not been renamed into place yet, deleting it.
+	if err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		var err error
 		removals, err = s.getCleanupDirectories(ctx)
 		return err
