@@ -192,7 +192,7 @@ func (s *service) List(sr *snapshotsapi.ListSnapshotsRequest, ss snapshotsapi.Sn
 		return nil
 	}, sr.Filters...)
 	if err != nil {
-		return err
+		return errgrpc.ToGRPC(err)
 	}
 	if len(buffer) > 0 {
 		// Send remaining infos
