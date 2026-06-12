@@ -60,7 +60,7 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 		if err := mount.All(mounts, target); err != nil {
 			// mount.All does not unwind partially-applied mounts on failure.
 			if uerr := mount.UnmountMounts(mounts, target, 0); uerr != nil {
-				err = fmt.Errorf("%w (cleanup of partial mounts failed: %v)", err, uerr)
+				err = fmt.Errorf("%w (cleanup of partial mounts failed: %w)", err, uerr)
 			}
 			return nopCleanup, err
 		}
@@ -101,7 +101,7 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 	// folding any detach failure into the returned error.
 	failMount := func(err error) error {
 		if cerr := cleanupLoops(); cerr != nil {
-			return fmt.Errorf("%w (loop device cleanup also failed: %v)", err, cerr)
+			return fmt.Errorf("%w (loop device cleanup also failed: %w)", err, cerr)
 		}
 		return err
 	}

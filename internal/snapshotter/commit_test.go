@@ -14,7 +14,7 @@ func TestGetCommitUpperDir(t *testing.T) {
 
 	t.Run("overlay mode when no rwlayer.img", func(t *testing.T) {
 		root := t.TempDir()
-		s := newTestSnapshotterWithRoot(t, root)
+		s := newTestSnapshotterWithRoot(t, root) //nolint:contextcheck // NewSnapshotter startup cleanup intentionally uses a background context
 
 		// Create snapshot directory without rwlayer.img
 		snapshotDir := filepath.Join(root, "snapshots", "test-id")
@@ -41,7 +41,7 @@ func TestGetCommitUpperDir(t *testing.T) {
 
 	t.Run("block mode when rwlayer.img exists and upper dir exists", func(t *testing.T) {
 		root := t.TempDir()
-		s := newTestSnapshotterWithRoot(t, root)
+		s := newTestSnapshotterWithRoot(t, root) //nolint:contextcheck // NewSnapshotter startup cleanup intentionally uses a background context
 
 		// Create snapshot directory with rwlayer.img and rw/upper/
 		snapshotDir := filepath.Join(root, "snapshots", "test-id")
@@ -107,7 +107,7 @@ func TestGetCommitUpperDir(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
-			s := newTestSnapshotterWithRoot(t, root)
+			s := newTestSnapshotterWithRoot(t, root) //nolint:contextcheck // NewSnapshotter startup cleanup intentionally uses a background context
 
 			snapshotDir := filepath.Join(root, "snapshots", "test-id")
 			fsDir := filepath.Join(snapshotDir, "fs")
