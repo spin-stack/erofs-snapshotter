@@ -70,6 +70,19 @@ func run(address, namespace, snapshotterName, sourceImage, targetImage, markerFi
 
 	fmt.Printf("Connected to containerd at %s (namespace: %s)\n", address, namespace)
 
+	// Hold a lease for the whole operation: the config/manifest blobs and the
+	// new snapshot are unreferenced until images.Create registers the image,
+	// and a concurrent containerd GC sweep would delete them otherwise.
+	ctx, done, err := c.WithLease(ctx)
+	if err != nil {
+		return fmt.Errorf("create lease: %w", err)
+	}
+	defer func() {
+		if derr := done(context.WithoutCancel(ctx)); derr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to release lease: %v\n", derr)
+		}
+	}()
+
 	img, err := c.GetImage(ctx, sourceImage)
 	if err != nil {
 		return fmt.Errorf("get source image %s: %w", sourceImage, err)
@@ -164,15 +177,9 @@ func run(address, namespace, snapshotterName, sourceImage, targetImage, markerFi
 			"io.containerd.commit.time":   time.Now().Format(time.RFC3339),
 		},
 	}
-	imgService := c.ImageService()
-	created, err := imgService.Create(ctx, newImage)
+	created, err := registerImage(ctx, c.ImageService(), newImage)
 	if err != nil {
-		if !errdefs.IsAlreadyExists(err) {
-			return fmt.Errorf("create image: %w", err)
-		}
-		if created, err = imgService.Update(ctx, newImage); err != nil {
-			return fmt.Errorf("update image: %w", err)
-		}
+		return err
 	}
 	fmt.Printf("\n✓ Created image %s (digest %s)\n", created.Name, created.Target.Digest)
 
@@ -183,6 +190,21 @@ func run(address, namespace, snapshotterName, sourceImage, targetImage, markerFi
 	fmt.Printf("✓ New image has %d layers and is unpacked (snapshot %s exists)\n", len(diffIDs)+1, newChainID)
 
 	return nil
+}
+
+// registerImage creates the image record, falling back to Update when the
+// name already exists.
+func registerImage(ctx context.Context, imgService images.Store, newImage images.Image) (images.Image, error) {
+	created, err := imgService.Create(ctx, newImage)
+	if err != nil {
+		if !errdefs.IsAlreadyExists(err) {
+			return images.Image{}, fmt.Errorf("create image: %w", err)
+		}
+		if created, err = imgService.Update(ctx, newImage); err != nil {
+			return images.Image{}, fmt.Errorf("update image: %w", err)
+		}
+	}
+	return created, nil
 }
 
 // verifyCommittedImage checks the committed image resolves, has the expected
