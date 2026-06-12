@@ -20,27 +20,8 @@ package snapshotter
 
 // This file contains EROFS snapshot flow integration tests.
 // These tests verify end-to-end workflows involving the snapshotter
-// with commit/apply flows and cleanup.
-//
-// Tests in this file:
-// - TestErofsSnapshotCommitApplyFlow
-// - TestErofsSnapshotterFsmetaSingleLayerView
-// - TestErofsBlockModeMountsAfterPrepare
-// - TestErofsCleanupRemovesOrphan
-// - TestErofsViewMountsMultiLayer (verifies EROFS descriptor format)
-// - TestErofsViewMountsSingleLayer
-// - TestErofsViewMountsCleanupOnRemove
-// - TestErofsViewMountsIdempotent
-// - TestErofsBlockModeIgnoresFsMerge
-// - TestErofsExtractSnapshotWithParents
-// - TestErofsImmutableFlagOnCommit
-// - TestErofsImmutableFlagClearedOnRemove
-// - TestErofsConcurrentMounts
-// - TestErofsViewNoParent
-// - TestErofsViewNoParentBlockMode
-// - TestErofsBlockModeExtractWithParent
-// - TestErofsBlockModeExtractWithMultipleParents
-// - TestErofsConcurrentRemoveAndMounts
+// with commit/apply flows and cleanup (views, block mode, extract
+// snapshots, immutable flags, and concurrency).
 
 import (
 	"context"
@@ -48,6 +29,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -188,17 +170,34 @@ func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
 
 		// View mounts should contain EROFS mount(s) (the consumer converts to virtio-blk)
 		// Multi-layer views return fsmeta.erofs with device= options (consolidated)
-		hasErofs := false
+		var lowerErofsMounts []mount.Mount
+		lowerHasDeviceOpts := false
 		for _, m := range lowerMounts {
 			if mountutils.TypeSuffix(m.Type) == testTypeErofs {
-				hasErofs = true
-				break
+				lowerErofsMounts = append(lowerErofsMounts, m)
+				for _, opt := range m.Options {
+					if strings.HasPrefix(opt, "device=") {
+						lowerHasDeviceOpts = true
+					}
+				}
 			}
 		}
-		if !hasErofs {
+		if len(lowerErofsMounts) == 0 {
 			t.Fatalf("expected EROFS mount(s), got: %#v", lowerMounts)
 		}
-		_ = expectMulti // fsmeta consolidation handles both single and multi-layer
+		if expectMulti {
+			// Multi-layer views must either consolidate into a single fsmeta
+			// mount (format/erofs with device= options, fsmeta generation is
+			// async) or fall back to one EROFS mount per layer.
+			consolidated := len(lowerErofsMounts) == 1 &&
+				lowerErofsMounts[0].Type == "format/erofs" && lowerHasDeviceOpts
+			fallback := len(lowerErofsMounts) > 1
+			if !consolidated && !fallback {
+				t.Fatalf("multi-layer view returned neither consolidated fsmeta mount nor per-layer mounts: %#v", lowerMounts)
+			}
+		} else if len(lowerErofsMounts) != 1 {
+			t.Fatalf("single-layer view should return exactly one EROFS mount, got: %#v", lowerMounts)
+		}
 
 		// For Compare, we need to mount both lower and upper manually because:
 		// 1. Lower may have multi-device fsmeta (device= options) which containerd mount manager doesn't support
@@ -526,10 +525,7 @@ func TestErofsSnapshotterFsmetaSingleLayerView(t *testing.T) {
 		parentKey = commitKey
 	}
 
-	// Wait a bit for fsmeta generation (it runs asynchronously)
-	time.Sleep(500 * time.Millisecond)
-
-	// Check if fsmeta was generated for the top layer
+	// Resolve the snapshot ID of the top layer (fsmeta is stored there)
 	var topID string
 	if err := snap.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		topID, _, _, err = storage.GetInfo(ctx, "layer-5-commit")
@@ -538,57 +534,67 @@ func TestErofsSnapshotterFsmetaSingleLayerView(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fsmetaPath := snap.fsMetaPath(topID)
-	fsmetaExists := false
-	if fi, err := os.Stat(fsmetaPath); err == nil && fi.Size() > 0 {
-		fsmetaExists = true
-		t.Logf("fsmeta generated at %s (%d bytes)", fsmetaPath, fi.Size())
+	// Create a view of the merged layers. This triggers asynchronous fsmeta
+	// generation for the parent chain.
+	viewKey := "merged-view"
+	if _, err := s.View(ctx, viewKey, parentKey); err != nil {
+		t.Fatal(err)
 	}
 
-	// Create a view of the merged layers
-	viewKey := "merged-view"
-	viewMounts, err := s.View(ctx, viewKey, parentKey)
+	// Wait deterministically for the background generation to finish instead
+	// of sleeping a fixed amount: View has already registered the goroutine
+	// with bgWg before returning, and generation is bounded by fsmetaTimeout.
+	snap.bgWg.Wait()
+
+	fsmetaPath := snap.fsMetaPath(topID)
+	fi, err := os.Stat(fsmetaPath)
+	if err != nil || fi.Size() == 0 {
+		// Generation is fail-silent by design (mounts fall back to per-layer),
+		// but this test exists to verify the fsmeta view path - skip explicitly
+		// rather than passing without exercising any assertion.
+		t.Skipf("fsmeta not generated at %s (err=%v): mkfs.erofs may not support merged fsmeta", fsmetaPath, err)
+	}
+	t.Logf("fsmeta generated at %s (%d bytes)", fsmetaPath, fi.Size())
+
+	// Re-resolve mounts now that fsmeta exists; Mounts() recomputes from the
+	// current on-disk state.
+	viewMounts, err := s.Mounts(ctx, viewKey)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Logf("view mounts (fsmeta exists: %v): %#v", fsmetaExists, viewMounts)
+	t.Logf("view mounts: %#v", viewMounts)
 
-	if fsmetaExists {
-		// With fsmeta, we expect a single merged EROFS mount (with device= options)
-		// The key assertion: KindView with fsmeta merge resulting in single lower
-		// should NOT require format/mkdir/overlay (which needs mount manager)
-		hasTemplateOverlay := false
-		for _, m := range viewMounts {
-			if strings.Contains(m.Type, "overlay") && mountsHaveTemplate([]mount.Mount{m}) {
-				hasTemplateOverlay = true
-				break
+	// With fsmeta, we expect a single merged EROFS mount (with device= options)
+	// The key assertion: KindView with fsmeta merge resulting in single lower
+	// should NOT require format/mkdir/overlay (which needs mount manager)
+	hasTemplateOverlay := false
+	for _, m := range viewMounts {
+		if strings.Contains(m.Type, "overlay") && mountsHaveTemplate([]mount.Mount{m}) {
+			hasTemplateOverlay = true
+			break
+		}
+	}
+
+	if hasTemplateOverlay {
+		t.Fatalf("fsmeta view with single lower should not require template resolution, got: %#v", viewMounts)
+	}
+
+	// Verify we have EROFS mounts (possibly with device= for multi-device)
+	// Multi-device fsmeta mounts return "format/erofs", single-layer returns "erofs"
+	hasErofs := false
+	for _, m := range viewMounts {
+		if mountutils.TypeSuffix(m.Type) == testTypeErofs {
+			hasErofs = true
+			t.Logf("found EROFS mount: type=%s, source=%s, options=%v", m.Type, m.Source, m.Options)
+			// Verify fsmeta mounts use format/erofs
+			if strings.HasSuffix(m.Source, "fsmeta.erofs") && m.Type != "format/erofs" {
+				t.Fatalf("fsmeta mount should use format/erofs type, got: %s", m.Type)
 			}
 		}
-
-		if hasTemplateOverlay {
-			t.Fatalf("fsmeta view with single lower should not require template resolution, got: %#v", viewMounts)
-		}
-
-		// Verify we have EROFS mounts (possibly with device= for multi-device)
-		// Multi-device fsmeta mounts return "format/erofs", single-layer returns "erofs"
-		hasErofs := false
-		for _, m := range viewMounts {
-			if mountutils.TypeSuffix(m.Type) == testTypeErofs {
-				hasErofs = true
-				t.Logf("found EROFS mount: type=%s, source=%s, options=%v", m.Type, m.Source, m.Options)
-				// Verify fsmeta mounts use format/erofs
-				if strings.HasSuffix(m.Source, "fsmeta.erofs") && m.Type != "format/erofs" {
-					t.Fatalf("fsmeta mount should use format/erofs type, got: %s", m.Type)
-				}
-			}
-		}
-		if !hasErofs {
-			t.Fatalf("expected EROFS mount in view, got: %#v", viewMounts)
-		}
-	} else {
-		// Without fsmeta, we'll have multiple EROFS mounts with overlay
-		t.Logf("fsmeta not generated (mkfs.erofs may not support --aufs), view has %d mounts", len(viewMounts))
+	}
+	if !hasErofs {
+		t.Fatalf("expected EROFS mount in view, got: %#v", viewMounts)
 	}
 }
 
@@ -820,30 +826,15 @@ func TestErofsViewMountsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Should return consistent results
-	if len(mounts1) != len(mounts2) {
-		t.Fatalf("inconsistent mount counts: first=%d, second=%d", len(mounts1), len(mounts2))
+	// A view of committed layers must return at least one mount
+	if len(mounts1) == 0 {
+		t.Fatal("expected at least one mount from view")
 	}
 
-	// Both mount types should be consistent
-	if mounts1[0].Type != mounts2[0].Type {
-		t.Fatalf("inconsistent mount types: first=%s, second=%s", mounts1[0].Type, mounts2[0].Type)
-	}
-
-	// Source paths should be identical
-	if mounts1[0].Source != mounts2[0].Source {
-		t.Fatalf("inconsistent source:\n  first:  %s\n  second: %s", mounts1[0].Source, mounts2[0].Source)
-	}
-
-	// Options should be identical
-	if len(mounts1[0].Options) != len(mounts2[0].Options) {
-		t.Fatalf("inconsistent options count: first=%d, second=%d", len(mounts1[0].Options), len(mounts2[0].Options))
-	}
-
-	for i := range mounts1[0].Options {
-		if mounts1[0].Options[i] != mounts2[0].Options[i] {
-			t.Fatalf("inconsistent option[%d]:\n  first:  %s\n  second: %s", i, mounts1[0].Options[i], mounts2[0].Options[i])
-		}
+	// All mounts (type, source, options) must be identical across calls,
+	// including every mount in the multi-mount fallback case.
+	if !reflect.DeepEqual(mounts1, mounts2) {
+		t.Fatalf("inconsistent mounts:\n  first:  %#v\n  second: %#v", mounts1, mounts2)
 	}
 }
 
@@ -969,9 +960,16 @@ func TestErofsImmutableFlagOnCommit(t *testing.T) {
 	}
 
 	// lsattr output format: "----i--------e-- /path/to/file"
-	// The 'i' indicates immutable flag
-	if !strings.Contains(string(out), "i") {
-		t.Errorf("expected immutable flag to be set on %s, lsattr output: %s", layerBlob, string(out))
+	// Check only the attribute field (first token): the path may itself
+	// contain the letter 'i' (e.g. t.TempDir() embeds the test name), which
+	// would make a whole-output substring match always true.
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		t.Fatalf("unexpected lsattr output for %s: %q", layerBlob, string(out))
+	}
+	attrs := fields[0]
+	if !strings.Contains(attrs, "i") {
+		t.Errorf("expected immutable flag to be set on %s, lsattr attributes: %s", layerBlob, attrs)
 	} else {
 		t.Logf("immutable flag verified on %s: %s", layerBlob, strings.TrimSpace(string(out)))
 	}
@@ -1295,16 +1293,19 @@ func TestErofsConcurrentRemoveAndMounts(t *testing.T) {
 			t.Fatalf("iter %d: failed to create view: %v", iter, err)
 		}
 
-		// Start concurrent operations
+		// Start both goroutines on a shared barrier so Mounts and Remove
+		// actually interleave instead of Mounts finishing before Remove starts.
+		start := make(chan struct{})
 		mountsDone := make(chan error, 1)
 		removeDone := make(chan error, 1)
 
 		// Goroutine 1: repeatedly call Mounts
 		go func() {
+			<-start
 			for range 10 {
 				_, err := env.snapshotter.Mounts(env.ctx(), viewKey)
 				if err != nil {
-					// Snapshot may have been removed - this is expected
+					// Snapshot removed by the concurrent Remove - expected
 					if strings.Contains(err.Error(), "not found") ||
 						strings.Contains(err.Error(), "does not exist") {
 						break
@@ -1316,17 +1317,14 @@ func TestErofsConcurrentRemoveAndMounts(t *testing.T) {
 			mountsDone <- nil
 		}()
 
-		// Goroutine 2: remove the snapshot after a brief delay
+		// Goroutine 2: remove the snapshot concurrently. Each iteration uses
+		// a unique view key that nothing else removes, so Remove must succeed.
 		go func() {
-			time.Sleep(1 * time.Millisecond)
-			err := env.snapshotter.Remove(env.ctx(), viewKey)
-			// "not found" is acceptable if another iteration already removed it
-			if err != nil && !strings.Contains(err.Error(), "not found") {
-				removeDone <- err
-				return
-			}
-			removeDone <- nil
+			<-start
+			removeDone <- env.snapshotter.Remove(env.ctx(), viewKey)
 		}()
+
+		close(start)
 
 		// Wait for both to complete with timeout
 		timeout := time.After(5 * time.Second)

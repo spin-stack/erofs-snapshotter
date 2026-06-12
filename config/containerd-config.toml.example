@@ -14,6 +14,21 @@ version = 2
     type = "diff"
     address = "/run/spin-stack/erofs-snapshotter.sock"
 
+# REQUIRED: Route diff operations (Apply/Compare) through the EROFS differ.
+# Without this, containerd uses the walking differ, which cannot handle the
+# VM-only mounts returned by this snapshotter (format/erofs, ext4 file paths):
+# pulls would write tar content into the ext4 instead of creating EROFS blobs,
+# and "nerdctl/ctr commit" would fail or produce empty layers.
+[plugins."io.containerd.service.v1.diff-service"]
+  default = ["spin-erofs-diff", "walking"]
+
+# Configure unpack platforms for the proxy snapshotter
+[plugins."io.containerd.transfer.v1.local"]
+  [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+    platform = "linux/amd64"
+    snapshotter = "spin-erofs"
+    differ = "spin-erofs-diff"
+
 # Optional: Use spin-erofs as the default snapshotter for CRI
 [plugins."io.containerd.cri.v1.images"]
   snapshotter = "spin-erofs"

@@ -2,12 +2,21 @@ package preflight
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
 	// Import testutil to register the -test.root flag used by containerd tests
 	_ "github.com/containerd/containerd/v2/pkg/testutil"
 )
+
+// expectErofs reports whether the environment guarantees EROFS support.
+// Set EXPECT_EROFS=1 in environments that install erofs-utils and run an
+// EROFS-enabled kernel (e.g. the CI Docker test image) so a failing check
+// is a real test failure instead of a silent skip.
+func expectErofs() bool {
+	return os.Getenv("EXPECT_EROFS") == "1"
+}
 
 func TestKernelVersion(t *testing.T) {
 	version, err := KernelVersion()
@@ -110,8 +119,10 @@ func TestCheckKernelVersion(t *testing.T) {
 func TestCheckErofsSupport(t *testing.T) {
 	err := CheckErofsSupport()
 	if err != nil {
-		t.Logf("EROFS not available: %v", err)
-		t.Skip("EROFS module not loaded")
+		if expectErofs() {
+			t.Fatalf("EXPECT_EROFS=1 but EROFS support check failed: %v", err)
+		}
+		t.Skipf("EROFS not available: %v", err)
 	}
 	t.Log("EROFS is available")
 }
@@ -119,9 +130,11 @@ func TestCheckErofsSupport(t *testing.T) {
 func TestCheck(t *testing.T) {
 	err := Check()
 	if err != nil {
-		t.Logf("Preflight check failed: %v", err)
-		// Don't fail the test - the system may not meet requirements
-		t.Skip("System does not meet preflight requirements")
+		if expectErofs() {
+			t.Fatalf("EXPECT_EROFS=1 but preflight check failed: %v", err)
+		}
+		// The local system may legitimately not meet requirements
+		t.Skipf("system does not meet preflight requirements: %v", err)
 	}
 	t.Log("All preflight checks passed")
 }

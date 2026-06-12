@@ -76,10 +76,6 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}
 
 	snapshotDir := s.snapshotsDir()
-	td, err = s.prepareDirectory(snapshotDir, kind)
-	if err != nil {
-		return nil, fmt.Errorf("create prepare snapshot dir: %w", err)
-	}
 
 	// Mark extract snapshots with a label for TOCTOU-safe detection.
 	if isExtractKey(key) {
@@ -89,6 +85,14 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}
 
 	if err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) (err error) {
+		// The temp dir must be created inside the write transaction so that
+		// Cleanup/Remove (which scan the snapshots directory under a write
+		// transaction) cannot observe and delete it before the rename below.
+		td, err = s.prepareDirectory(snapshotDir, kind)
+		if err != nil {
+			return fmt.Errorf("create prepare snapshot dir: %w", err)
+		}
+
 		snap, err = storage.CreateSnapshot(ctx, kind, key, parent, opts...)
 		if err != nil {
 			return fmt.Errorf("create snapshot: %w", err)
@@ -124,17 +128,8 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	// Run async to avoid blocking Prepare/View - fsmeta generation is expensive
 	// but not required for basic snapshot operations.
 	if !isExtractKey(key) && len(snap.ParentIDs) > 0 {
-		parentIDs := snap.ParentIDs // capture for goroutine
-		s.bgWg.Add(1)
-		//nolint:contextcheck,gosec // intentionally using fresh context with timeout for background work
-		go func(ids []string) {
-			defer s.bgWg.Done()
-			// Use a fresh context with timeout - intentionally independent of parent
-			// context to allow completion even if the original request is cancelled.
-			bgCtx, cancel := context.WithTimeout(context.Background(), fsmetaTimeout)
-			defer cancel()
-			s.generateFsMeta(bgCtx, ids)
-		}(parentIDs)
+		//nolint:contextcheck // background generation derives from the service-lifetime context, not the request context
+		s.spawnFsmetaGeneration(snap.ParentIDs)
 	}
 
 	// For active snapshots, create the writable ext4 layer file.
@@ -155,6 +150,33 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}
 
 	return s.mounts(snap, info)
+}
+
+// spawnFsmetaGeneration starts background fsmeta/VMDK generation for the
+// given parent chain (newest-first). Concurrency is bounded by bgSem and the
+// goroutine derives from the service-lifetime context (not the request
+// context) so generation survives request cancellation but is aborted on
+// Close.
+func (s *snapshotter) spawnFsmetaGeneration(parentIDs []string) {
+	s.bgWg.Add(1)
+	go func(ids []string) {
+		defer s.bgWg.Done()
+		// Skip cheaply if another generation already produced the fsmeta.
+		if _, err := os.Stat(s.fsMetaPath(ids[0])); err == nil {
+			return
+		}
+		// Bound concurrent mkfs.erofs runs; bail out if the snapshotter is
+		// shutting down while we wait for a slot.
+		select {
+		case s.bgSem <- struct{}{}:
+		case <-s.bgCtx.Done():
+			return
+		}
+		defer func() { <-s.bgSem }()
+		bgCtx, cancel := context.WithTimeout(s.bgCtx, fsmetaTimeout)
+		defer cancel()
+		s.generateFsMeta(bgCtx, ids)
+	}(parentIDs)
 }
 
 // cleanupFailedSnapshot removes temporary and final directories on failure.
@@ -288,7 +310,10 @@ func (s *snapshotter) cleanupAfterRemove(ctx context.Context, id string, removal
 // Errors are logged but don't stop cleanup (best-effort).
 func (s *snapshotter) Cleanup(ctx context.Context) error {
 	var removals []string
-	if err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+	// Use a write transaction so no snapshot can be created or removed while
+	// the scan runs: a read transaction would race with an in-flight Prepare
+	// whose directory has not been renamed into place yet, deleting it.
+	if err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		var err error
 		removals, err = s.getCleanupDirectories(ctx)
 		return err

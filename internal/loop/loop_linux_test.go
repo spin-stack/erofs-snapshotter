@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/containerd/containerd/v2/pkg/testutil"
 )
@@ -15,6 +16,38 @@ import (
 // testSerialPrefix is the prefix used for all test loop device serials.
 // This allows cleanup of orphaned devices from interrupted tests.
 const testSerialPrefix = "erofs-test-"
+
+// readSysfsBackingFile returns the full (untruncated) backing file path of a
+// loop device from /sys/block/loopN/loop/backing_file.
+func readSysfsBackingFile(t *testing.T, devNumber int) string {
+	t.Helper()
+	data, err := os.ReadFile(fmt.Sprintf("/sys/block/loop%d/loop/backing_file", devNumber))
+	if err != nil {
+		t.Fatalf("failed to read sysfs backing_file for loop%d: %v", devNumber, err)
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// verifyDetached asserts that the loop device released its backing file.
+// After LOOP_CLR_FD the kernel removes /sys/block/loopN/loop/backing_file
+// (the whole loop attribute group disappears for unconfigured devices), but
+// it may do so asynchronously, so poll with a short deadline.
+func verifyDetached(t *testing.T, dev *Device) {
+	t.Helper()
+	sysfsPath := fmt.Sprintf("/sys/block/loop%d/loop/backing_file", dev.Number)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(sysfsPath); os.IsNotExist(err) {
+			return
+		}
+		if time.Now().After(deadline) {
+			data, _ := os.ReadFile(sysfsPath)
+			t.Fatalf("loop device %s still attached after detach: backing_file=%q",
+				dev.Path, strings.TrimSpace(string(data)))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 // TestMain handles test setup and cleanup, including signal handling
 // to clean up loop devices if tests are interrupted.
@@ -114,10 +147,17 @@ func TestSetupAndDetach(t *testing.T) {
 		t.Error("expected read-only flag to be set")
 	}
 
-	// Verify backing file
+	// Verify backing file.
+	// LoopInfo64.FileName is truncated to LO_NAME_SIZE (64 bytes including
+	// the NUL terminator), so a strict equality check would fail with long
+	// TMPDIR paths. The ioctl value must be a prefix of the real path; the
+	// full path is verified via sysfs, which is not truncated.
 	gotBackingFile := info.BackingFile()
-	if gotBackingFile != backingFile {
-		t.Errorf("backing file mismatch: got %s, want %s", gotBackingFile, backingFile)
+	if !strings.HasPrefix(backingFile, gotBackingFile) {
+		t.Errorf("backing file mismatch: got %s, want prefix of %s", gotBackingFile, backingFile)
+	}
+	if sysfsBacking := readSysfsBackingFile(t, dev.Number); sysfsBacking != backingFile {
+		t.Errorf("sysfs backing file mismatch: got %s, want %s", sysfsBacking, backingFile)
 	}
 
 	// Detach
@@ -125,18 +165,9 @@ func TestSetupAndDetach(t *testing.T) {
 		t.Fatalf("Detach failed: %v", err)
 	}
 
-	// Verify device is detached
-	// Note: The kernel may not immediately clear the backing file info.
-	// We verify detach worked by checking that either:
-	// 1. GetInfo fails (device no longer configured)
-	// 2. GetInfo succeeds with empty backing file
-	// 3. GetInfo succeeds but backing file will be cleared shortly (kernel timing)
-	// All behaviors are acceptable - the LOOP_CLR_FD ioctl succeeded.
-	info, err = dev.GetInfo()
-	if err == nil && info.BackingFile() != "" {
-		// This can happen due to kernel timing - log but don't fail
-		t.Logf("note: backing file still visible after detach (kernel timing): %s", info.BackingFile())
-	}
+	// Verify the device actually released its backing file (the kernel may
+	// clear the association asynchronously, so this retries briefly).
+	verifyDetached(t, dev)
 }
 
 func TestSetupWithOffset(t *testing.T) {
@@ -376,11 +407,9 @@ func TestDetachPath(t *testing.T) {
 		t.Fatalf("DetachPath failed: %v", err)
 	}
 
-	// Verify detached - see TestSetupAndDetach for explanation of timing behavior
-	info, err := dev.GetInfo()
-	if err == nil && info.BackingFile() != "" {
-		t.Logf("note: backing file still visible after DetachPath (kernel timing): %s", info.BackingFile())
-	}
+	// Verify the device actually released its backing file (the kernel may
+	// clear the association asynchronously, so this retries briefly).
+	verifyDetached(t, dev)
 }
 
 func TestDetachNonexistent(t *testing.T) {

@@ -34,10 +34,10 @@ package snapshotter
 // - TestErofsDifferCompareContextCancellation
 // - TestErofsDifferCompareSingleLayerView
 // - TestErofsDifferCompareViewWithMultipleLayers
-// - TestErofsDifferCompareDoesNotRequireMountManager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -58,6 +58,7 @@ import (
 
 	"github.com/spin-stack/erofs-snapshotter/internal/differ"
 	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
+	"github.com/spin-stack/erofs-snapshotter/internal/loop"
 	"github.com/spin-stack/erofs-snapshotter/internal/mountutils"
 	"github.com/spin-stack/erofs-snapshotter/internal/preflight"
 )
@@ -106,50 +107,6 @@ func newDifferTestEnv(t *testing.T) *differTestEnv {
 	snapshotRoot := filepath.Join(tempDir, "snapshots")
 
 	s, err := NewSnapshotter(snapshotRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	snap, ok := s.(*snapshotter)
-	if !ok {
-		t.Fatal("failed to cast snapshotter to *snapshotter")
-	}
-
-	env := &differTestEnv{
-		t:            t,
-		tempDir:      tempDir,
-		snapshotRoot: snapshotRoot,
-		snapshotter:  snap,
-		contentStore: contentStore,
-	}
-
-	t.Cleanup(func() {
-		cleanupAllSnapshots(ctx, s)
-		s.Close()
-		mount.UnmountRecursive(snapshotRoot, 0)
-	})
-
-	return env
-}
-
-// newDifferTestEnvWithBlockMode creates a test environment with block mode enabled.
-//
-// NOTE: Tests using this helper require the mount manager to set up loop devices
-// for EROFS and ext4 mounts. The containerd mount manager handles this automatically.
-func newDifferTestEnvWithBlockMode(t *testing.T) *differTestEnv {
-	t.Helper()
-	testutil.RequiresRoot(t)
-	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
-
-	if err := preflight.CheckErofsSupport(); err != nil {
-		t.Skipf("EROFS support check failed: %v", err)
-	}
-
-	tempDir := t.TempDir()
-	contentStore := imagetest.NewContentStore(ctx, t).Store
-	snapshotRoot := filepath.Join(tempDir, "snapshots")
-
-	s, err := NewSnapshotter(snapshotRoot, WithDefaultSize(16*1024*1024))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,32 +183,6 @@ func (e *differTestEnv) createLayer(key, parentKey, filename, content string) st
 	return commitKey
 }
 
-// createBlockLayer creates and commits a layer using block mode (ext4 upper).
-// Note: This is now the same as createLayer since block mode is always used.
-// Uses extract-style key to ensure ext4 is mounted on host for writing.
-func (e *differTestEnv) createBlockLayer(key, parentKey, filename, content string) string {
-	e.t.Helper()
-
-	// Use extract-style key so the snapshotter mounts the ext4 on host
-	extractKey := "extract-" + key
-	if _, err := e.snapshotter.Prepare(e.ctx(), extractKey, parentKey); err != nil {
-		e.t.Fatalf("failed to prepare %s: %v", extractKey, err)
-	}
-
-	id := snapshotID(e.ctx(), e.t, e.snapshotter, extractKey)
-	filePath := filepath.Join(e.snapshotter.blockUpperPath(id), filename)
-	if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
-		e.t.Fatalf("failed to write %s: %v", filename, err)
-	}
-
-	commitKey := key + "-commit"
-	if err := e.snapshotter.Commit(e.ctx(), commitKey, extractKey); err != nil {
-		e.t.Fatalf("failed to commit %s: %v", extractKey, err)
-	}
-
-	return commitKey
-}
-
 // prepareActiveLayer prepares an active (uncommitted) layer and writes a file to it.
 // Returns the mounts for use in Compare.
 // Uses extract-style key to ensure ext4 is mounted on host for writing.
@@ -274,26 +205,73 @@ func (e *differTestEnv) prepareActiveLayer(key, parentKey, filename, content str
 	return mounts
 }
 
-// prepareActiveBlockLayer prepares an active layer in block mode.
-// Note: This is now the same as prepareActiveLayer since block mode is always used.
-// Uses extract-style key to ensure ext4 is mounted on host for writing.
-func (e *differTestEnv) prepareActiveBlockLayer(key, parentKey, filename, content string) []mount.Mount {
+// populateGuestUpper mounts the ext4 writable layer from an active snapshot's
+// mounts on the host and runs populate with the guest-style upper directory,
+// mirroring what the guest VM does when it builds its overlay upper layer.
+// The ext4 is unmounted and the loop device detached before returning so the
+// differ can lock the image afterwards (mountutils.MountExt4 takes flock/OFD
+// locks on the image file).
+func (e *differTestEnv) populateGuestUpper(mounts []mount.Mount, populate func(upperDir string) error) {
 	e.t.Helper()
 
-	// Use extract-style key so the snapshotter mounts the ext4 on host
-	extractKey := "extract-" + key
-	mounts, err := e.snapshotter.Prepare(e.ctx(), extractKey, parentKey)
+	var ext4Source string
+	for _, m := range mounts {
+		if mountutils.TypeSuffix(m.Type) == testTypeExt4 {
+			ext4Source = m.Source
+			break
+		}
+	}
+	if ext4Source == "" {
+		e.t.Fatalf("expected ext4 mount in active snapshot mounts, got: %#v", mounts)
+	}
+
+	target, err := os.MkdirTemp(e.tempDir, "ext4-upper-")
 	if err != nil {
-		e.t.Fatalf("failed to prepare %s: %v", extractKey, err)
+		e.t.Fatal(err)
 	}
 
-	id := snapshotID(e.ctx(), e.t, e.snapshotter, extractKey)
-	filePath := filepath.Join(e.snapshotter.blockUpperPath(id), filename)
-	if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
-		e.t.Fatalf("failed to write %s: %v", filename, err)
+	loopDev, err := loop.Setup(ext4Source, loop.Config{})
+	if err != nil {
+		e.t.Fatalf("failed to set up loop device for %s: %v", ext4Source, err)
 	}
+	mounted := false
+	released := false
+	defer func() {
+		// Best-effort teardown on failure paths; the success path below
+		// unmounts and detaches explicitly with error reporting.
+		if !released {
+			if mounted {
+				_ = unix.Unmount(target, 0)
+			}
+			_ = loopDev.Detach()
+		}
+	}()
 
-	return mounts
+	if err := unix.Mount(loopDev.Path, target, testTypeExt4, 0, ""); err != nil {
+		e.t.Fatalf("failed to mount ext4 %s: %v", ext4Source, err)
+	}
+	mounted = true
+
+	// The guest creates /upper at the ext4 root (the layout
+	// withActiveSnapshotMount in the differ expects).
+	upperDir := filepath.Join(target, "upper")
+	if err := os.MkdirAll(upperDir, 0o755); err != nil {
+		e.t.Fatalf("failed to create guest upper directory: %v", err)
+	}
+	populateErr := populate(upperDir)
+
+	if err := unix.Unmount(target, 0); err != nil {
+		e.t.Fatalf("failed to unmount ext4: %v", err)
+	}
+	mounted = false
+	if err := loopDev.Detach(); err != nil {
+		e.t.Fatalf("failed to detach loop device: %v", err)
+	}
+	released = true
+
+	if populateErr != nil {
+		e.t.Fatalf("failed to populate guest upper: %v", populateErr)
+	}
 }
 
 // createView creates a read-only view of a committed snapshot.
@@ -353,22 +331,27 @@ func TestErofsDifferApply(t *testing.T) {
 	// Create content store for the differ
 	contentStore := imagetest.NewContentStore(ctx, t).Store
 
-	// Create EROFS snapshotter first (creates the snapshot root directory)
+	// Create EROFS snapshotter first (creates the snapshot root directory).
+	// All teardown is registered with t.Cleanup (not defer) so it runs in
+	// reverse registration order AFTER the view unmount registered below:
+	// unmount view -> mount manager -> db -> snapshots -> snapshotter.
 	snapshotRoot := filepath.Join(tempDir, "snapshots")
 	s, err := NewSnapshotter(snapshotRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
-	defer cleanupAllSnapshots(ctx, s)
-	t.Cleanup(func() { mount.UnmountRecursive(snapshotRoot, 0) })
+	t.Cleanup(func() {
+		cleanupAllSnapshots(ctx, s)
+		s.Close()
+		mount.UnmountRecursive(snapshotRoot, 0)
+	})
 
 	// Create mount manager for EROFS mounts (after snapshotter creates root)
 	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0o600, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	t.Cleanup(func() { db.Close() })
 
 	mountRoot := filepath.Join(tempDir, "mounts")
 	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
@@ -376,7 +359,7 @@ func TestErofsDifferApply(t *testing.T) {
 		t.Fatal(err)
 	}
 	if closer, ok := mm.(interface{ Close() error }); ok {
-		defer closer.Close()
+		t.Cleanup(func() { closer.Close() })
 	}
 	t.Cleanup(func() { mount.UnmountRecursive(mountRoot, 0) })
 
@@ -540,11 +523,14 @@ func TestErofsDifferCompareWithMountManager(t *testing.T) {
 
 	mm := env.createMountManager()
 	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
-	env.compareAndVerify(differ, lowerMounts, upperMounts)
+	env.compareAndVerify(differ, lowerMounts, upperMounts, "upper.txt")
 }
 
+// TestErofsDifferCompareBlockUpperFallback tests Compare with an extract
+// snapshot upper: the snapshotter mounts the ext4 writable layer on the host
+// (block commit mode) and returns a bind mount to its upper directory.
 func TestErofsDifferCompareBlockUpperFallback(t *testing.T) {
-	env := newDifferTestEnvWithBlockMode(t)
+	env := newDifferTestEnv(t)
 
 	// Create empty base layer using extract-style key so ext4 is mounted
 	if _, err := env.snapshotter.Prepare(env.ctx(), "extract-"+testKeyBase, ""); err != nil {
@@ -554,8 +540,8 @@ func TestErofsDifferCompareBlockUpperFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create active upper layer in block mode
-	upperMounts := env.prepareActiveBlockLayer(testKeyUpper, "base-commit", "marker.txt", "marker")
+	// Active upper layer written through the host-mounted ext4 (block mode)
+	upperMounts := env.prepareActiveLayer(testKeyUpper, "base-commit", "marker.txt", "marker")
 	lowerMounts := env.createView(testKeyLower, "base-commit")
 
 	mm := env.createMountManager()
@@ -563,96 +549,101 @@ func TestErofsDifferCompareBlockUpperFallback(t *testing.T) {
 	env.compareAndVerify(differ, lowerMounts, upperMounts, "marker.txt")
 }
 
+// TestErofsDifferComparePreservesWhiteouts verifies that deletions recorded in
+// the guest's overlay upper layer survive Compare. The guest represents a
+// deleted file as an overlayfs whiteout (character device 0:0) inside the ext4
+// writable layer. The differ mounts active snapshot uppers (EROFS + ext4) with
+// the guest upper stacked as the top overlay lowerdir, so the whiteout hides
+// the file in the merged view and Compare must emit a .wh. entry in the diff.
 func TestErofsDifferComparePreservesWhiteouts(t *testing.T) {
-	// Skip: The differ's writeDiff function handles whiteouts from overlayfs (char device 0:0)
-	// but the test creates whiteouts in a non-overlay context. Overlayfs whiteout detection
-	// requires the file system's opaque markers which aren't present in ext4 upper directories.
-	// TODO: Investigate proper whiteout handling for the EROFS differ in non-overlay contexts.
-	t.Skip("whiteout detection requires overlayfs context")
-	env := newDifferTestEnvWithBlockMode(t)
+	env := newDifferTestEnv(t)
 
-	// Create base layer with a file that will be deleted
-	env.createBlockLayer(testKeyBase, "", "gone.txt", "gone")
+	// Base layer with a file that the "guest" deletes
+	baseCommit := env.createLayer(testKeyBase, "", "gone.txt", "gone")
 
-	// Create upper layer with a whiteout using extract-style key
-	extractKey := "extract-" + testKeyUpper
-	upperMounts, err := env.snapshotter.Prepare(env.ctx(), extractKey, "base-commit")
+	// Non-extract active snapshot: EROFS layer(s) + ext4 writable layer
+	upperMounts, err := env.snapshotter.Prepare(env.ctx(), testKeyUpper, baseCommit)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// For extract snapshots, the bind mount source is the rw/upper directory.
-	// Create whiteout (character device 0:0) in the blockUpperPath directory.
-	// In overlayfs, whiteouts are char devices 0:0 with the original filename.
-	// The .wh. prefix is only added when converting to tar format.
-	if len(upperMounts) == 0 {
-		t.Fatal("expected at least one mount")
-	}
-	// Use blockUpperPath to get the correct directory inside the mounted ext4
-	id := snapshotID(env.ctx(), t, env.snapshotter, extractKey)
-	whiteoutPath := filepath.Join(env.snapshotter.blockUpperPath(id), "gone.txt")
-	if err := unix.Mknod(whiteoutPath, unix.S_IFCHR|0o644, 0); err != nil {
-		t.Fatalf("failed to create whiteout at %s: %v", whiteoutPath, err)
+	if !mountutils.HasActiveSnapshotMounts(upperMounts) {
+		t.Fatalf("expected EROFS + ext4 active snapshot mounts, got: %#v", upperMounts)
 	}
 
-	lowerMounts := env.createView(testKeyLower, "base-commit")
+	// Simulate the guest deleting gone.txt and adding added.txt: overlayfs
+	// represents the deletion as a 0:0 character device in the upper layer.
+	env.populateGuestUpper(upperMounts, func(upperDir string) error {
+		if err := os.WriteFile(filepath.Join(upperDir, "added.txt"), []byte("added"), 0o644); err != nil {
+			return err
+		}
+		return unix.Mknod(filepath.Join(upperDir, "gone.txt"), unix.S_IFCHR|0o644, 0)
+	})
+
+	lowerMounts := env.createView(testKeyLower, baseCommit)
 
 	mm := env.createMountManager()
 	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
-	env.compareAndVerify(differ, lowerMounts, upperMounts, ".wh.gone.txt")
+	env.compareAndVerify(differ, lowerMounts, upperMounts, ".wh.gone.txt", "added.txt")
 }
 
+// TestErofsDifferCompareWithFormattedUpperMounts tests Compare with the active
+// snapshot mount shape consumed by VM runtimes (EROFS layers + ext4 writable
+// layer). The differ must merge the guest upper inside the ext4 with the EROFS
+// layers on the host to compute the diff.
 func TestErofsDifferCompareWithFormattedUpperMounts(t *testing.T) {
-	env := newDifferTestEnvWithBlockMode(t)
+	env := newDifferTestEnv(t)
 
-	// Create empty base layer using extract-style key
-	if _, err := env.snapshotter.Prepare(env.ctx(), "extract-"+testKeyBase, ""); err != nil {
+	baseCommit := env.createLayer(testKeyBase, "", "base.txt", "base")
+
+	// Non-extract active snapshot: EROFS layer(s) + ext4 writable layer
+	upperMounts, err := env.snapshotter.Prepare(env.ctx(), testKeyUpper, baseCommit)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := env.snapshotter.Commit(env.ctx(), "base-commit", "extract-"+testKeyBase); err != nil {
-		t.Fatal(err)
+	if !mountutils.HasActiveSnapshotMounts(upperMounts) {
+		t.Fatalf("expected EROFS + ext4 active snapshot mounts, got: %#v", upperMounts)
 	}
 
-	// Create active upper layer in block mode
-	upperMounts := env.prepareActiveBlockLayer(testKeyUpper, "base-commit", "upper.txt", "upper")
+	// Write a file into the guest-style upper directory inside the ext4
+	env.populateGuestUpper(upperMounts, func(upperDir string) error {
+		return os.WriteFile(filepath.Join(upperDir, "upper.txt"), []byte("upper"), 0o644)
+	})
 
-	// Active layer returns mounts (combination of EROFS + ext4 or bind)
-	if len(upperMounts) == 0 {
-		t.Fatalf("expected mounts, got empty slice")
-	}
-
-	lowerMounts := env.createView(testKeyLower, "base-commit")
+	lowerMounts := env.createView(testKeyLower, baseCommit)
 
 	mm := env.createMountManager()
 	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
 	env.compareAndVerify(differ, lowerMounts, upperMounts, "upper.txt")
 }
 
-// TestErofsDifferCompareWithoutMountManager verifies that Compare works
-// without a mount manager. EROFS snapshotter now returns direct mounts that
-// don't require mount manager resolution.
+// TestErofsDifferCompareWithoutMountManager verifies that Compare resolves
+// snapshotter mounts without a mount manager. Multi-layer views (merged fsmeta
+// multi-device or stacked individual EROFS layer mounts) and extract bind
+// uppers are mounted directly by the differ, with no manager activation.
 func TestErofsDifferCompareWithoutMountManager(t *testing.T) {
 	env := newDifferTestEnv(t)
 
-	// Create layers
+	// Two layers so the lower view is either a merged fsmeta multi-device
+	// mount or stacked individual EROFS layer mounts - both shapes the
+	// differ handles directly without mount manager activation.
 	baseCommit := env.createLayer(testKeyBase, "", "base.txt", "base")
-	upperMounts := env.prepareActiveLayer(testKeyUpper, baseCommit, "upper.txt", "upper")
-	lowerMounts := env.createView(testKeyLower, baseCommit)
+	childCommit := env.createLayer("child", baseCommit, "child.txt", "child")
 
-	// Single-layer view should NOT have templates
+	upperMounts := env.prepareActiveLayer(testKeyUpper, childCommit, "upper.txt", "upper")
+	lowerMounts := env.createView(testKeyLower, childCommit)
+
+	// Direct mounts must not contain template syntax, which would require
+	// mount manager resolution.
 	if mountsHaveTemplate(lowerMounts) {
-		t.Fatalf("single-layer view should not have templates, got: %#v", lowerMounts)
+		t.Fatalf("view mounts should not have templates, got: %#v", lowerMounts)
+	}
+	if mountsHaveTemplate(upperMounts) {
+		t.Fatalf("extract mounts should not have templates, got: %#v", upperMounts)
 	}
 
-	// Active snapshot with parent now uses templates for overlay (new architecture)
-	if !mountsHaveTemplate(upperMounts) {
-		t.Logf("active mounts (may have templates): %#v", upperMounts)
-	}
-
-	// Compare with mount manager since active mounts may have templates
-	mm := env.createMountManager()
-	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
-	env.compareAndVerify(differ, lowerMounts, upperMounts)
+	// No mount manager: Compare must still produce the diff.
+	differ := differ.NewErofsDiffer(env.contentStore)
+	env.compareAndVerify(differ, lowerMounts, upperMounts, "upper.txt")
 }
 
 // TestErofsDifferCompareMultipleStackedLayers tests Compare with 5+ stacked
@@ -705,33 +696,33 @@ func TestErofsDifferCompareEmptyLowerMounts(t *testing.T) {
 
 	// Compare with empty lower mounts - tests the base case
 	emptyLower := []mount.Mount{}
-	env.compareAndVerify(differ, emptyLower, upperMounts)
+	env.compareAndVerify(differ, emptyLower, upperMounts, "upper.txt")
 }
 
-// TestErofsDifferCompareContextCancellation tests that Compare properly handles
-// context cancellation. With direct mounts (no mount manager activation needed),
-// fast operations may complete before cancellation takes effect.
+// TestErofsDifferCompareContextCancellation verifies that Compare fails with
+// context.Canceled when the context is already cancelled. Empty lower mounts
+// and a bind upper are used so neither side needs the mount manager: the
+// failure must come from the cancelled context, not from mount resolution.
 func TestErofsDifferCompareContextCancellation(t *testing.T) {
 	env := newDifferTestEnv(t)
 
-	// Create layers
+	// Create an upper layer (extract-style bind mount)
 	baseCommit := env.createLayer(testKeyBase, "", "base.txt", "base")
 	upperMounts := env.prepareActiveLayer(testKeyUpper, baseCommit, "upper.txt", "upper")
-	lowerMounts := env.createView(testKeyLower, baseCommit)
+	lowerMounts := []mount.Mount{}
 
-	// Create differ without mount manager (direct mounts)
 	differ := differ.NewErofsDiffer(env.contentStore)
 
 	// Create a cancelled context
 	ctx, cancel := context.WithCancel(env.ctx())
 	cancel() // Cancel immediately
 
-	// Compare with cancelled context - may fail or complete quickly
 	_, err := differ.Compare(ctx, lowerMounts, upperMounts)
-	if err != nil {
-		t.Logf("Compare with cancelled context returned: %v", err)
-	} else {
-		t.Log("Compare completed before context cancellation took effect")
+	if err == nil {
+		t.Fatal("expected Compare with cancelled context to fail")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected error to wrap context.Canceled, got: %v", err)
 	}
 }
 
@@ -778,36 +769,4 @@ func TestErofsDifferCompareViewWithMultipleLayers(t *testing.T) {
 	mm := env.createMountManager()
 	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
 	env.compareAndVerify(differ, viewMounts, upperMounts, "upper.txt")
-}
-
-// TestErofsDifferCompareDoesNotRequireMountManager verifies that Compare
-// works with mount manager for fsmeta consolidated mounts.
-func TestErofsDifferCompareDoesNotRequireMountManager(t *testing.T) {
-	env := newDifferTestEnv(t)
-
-	// Create two layers to test multi-layer behavior
-	baseCommit := env.createLayer(testKeyBase, "", "base.txt", "base")
-	childCommit := env.createLayer("child", baseCommit, "child.txt", "child")
-
-	// Get mounts
-	upperMounts := env.prepareActiveLayer(testKeyUpper, childCommit, "upper.txt", "upper")
-	lowerMounts := env.createView(testKeyLower, childCommit)
-
-	// Should have at least one EROFS mount
-	hasErofs := false
-	for _, m := range lowerMounts {
-		if mountutils.TypeSuffix(m.Type) == testTypeErofs {
-			hasErofs = true
-			break
-		}
-	}
-	if !hasErofs {
-		t.Fatalf("expected EROFS mount(s), got: %#v", lowerMounts)
-	}
-
-	mm := env.createMountManager()
-	differ := differ.NewErofsDiffer(env.contentStore, differ.WithMountManager(mm))
-
-	desc := env.compareAndVerify(differ, lowerMounts, upperMounts)
-	t.Logf("Compare succeeded: %s", desc.Digest)
 }

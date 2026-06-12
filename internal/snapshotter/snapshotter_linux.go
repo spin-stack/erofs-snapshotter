@@ -208,16 +208,34 @@ func unmountAll(target string) error {
 	return nil
 }
 
-func convertDirToErofs(ctx context.Context, layerBlob, upperDir string) error {
-	err := erofs.ConvertErofs(ctx, layerBlob, upperDir, nil)
-	if err != nil {
+// convertDirToErofs converts upperDir into an EROFS blob at layerBlob.
+// When prune is true the contents of upperDir are removed after a successful
+// conversion to reclaim space; pass false when upperDir lives on a read-only
+// mount.
+func convertDirToErofs(ctx context.Context, layerBlob, upperDir string, prune bool) error {
+	// Convert into a temporary file and rename only on success: Commit trusts
+	// any existing blob, so a partial file must never appear under the final
+	// name (e.g. if mkfs.erofs fails or the process crashes mid-conversion).
+	tmpBlob := layerBlob + ".tmp"
+	if err := erofs.ConvertErofs(ctx, tmpBlob, upperDir, nil); err != nil {
+		_ = os.Remove(tmpBlob)
 		return err
 	}
 
 	// Sync the layer blob to disk to ensure durability.
 	// This prevents data loss if the system crashes before the OS flushes the buffer cache.
-	if err := syncFile(layerBlob); err != nil {
+	if err := syncFile(tmpBlob); err != nil {
+		_ = os.Remove(tmpBlob)
 		return fmt.Errorf("failed to sync layer blob: %w", err)
+	}
+
+	if err := os.Rename(tmpBlob, layerBlob); err != nil {
+		_ = os.Remove(tmpBlob)
+		return fmt.Errorf("failed to finalize layer blob: %w", err)
+	}
+
+	if !prune {
+		return nil
 	}
 
 	// Remove all sub-directories in the overlayfs upperdir.  Leave the

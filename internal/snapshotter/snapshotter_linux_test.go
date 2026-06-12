@@ -355,18 +355,37 @@ func snapshotID(ctx context.Context, t *testing.T, s *snapshotter, key string) s
 }
 
 // cleanupAllSnapshots removes all snapshots using only the public Snapshotter interface.
-// Snapshots are removed in reverse order (children first, then parents) to respect
-// the snapshot dependency chain. After removing all snapshots, Cleanup() is called
-// to unmount any remaining EROFS layers and release resources.
+// Walk returns snapshots in metadata key order, not dependency order, so snapshots
+// are removed leaves-first: on each pass only snapshots that are not a parent of
+// any remaining snapshot are removed, repeating until nothing is left (or no
+// progress can be made). After removing all snapshots, Cleanup() is called to
+// unmount any remaining EROFS layers and release resources.
 func cleanupAllSnapshots(ctx context.Context, s snapshots.Snapshotter) {
-	var keys []string
-	_ = s.Walk(ctx, func(ctx context.Context, info snapshots.Info) error {
-		keys = append(keys, info.Name)
-		return nil
-	})
-	// Remove in reverse order (children first, then parents)
-	for i := len(keys) - 1; i >= 0; i-- {
-		_ = s.Remove(ctx, keys[i])
+	for {
+		var keys []string
+		parents := make(map[string]bool)
+		_ = s.Walk(ctx, func(ctx context.Context, info snapshots.Info) error {
+			keys = append(keys, info.Name)
+			if info.Parent != "" {
+				parents[info.Parent] = true
+			}
+			return nil
+		})
+		if len(keys) == 0 {
+			break
+		}
+		removed := 0
+		for _, key := range keys {
+			if parents[key] {
+				continue // still has children; remove on a later pass
+			}
+			if err := s.Remove(ctx, key); err == nil {
+				removed++
+			}
+		}
+		if removed == 0 {
+			break // no progress; avoid looping forever on undeletable snapshots
+		}
 	}
 	// Call Cleanup to unmount EROFS layers and release resources
 	if cleaner, ok := s.(interface{ Cleanup(context.Context) error }); ok {
@@ -451,19 +470,29 @@ func mountErofsLayersWithOverlay(t *testing.T, layers []mount.Mount, target stri
 	var layerDirs []string
 	var loopDevices []*loop.Device
 
+	// failCleanup releases everything set up so far: already-mounted layers
+	// must be unmounted before detaching their loop devices (LOOP_CLR_FD on a
+	// still-mounted device fails with EBUSY, leaking both mount and device).
+	failCleanup := func() {
+		for _, dir := range layerDirs {
+			exec.Command("umount", dir).Run()
+		}
+		for _, l := range loopDevices {
+			l.Detach()
+		}
+	}
+
 	for i, m := range layers {
 		layerDir := filepath.Join(baseDir, fmt.Sprintf("layer%d", i))
 		if err := os.MkdirAll(layerDir, 0o755); err != nil {
+			failCleanup()
 			t.Fatalf("failed to create layer dir: %v", err)
 		}
 
 		// Set up loop device for this layer
 		loopDev, err := loop.Setup(m.Source, loop.Config{ReadOnly: true})
 		if err != nil {
-			// Cleanup on failure
-			for _, l := range loopDevices {
-				l.Detach()
-			}
+			failCleanup()
 			t.Fatalf("failed to setup loop device for %s: %v", m.Source, err)
 		}
 		loopDevices = append(loopDevices, loopDev)
@@ -472,10 +501,7 @@ func mountErofsLayersWithOverlay(t *testing.T, layers []mount.Mount, target stri
 		args := []string{"-t", "erofs", "-o", "ro", loopDev.Path, layerDir}
 		cmd := exec.Command("mount", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			// Cleanup on failure
-			for _, l := range loopDevices {
-				l.Detach()
-			}
+			failCleanup()
 			t.Fatalf("failed to mount EROFS layer %s: %v: %s", m.Source, err, out)
 		}
 		layerDirs = append(layerDirs, layerDir)
@@ -501,12 +527,7 @@ func mountErofsLayersWithOverlay(t *testing.T, layers []mount.Mount, target stri
 
 	// Ensure target directory exists
 	if err := os.MkdirAll(target, 0o755); err != nil {
-		for _, dir := range layerDirs {
-			exec.Command("umount", dir).Run()
-		}
-		for _, l := range loopDevices {
-			l.Detach()
-		}
+		failCleanup()
 		t.Fatalf("failed to create target dir: %v", err)
 	}
 
