@@ -19,12 +19,14 @@ package erofs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/errdefs"
@@ -110,7 +112,13 @@ func runMkfsWithStdin(ctx context.Context, r io.Reader, args []string) (int64, e
 	}
 
 	if result.err != nil {
-		return result.n, fmt.Errorf("mkfs.erofs succeeded but pipe failed (wrote %d bytes): %w", result.n, result.err)
+		// mkfs.erofs in tar mode may stop reading at the tar end-of-archive
+		// marker before stream EOF; if the unread remainder exceeds the pipe
+		// buffer, the copy fails with EPIPE even though the conversion
+		// succeeded (os/exec ignores EPIPE on stdin copies for this reason).
+		if !errors.Is(result.err, syscall.EPIPE) && !errors.Is(result.err, os.ErrClosed) {
+			return result.n, fmt.Errorf("mkfs.erofs succeeded but pipe failed (wrote %d bytes): %w", result.n, result.err)
+		}
 	}
 
 	log.G(ctx).Debugf("mkfs.erofs %v: piped %d bytes", args, result.n)
