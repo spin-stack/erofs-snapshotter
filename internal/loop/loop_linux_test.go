@@ -470,10 +470,311 @@ func TestMultipleDevices(t *testing.T) {
 }
 
 func TestBackingFileNotFound(t *testing.T) {
+	// No root required: Setup fails opening the backing file before it
+	// touches /dev/loop-control.
+	const missing = "/nonexistent/backing.img"
+	_, err := Setup(missing, Config{ReadOnly: true})
+	if err == nil {
+		t.Fatal("expected error for non-existent backing file")
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("error should mention backing file path %q, got: %v", missing, err)
+	}
+}
+
+// createBackingFile creates a sparse backing file of the given size in a
+// per-test temporary directory and returns its path.
+func createBackingFile(t *testing.T, size int64) string {
+	t.Helper()
+	backingFile := filepath.Join(t.TempDir(), "backing.img")
+	f, err := os.Create(backingFile)
+	if err != nil {
+		t.Fatalf("failed to create backing file: %v", err)
+	}
+	if err := f.Truncate(size); err != nil {
+		f.Close()
+		t.Fatalf("failed to truncate backing file: %v", err)
+	}
+	f.Close()
+	return backingFile
+}
+
+func TestFindBySerialNotFound(t *testing.T) {
+	// Reading /sys/block does not require root.
+	serial := fmt.Sprintf("erofs-test-no-such-serial-%d", os.Getpid())
+	found, err := FindBySerial(serial)
+	if err != nil {
+		t.Fatalf("FindBySerial failed: %v", err)
+	}
+	if found != nil {
+		t.Errorf("expected nil for unknown serial, got %s", found.Path)
+	}
+}
+
+func TestFindByBackingFileNotFound(t *testing.T) {
+	// File exists but has no loop device attached.
+	backingFile := createBackingFile(t, 1024)
+	found, err := FindByBackingFile(backingFile)
+	if err != nil {
+		t.Fatalf("FindByBackingFile failed: %v", err)
+	}
+	if found != nil {
+		t.Errorf("expected nil for file without loop device, got %s", found.Path)
+	}
+}
+
+func TestCleanupBySerialPrefix(t *testing.T) {
 	testutil.RequiresRoot(t)
 
-	_, err := Setup("/nonexistent/backing.img", Config{ReadOnly: true})
-	if err == nil {
-		t.Error("expected error for non-existent backing file")
+	// Unique prefix per run; still under testSerialPrefix so TestMain
+	// cleanup catches orphans from interrupted runs.
+	prefix := fmt.Sprintf("%scleanup-%d-", testSerialPrefix, os.Getpid())
+
+	var devices []*Device
+	for i := range 2 {
+		backingFile := createBackingFile(t, 1024*1024)
+		dev, err := Setup(backingFile, Config{
+			ReadOnly: true,
+			Serial:   fmt.Sprintf("%s%d", prefix, i),
+		})
+		if err != nil {
+			t.Fatalf("Setup %d failed: %v", i, err)
+		}
+		t.Cleanup(func() { _ = dev.Detach() })
+		devices = append(devices, dev)
+	}
+
+	// Serial support requires Linux 5.17+.
+	if devices[0].GetSerial() == "" {
+		t.Skip("serial support not available (requires Linux 5.17+)")
+	}
+
+	n, err := CleanupBySerialPrefix(prefix)
+	if err != nil {
+		t.Fatalf("CleanupBySerialPrefix failed: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("expected 2 devices detached, got %d", n)
+	}
+	for _, dev := range devices {
+		verifyDetached(t, dev)
+	}
+}
+
+func TestDetachIdempotent(t *testing.T) {
+	testutil.RequiresRoot(t)
+
+	backingFile := createBackingFile(t, 1024*1024)
+	dev, err := Setup(backingFile, Config{
+		ReadOnly: true,
+		Serial:   fmt.Sprintf("erofs-test-idempotent-%d", os.Getpid()),
+	})
+	if err != nil {
+		t.Fatalf("Setup failed: %v", err)
+	}
+	t.Cleanup(func() { _ = dev.Detach() })
+
+	if err := dev.Detach(); err != nil {
+		t.Fatalf("first Detach failed: %v", err)
+	}
+	verifyDetached(t, dev)
+
+	// Second Detach hits the ENXIO (device not configured) path and must
+	// return nil.
+	if err := dev.Detach(); err != nil {
+		t.Errorf("second Detach on already-detached device should return nil, got: %v", err)
+	}
+}
+
+func TestDetachNonexistentDevice(t *testing.T) {
+	dev := &Device{Path: "/dev/loop-does-not-exist-99999", Number: 99999}
+	if err := dev.Detach(); err != nil {
+		t.Errorf("Detach on nonexistent device path should return nil, got: %v", err)
+	}
+}
+
+func TestDetachNonLoopFile(t *testing.T) {
+	// Opening a regular file succeeds but LOOP_CLR_FD fails with a
+	// non-ENXIO errno, exercising Detach's error return.
+	path := filepath.Join(t.TempDir(), "not-a-loop")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatalf("failed to create file: %v", err)
+	}
+	dev := &Device{Path: path}
+	if err := dev.Detach(); err == nil {
+		t.Error("expected error detaching a regular file")
+	}
+}
+
+func TestDetachPathNonLoopFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "not-a-loop")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatalf("failed to create file: %v", err)
+	}
+	if err := DetachPath(path); err == nil {
+		t.Error("expected error detaching a regular file by path")
+	}
+}
+
+func TestGetInfoErrors(t *testing.T) {
+	t.Run("nonexistent device", func(t *testing.T) {
+		dev := &Device{Path: "/dev/loop-does-not-exist-99999", Number: 99999}
+		if _, err := dev.GetInfo(); err == nil {
+			t.Error("expected error for nonexistent device path")
+		}
+	})
+
+	t.Run("non-loop file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "not-a-loop")
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatalf("failed to create file: %v", err)
+		}
+		dev := &Device{Path: path}
+		if _, err := dev.GetInfo(); err == nil {
+			t.Error("expected error for LOOP_GET_STATUS64 on regular file")
+		}
+	})
+}
+
+func TestGetInfoDetached(t *testing.T) {
+	testutil.RequiresRoot(t)
+
+	backingFile := createBackingFile(t, 1024*1024)
+	dev, err := Setup(backingFile, Config{
+		ReadOnly: true,
+		Serial:   fmt.Sprintf("erofs-test-info-detached-%d", os.Getpid()),
+	})
+	if err != nil {
+		t.Fatalf("Setup failed: %v", err)
+	}
+	t.Cleanup(func() { _ = dev.Detach() })
+
+	if err := dev.Detach(); err != nil {
+		t.Fatalf("Detach failed: %v", err)
+	}
+	verifyDetached(t, dev)
+
+	// LOOP_GET_STATUS64 on an unconfigured device fails (ENXIO). The device
+	// node may also have been removed entirely; both result in an error.
+	if _, err := dev.GetInfo(); err == nil {
+		t.Error("expected error from GetInfo on detached device")
+	}
+}
+
+func TestGetSerialNoDevice(t *testing.T) {
+	// Sysfs read fails for a device number that does not exist; GetSerial
+	// must return the empty string rather than an error.
+	dev := &Device{Path: "/dev/loop1048576", Number: 1 << 20}
+	if s := dev.GetSerial(); s != "" {
+		t.Errorf("expected empty serial for nonexistent device, got %q", s)
+	}
+}
+
+func TestSetupReadOnlyBackingFile(t *testing.T) {
+	testutil.RequiresRoot(t)
+
+	backingFile := createBackingFile(t, 1024*1024)
+	if err := os.Chmod(backingFile, 0o400); err != nil {
+		t.Fatalf("failed to chmod backing file: %v", err)
+	}
+
+	dev, err := Setup(backingFile, Config{
+		ReadOnly: true,
+		Serial:   fmt.Sprintf("erofs-test-rofile-%d", os.Getpid()),
+	})
+	if err != nil {
+		t.Fatalf("Setup with ReadOnly on read-only file failed: %v", err)
+	}
+	t.Cleanup(func() { _ = dev.Detach() })
+
+	info, err := dev.GetInfo()
+	if err != nil {
+		t.Fatalf("GetInfo failed: %v", err)
+	}
+	if info.Flags&LoFlagsReadOnly == 0 {
+		t.Error("expected read-only flag to be set")
+	}
+}
+
+func TestSetupDirectIO(t *testing.T) {
+	testutil.RequiresRoot(t)
+
+	backingFile := createBackingFile(t, 1024*1024)
+	dev, err := Setup(backingFile, Config{
+		ReadOnly: true,
+		DirectIO: true,
+		Serial:   fmt.Sprintf("erofs-test-dio-%d", os.Getpid()),
+	})
+	if err != nil {
+		// Direct I/O support depends on the backing filesystem (e.g.
+		// overlayfs/tmpfs may reject it); the failure path through
+		// LOOP_SET_STATUS64 cleanup is still exercised.
+		t.Logf("Setup with DirectIO not supported on this filesystem: %v", err)
+		return
+	}
+	t.Cleanup(func() { _ = dev.Detach() })
+
+	info, err := dev.GetInfo()
+	if err != nil {
+		t.Fatalf("GetInfo failed: %v", err)
+	}
+	// The kernel may accept the request but silently fall back to buffered
+	// I/O depending on the backing filesystem, so the flag is informational.
+	t.Logf("direct I/O flag set: %v", info.Flags&LoFlagsDirectIO != 0)
+}
+
+// brokenSymlink returns a path whose open(2) fails with ELOOP (a symlink
+// pointing to itself). Unlike a missing path, os.IsNotExist is false for
+// ELOOP, which exercises the open-error returns in Detach and DetachPath.
+func brokenSymlink(t *testing.T) string {
+	t.Helper()
+	link := filepath.Join(t.TempDir(), "self-loop")
+	if err := os.Symlink(link, link); err != nil {
+		t.Fatalf("failed to create self-referencing symlink: %v", err)
+	}
+	return link
+}
+
+func TestDetachOpenError(t *testing.T) {
+	dev := &Device{Path: brokenSymlink(t)}
+	if err := dev.Detach(); err == nil {
+		t.Error("expected error from Detach on unopenable path")
+	}
+}
+
+func TestDetachPathOpenError(t *testing.T) {
+	if err := DetachPath(brokenSymlink(t)); err == nil {
+		t.Error("expected error from DetachPath on unopenable path")
+	}
+}
+
+func TestFindByBackingFileRelativeWithDeletedCwd(t *testing.T) {
+	// filepath.Abs fails when the working directory has been removed,
+	// exercising the fallback to the raw backing file path.
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.Remove(dir); err != nil {
+		t.Fatalf("failed to remove temp dir: %v", err)
+	}
+
+	found, err := FindByBackingFile("relative-backing.img")
+	if err != nil {
+		t.Fatalf("FindByBackingFile failed: %v", err)
+	}
+	if found != nil {
+		t.Errorf("expected nil for unmatched relative path, got %s", found.Path)
+	}
+}
+
+func TestBackingFileNoNullTerminator(t *testing.T) {
+	// When FileName fills all 64 bytes the kernel omits the NUL terminator;
+	// BackingFile must return the full buffer.
+	var info LoopInfo64
+	for i := range info.FileName {
+		info.FileName[i] = 'a'
+	}
+	want := strings.Repeat("a", len(info.FileName))
+	if got := info.BackingFile(); got != want {
+		t.Errorf("BackingFile mismatch: got %q, want %q", got, want)
 	}
 }
