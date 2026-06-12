@@ -68,6 +68,14 @@ type snapshotter struct {
 
 	// bgWg tracks background operations (fsmeta generation) for clean shutdown.
 	bgWg sync.WaitGroup
+	// bgSem bounds concurrent background fsmeta generations: each one runs an
+	// mkfs.erofs process reading every blob in a chain, so an unbounded burst
+	// of Prepares would cause a CPU/IO storm.
+	bgSem chan struct{}
+	// bgCtx is the service-lifetime context for background fsmeta generation;
+	// bgCancel aborts in-flight generations so Close doesn't block on them.
+	bgCtx    context.Context //nolint:containedctx // service-lifetime context, cancelled in Close
+	bgCancel context.CancelFunc
 }
 
 // isMounted checks if a path is currently mounted.
@@ -123,11 +131,15 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		return nil, fmt.Errorf("create snapshots directory: %w", err)
 	}
 
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	s := &snapshotter{
 		root:            root,
 		ms:              ms,
 		setImmutable:    config.setImmutable,
 		defaultWritable: config.defaultSize,
+		bgSem:           make(chan struct{}, fsmetaConcurrency()),
+		bgCtx:           bgCtx,
+		bgCancel:        bgCancel,
 	}
 
 	// Clean up any orphaned mounts from previous runs.
@@ -137,10 +149,19 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 	return s, nil
 }
 
+// fsmetaConcurrency returns the maximum number of concurrent background
+// fsmeta generations (mkfs.erofs processes).
+func fsmetaConcurrency() int {
+	return min(max(runtime.GOMAXPROCS(0)/2, 1), 4)
+}
+
 // Close releases all resources held by the snapshotter.
-// It waits for any background operations (fsmeta generation) to complete.
+// It cancels in-flight background operations (fsmeta generation) and waits
+// for them to finish; an interrupted generation only leaves .tmp/.lock files
+// behind, which are cleaned up on the next startup.
 func (s *snapshotter) Close() error {
-	s.bgWg.Wait() // Wait for background operations to complete
+	s.bgCancel()
+	s.bgWg.Wait()
 	s.cleanupBlockMounts()
 	return s.ms.Close()
 }

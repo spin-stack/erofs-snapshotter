@@ -130,12 +130,25 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	if !isExtractKey(key) && len(snap.ParentIDs) > 0 {
 		parentIDs := snap.ParentIDs // capture for goroutine
 		s.bgWg.Add(1)
-		//nolint:contextcheck,gosec // intentionally using fresh context with timeout for background work
+		//nolint:contextcheck,gosec // intentionally derived from the service-lifetime context, not the request context
 		go func(ids []string) {
 			defer s.bgWg.Done()
-			// Use a fresh context with timeout - intentionally independent of parent
-			// context to allow completion even if the original request is cancelled.
-			bgCtx, cancel := context.WithTimeout(context.Background(), fsmetaTimeout)
+			// Skip cheaply if another generation already produced the fsmeta.
+			if _, err := os.Stat(s.fsMetaPath(ids[0])); err == nil {
+				return
+			}
+			// Bound concurrent mkfs.erofs runs; bail out if the snapshotter
+			// is shutting down while we wait for a slot.
+			select {
+			case s.bgSem <- struct{}{}:
+			case <-s.bgCtx.Done():
+				return
+			}
+			defer func() { <-s.bgSem }()
+			// Derived from the service-lifetime context (not the request
+			// context) so generation survives request cancellation but is
+			// aborted on Close.
+			bgCtx, cancel := context.WithTimeout(s.bgCtx, fsmetaTimeout)
 			defer cancel()
 			s.generateFsMeta(bgCtx, ids)
 		}(parentIDs)
