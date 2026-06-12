@@ -294,6 +294,27 @@ Snapshot directory structure:
 - Used when: VM handles overlay internally
 - Source: `{snapshotDir}/fs/`
 
+In BLOCK MODE without a mounted `rw/upper` (runtime snapshots, the
+`nerdctl/ctr commit` flow), Commit mounts the ext4 read-only itself and
+NEVER falls back to `fs/` (always empty in block mode — converting it would
+silently commit an empty layer).
+
+### Commit Quiesce Contract [CRITICAL]
+
+- Committing a container requires it to be **stopped** (not paused): the
+  guest's changes live inside `rwlayer.img` and are only consistent once the
+  VM released it.
+- Enforcement: `mountutils.MountExt4` takes flock + a whole-file **OFD lock**
+  (the lock family QEMU uses) before mounting and holds it until unmount;
+  a running VM yields `errdefs.ErrFailedPrecondition`.
+- Guest layout contract: the VM runtime creates `upper/` and `work/` at the
+  ext4 root; commit/diff read `{ext4root}/upper`. Writes outside `upper/`
+  are invisible to commit.
+- Hot commit (fsfreeze/sync cooperation) requires a qemubox-side protocol
+  that does not exist yet; until then it fails loudly by design.
+
+See `internal/snapshotter/doc.go` ("Committing a Container") for details.
+
 ---
 
 ## Quick Find Commands
