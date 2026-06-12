@@ -508,6 +508,26 @@ func (e *Environment) Context() context.Context {
 	return namespaces.WithNamespace(e.t.Context(), testNamespace)
 }
 
+// LeasedContext returns the test-namespace context protected by a containerd
+// lease, released via t.Cleanup. Snapshots created through the containerd
+// client without a lease (or an image referencing them) are eligible for
+// garbage collection immediately; image deletions in other subtests trigger
+// GC sweeps that would collect them mid-test, making Mounts/Commit fail
+// randomly with "not found".
+func (e *Environment) LeasedContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, done, err := e.Client().WithLease(e.Context())
+	if err != nil {
+		t.Fatalf("create lease: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := done(context.WithoutCancel(ctx)); err != nil {
+			t.Logf("release lease: %v", err)
+		}
+	})
+	return ctx
+}
+
 // SnapshotService returns the snapshot service for the test snapshotter.
 func (e *Environment) SnapshotService() snapshots.Snapshotter {
 	return e.Client().SnapshotService(snapshotterName)
@@ -1072,7 +1092,7 @@ func testPullImage(t *testing.T, env *Environment) {
 
 // testPrepareSnapshot verifies snapshot preparation from a committed parent.
 func testPrepareSnapshot(t *testing.T, env *Environment) {
-	ctx := env.Context()
+	ctx := env.LeasedContext(t)
 	ss := env.SnapshotService()
 	assert := NewAssertions(t, env)
 
@@ -1107,7 +1127,7 @@ func testPrepareSnapshot(t *testing.T, env *Environment) {
 
 // testViewSnapshot verifies view snapshot creation and mount info.
 func testViewSnapshot(t *testing.T, env *Environment) {
-	ctx := env.Context()
+	ctx := env.LeasedContext(t)
 	ss := env.SnapshotService()
 	assert := NewAssertions(t, env)
 
@@ -1247,7 +1267,7 @@ func verifyErofsMagic(path string) error {
 
 // testRwlayerCreation verifies rwlayer.img files are created for active snapshots.
 func testRwlayerCreation(t *testing.T, env *Environment) {
-	ctx := env.Context()
+	ctx := env.LeasedContext(t)
 	ss := env.SnapshotService()
 	assert := NewAssertions(t, env)
 
@@ -1280,7 +1300,7 @@ func testRwlayerCreation(t *testing.T, env *Environment) {
 
 // testCommit verifies snapshot commit creates EROFS layers.
 func testCommit(t *testing.T, env *Environment) {
-	ctx := env.Context()
+	ctx := env.LeasedContext(t)
 	ss := env.SnapshotService()
 	assert := NewAssertions(t, env)
 
@@ -1316,7 +1336,7 @@ func testCommit(t *testing.T, env *Environment) {
 
 // testSnapshotCleanup verifies snapshots can be properly removed.
 func testSnapshotCleanup(t *testing.T, env *Environment) {
-	ctx := env.Context()
+	ctx := env.LeasedContext(t)
 	ss := env.SnapshotService()
 	assert := NewAssertions(t, env)
 
@@ -1350,7 +1370,7 @@ func testSnapshotCleanup(t *testing.T, env *Environment) {
 
 // testMultiLayer tests pulling and viewing a multi-layer image.
 func testMultiLayer(t *testing.T, env *Environment) {
-	ctx := env.Context()
+	ctx := env.LeasedContext(t)
 	c := env.Client()
 	ss := env.SnapshotService()
 	assert := NewAssertions(t, env)
@@ -1577,7 +1597,7 @@ func extractDigest(path string) string {
 
 // testCommitLifecycle tests the full container commit workflow.
 func testCommitLifecycle(t *testing.T, env *Environment) {
-	ctx := env.Context()
+	ctx := env.LeasedContext(t)
 	ss := env.SnapshotService()
 	assert := NewAssertions(t, env)
 
@@ -1843,7 +1863,7 @@ func TestSequentialUnpackLayerOrder(t *testing.T) {
 		t.Fatalf("start environment: %v", err)
 	}
 
-	ctx := env.Context()
+	ctx := env.LeasedContext(t)
 	c := env.Client()
 	ss := env.SnapshotService()
 	assert := NewAssertions(t, env)
