@@ -34,6 +34,10 @@ import (
 )
 
 func TestMountsToLayer(t *testing.T) {
+	// Directory without a .erofslayer marker, so the test does not depend
+	// on host state (a stray /tmp/.erofslayer would flip hardcoded paths).
+	noMarkerDir := t.TempDir()
+
 	tests := []struct {
 		name        string
 		mounts      []mount.Mount
@@ -96,7 +100,10 @@ func TestMountsToLayer(t *testing.T) {
 		{
 			name: "overlay mount without marker",
 			mounts: []mount.Mount{
-				{Type: "overlay", Source: "overlay", Options: []string{"upperdir=/tmp/upper", "lowerdir=/tmp/lower"}},
+				{Type: "overlay", Source: "overlay", Options: []string{
+					"upperdir=" + filepath.Join(noMarkerDir, "upper"),
+					"lowerdir=" + filepath.Join(noMarkerDir, "lower"),
+				}},
 			},
 			expectError: true, // No .erofslayer marker
 		},
@@ -224,9 +231,36 @@ func TestMountsToLayerOverlay(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The first mounts below intentionally use non-EROFS types ("bind") so
+	// hasErofsMountType returns false and MountsToLayer must validate the
+	// .erofslayer marker instead of taking the trusted-EROFS shortcut.
 	t.Run("overlay with upperdir", func(t *testing.T) {
 		mounts := []mount.Mount{
-			{Type: "erofs", Source: lowerDir}, // first mount for lowerdir resolution
+			{Type: "bind", Source: lowerDir}, // first mount for lowerdir resolution
+			{
+				Type:   "overlay",
+				Source: "overlay",
+				Options: []string{
+					"upperdir=" + filepath.Join(upperParent, "upper"),
+					"lowerdir=" + lowerDir,
+					"workdir=" + filepath.Join(upperParent, "work"),
+				},
+			},
+		}
+		got, err := MountsToLayer(mounts)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+			return
+		}
+		if got != upperParent {
+			t.Errorf("got %q, want %q", got, upperParent)
+		}
+	})
+
+	t.Run("standalone overlay with upperdir", func(t *testing.T) {
+		// A single overlay mount (no EROFS-typed mount at all): both the
+		// upperdir resolution and the marker check must be exercised.
+		mounts := []mount.Mount{
 			{
 				Type:   "overlay",
 				Source: "overlay",
@@ -249,7 +283,9 @@ func TestMountsToLayerOverlay(t *testing.T) {
 
 	t.Run("overlay with only lowerdir (view)", func(t *testing.T) {
 		mounts := []mount.Mount{
-			{Type: "erofs", Source: lowerDir},
+			// lowerdir resolution uses the first mount's source, so the
+			// result must be lowerParent and its marker must be checked.
+			{Type: "bind", Source: lowerDir},
 			{
 				Type:   "overlay",
 				Source: "overlay",
@@ -312,12 +348,20 @@ func TestMountBaseType(t *testing.T) {
 }
 
 func TestSupportGenerateFromTar(t *testing.T) {
-	// This test just verifies the function doesn't panic
-	// The actual result depends on whether mkfs.erofs is installed
+	// Whether tar mode is supported depends on the installed mkfs.erofs,
+	// but the function's invariants are checkable in any environment.
+	_, lookErr := exec.LookPath("mkfs.erofs")
+
 	supported, err := SupportGenerateFromTar()
 	if err != nil {
-		t.Logf("mkfs.erofs not available: %v", err)
+		if supported {
+			t.Errorf("SupportGenerateFromTar() = (true, %v), want supported=false on error", err)
+		}
+		t.Logf("mkfs.erofs not usable: %v", err)
 		return
+	}
+	if lookErr != nil {
+		t.Errorf("SupportGenerateFromTar() succeeded but mkfs.erofs is not in PATH: %v", lookErr)
 	}
 	t.Logf("mkfs.erofs tar support: %v", supported)
 }
@@ -686,6 +730,9 @@ func TestGenerateTarIndexAndAppendTarIntegration(t *testing.T) {
 	layerPath := filepath.Join(dir, "layer.erofs")
 
 	tarBuf := createTestTar(t)
+	// Snapshot the tar bytes before they are consumed so the appended
+	// content can be verified against the original input.
+	tarData := append([]byte(nil), tarBuf.Bytes()...)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -720,6 +767,19 @@ func TestGenerateTarIndexAndAppendTarIntegration(t *testing.T) {
 	expectedMagic := []byte{0xe2, 0xe1, 0xf5, 0xe0}
 	if !bytes.Equal(magic, expectedMagic) {
 		t.Errorf("invalid EROFS magic: got %x, want %x", magic, expectedMagic)
+	}
+
+	// Verify the tar was actually appended after the index: the file must
+	// be larger than the tar alone and end with the exact input tar bytes.
+	if info.Size() <= int64(len(tarData)) {
+		t.Fatalf("layer size %d leaves no room for the EROFS index before the appended tar (%d bytes)", info.Size(), len(tarData))
+	}
+	tail := make([]byte, len(tarData))
+	if _, err := f.ReadAt(tail, info.Size()-int64(len(tarData))); err != nil {
+		t.Fatalf("failed to read appended tar: %v", err)
+	}
+	if !bytes.Equal(tail, tarData) {
+		t.Error("appended tar content does not match input tar")
 	}
 
 	t.Logf("Successfully created EROFS tar index layer: %s (%d bytes)", layerPath, info.Size())
@@ -798,13 +858,10 @@ func TestGetBlockSize(t *testing.T) {
 			t.Fatalf("GetBlockSize failed: %v", err)
 		}
 
-		// Tar index mode uses 512-byte blocks
-		t.Logf("EROFS tar index layer block size: %d", blockSize)
-
-		// The block size for tar index mode should be 512
-		// (This is what causes the fsmeta merge incompatibility)
+		// Tar index mode must use 512-byte blocks; this is what causes
+		// the fsmeta merge incompatibility the snapshotter guards against.
 		if blockSize != 512 {
-			t.Logf("Note: tar index mode block size is %d (expected 512)", blockSize)
+			t.Errorf("GetBlockSize() = %d, want 512 for tar index mode layer", blockSize)
 		}
 	})
 }

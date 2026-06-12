@@ -147,13 +147,7 @@ func (s *ErofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts [
 	// Use digest-based filename for easy correlation with registry manifests
 	layerBlobPath := path.Join(layer, erofs.LayerBlobFilename(desc.Digest.String()))
 	if native {
-		f, err := os.Create(layerBlobPath)
-		if err != nil {
-			return ocispec.Descriptor{}, err
-		}
-		_, err = io.Copy(f, content.NewReader(ra))
-		f.Close()
-		if err != nil {
+		if err := copyBlobAtomic(layerBlobPath, content.NewReader(ra)); err != nil {
 			return ocispec.Descriptor{}, err
 		}
 		return desc, nil
@@ -176,16 +170,27 @@ func (s *ErofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts [
 	}
 
 	// Use full conversion mode (--tar=f): converts tar to EROFS with 4096-byte blocks
-	// This creates layers compatible with fsmeta merge for multi-layer images
+	// This creates layers compatible with fsmeta merge for multi-layer images.
+	// Convert into a temporary file and rename only on success: Commit trusts
+	// any blob matching the digest-based name, so a partial file must never
+	// appear under the final name.
+	tmpBlobPath := layerBlobPath + ".tmp"
 	u := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+desc.Digest))
-	err = erofs.ConvertTarErofs(ctx, rc, layerBlobPath, u.String(), defaultMkfsOpts())
+	err = erofs.ConvertTarErofs(ctx, rc, tmpBlobPath, u.String(), defaultMkfsOpts())
 	if err != nil {
+		_ = os.Remove(tmpBlobPath)
 		return ocispec.Descriptor{}, fmt.Errorf("failed to convert tar to erofs: %w", err)
 	}
 
 	// Read any trailing data
 	if _, err := io.Copy(io.Discard, rc); err != nil {
+		_ = os.Remove(tmpBlobPath)
 		return ocispec.Descriptor{}, err
+	}
+
+	if err := os.Rename(tmpBlobPath, layerBlobPath); err != nil {
+		_ = os.Remove(tmpBlobPath)
+		return ocispec.Descriptor{}, fmt.Errorf("failed to finalize layer blob: %w", err)
 	}
 
 	return ocispec.Descriptor{
@@ -193,6 +198,29 @@ func (s *ErofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts [
 		Size:      rc.count,
 		Digest:    digester.Digest(),
 	}, nil
+}
+
+// copyBlobAtomic writes r to path via a temporary file and an atomic rename,
+// so a crash or write error never leaves a partial blob under the final name.
+func copyBlobAtomic(path string, r io.Reader) (err error) {
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmp)
+		}
+	}()
+	_, err = io.Copy(f, r)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // readCounter wraps an io.Reader and counts the total bytes read.

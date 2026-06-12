@@ -60,11 +60,9 @@ linters:
     - gochecknoglobals
     - gochecknoinits
     - gocognit
-    - goconst
     - godot
     - godox
     - gomoddirectives
-    - gomodguard
     - gosec
     - inamedparam
     - interfacebloat
@@ -127,6 +125,9 @@ linters:
     - unparam           # Unused params may be needed for interface compliance
     - revive            # Often overlaps with other linters
     - noctx             # Context not always needed for exec.Command
+    - goconst           # Since v2.12 it flags struct fields, map literals and
+                        # log field keys; inline mount-type and log-key strings
+                        # are idiomatic in this codebase
   settings:
     cyclop:
       max-complexity: 20

@@ -58,7 +58,7 @@ func TestGetNamespacedContext(t *testing.T) {
 			wantErr:          true,
 		},
 		{
-			name:             "uses default for k8s.io namespace",
+			name:             "uses context namespace for k8s.io (no special handling)",
 			inputNamespace:   "k8s.io",
 			defaultNamespace: "default",
 			wantNamespace:    "k8s.io",
@@ -103,18 +103,18 @@ func TestGetNamespacedContext(t *testing.T) {
 }
 
 func TestNamespaceAwareStore_NilClient(t *testing.T) {
-	// Test that operations fail gracefully with nil client
-	// This documents expected behavior when misconfigured
+	// Document the contract for a misconfigured store: a nil client must
+	// surface as a panic when the underlying store is first accessed,
+	// rather than silently returning a usable (but broken) store.
 	store := NewNamespaceAwareStore(nil, "default")
 
-	// These should panic or return errors due to nil client
-	// We're documenting this behavior, not endorsing it
-	t.Run("store returns nil for nil client", func(t *testing.T) {
-		// store() calls client.ContentStore() which will panic on nil client
-		// This test documents that the store requires a valid client
+	t.Run("store panics for nil client", func(t *testing.T) {
+		// store() calls client.ContentStore(), which dereferences the
+		// nil client. A regression that made this return a non-functional
+		// store without panicking would change the failure mode.
 		defer func() {
 			if r := recover(); r == nil {
-				t.Log("no panic occurred - client might handle nil")
+				t.Error("expected panic from store() with nil client, got none")
 			}
 		}()
 		_ = store.store()
@@ -209,6 +209,166 @@ func writeTestBlob(t *testing.T, ctx context.Context, cs content.Store, data []b
 		t.Fatal(err)
 	}
 	return desc
+}
+
+// recordingStore wraps a content.Store and records the namespace present in
+// the context of every call, so tests can verify that NamespaceAwareStore
+// injects the resolved namespace before delegating to the underlying store.
+type recordingStore struct {
+	content.Store
+	mu   sync.Mutex
+	seen []string
+}
+
+func (r *recordingStore) record(ctx context.Context) {
+	ns, _ := namespaces.Namespace(ctx)
+	r.mu.Lock()
+	r.seen = append(r.seen, ns)
+	r.mu.Unlock()
+}
+
+func (r *recordingStore) calls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.seen)
+}
+
+func (r *recordingStore) lastNamespace() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.seen) == 0 {
+		return ""
+	}
+	return r.seen[len(r.seen)-1]
+}
+
+func (r *recordingStore) ReaderAt(ctx context.Context, desc ocispec.Descriptor) (content.ReaderAt, error) {
+	r.record(ctx)
+	return r.Store.ReaderAt(ctx, desc)
+}
+
+func (r *recordingStore) Writer(ctx context.Context, opts ...content.WriterOpt) (content.Writer, error) {
+	r.record(ctx)
+	return r.Store.Writer(ctx, opts...)
+}
+
+func (r *recordingStore) Abort(ctx context.Context, ref string) error {
+	r.record(ctx)
+	return r.Store.Abort(ctx, ref)
+}
+
+func (r *recordingStore) Status(ctx context.Context, ref string) (content.Status, error) {
+	r.record(ctx)
+	return r.Store.Status(ctx, ref)
+}
+
+func (r *recordingStore) ListStatuses(ctx context.Context, filters ...string) ([]content.Status, error) {
+	r.record(ctx)
+	return r.Store.ListStatuses(ctx, filters...)
+}
+
+func (r *recordingStore) Info(ctx context.Context, dgst digest.Digest) (content.Info, error) {
+	r.record(ctx)
+	return r.Store.Info(ctx, dgst)
+}
+
+func (r *recordingStore) Update(ctx context.Context, info content.Info, fieldpaths ...string) (content.Info, error) {
+	r.record(ctx)
+	return r.Store.Update(ctx, info, fieldpaths...)
+}
+
+func (r *recordingStore) Walk(ctx context.Context, fn content.WalkFunc, filters ...string) error {
+	r.record(ctx)
+	return r.Store.Walk(ctx, fn, filters...)
+}
+
+func (r *recordingStore) Delete(ctx context.Context, dgst digest.Digest) error {
+	r.record(ctx)
+	return r.Store.Delete(ctx, dgst)
+}
+
+// TestNamespaceAwareStore_NamespacePropagation verifies that every method
+// injects the resolved namespace into the context passed to the underlying
+// store, which is the sole purpose of NamespaceAwareStore.
+func TestNamespaceAwareStore_NamespacePropagation(t *testing.T) {
+	tests := []struct {
+		name           string
+		inputNamespace string // "" means no namespace in the input context
+		wantNamespace  string
+	}{
+		{
+			name:           "injects default namespace when context has none",
+			inputNamespace: "",
+			wantNamespace:  "default",
+		},
+		{
+			name:           "propagates context namespace",
+			inputNamespace: "my-namespace",
+			wantNamespace:  "my-namespace",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recordingStore{Store: newTestContentStore(t)}
+			store := newNamespaceAwareStoreWithProvider(&testStoreProvider{cs: rec}, "default")
+
+			ctx := t.Context()
+			if tc.inputNamespace != "" {
+				ctx = namespaces.WithNamespace(ctx, tc.inputNamespace)
+			}
+
+			// Errors from the underlying store are irrelevant here: the
+			// recording wrapper captures the namespace before delegating,
+			// so each call is only checked for namespace propagation.
+			methods := []struct {
+				name string
+				call func(ctx context.Context)
+			}{
+				{"ReaderAt", func(ctx context.Context) {
+					_, _ = store.ReaderAt(ctx, ocispec.Descriptor{Digest: digest.FromString("missing")})
+				}},
+				{"Writer", func(ctx context.Context) {
+					if w, err := store.Writer(ctx, content.WithRef("ns-propagation-ref")); err == nil {
+						_ = w.Close()
+					}
+				}},
+				{"Abort", func(ctx context.Context) {
+					_ = store.Abort(ctx, "ns-propagation-ref")
+				}},
+				{"Status", func(ctx context.Context) {
+					_, _ = store.Status(ctx, "ns-propagation-ref")
+				}},
+				{"ListStatuses", func(ctx context.Context) {
+					_, _ = store.ListStatuses(ctx)
+				}},
+				{"Info", func(ctx context.Context) {
+					_, _ = store.Info(ctx, digest.FromString("missing"))
+				}},
+				{"Update", func(ctx context.Context) {
+					_, _ = store.Update(ctx, content.Info{Digest: digest.FromString("missing")})
+				}},
+				{"Walk", func(ctx context.Context) {
+					_ = store.Walk(ctx, func(content.Info) error { return nil })
+				}},
+				{"Delete", func(ctx context.Context) {
+					_ = store.Delete(ctx, digest.FromString("missing"))
+				}},
+			}
+
+			for _, m := range methods {
+				before := rec.calls()
+				m.call(ctx)
+				if got := rec.calls() - before; got != 1 {
+					t.Errorf("%s: underlying store called %d times, want 1", m.name, got)
+					continue
+				}
+				if got := rec.lastNamespace(); got != tc.wantNamespace {
+					t.Errorf("%s: namespace = %q, want %q", m.name, got, tc.wantNamespace)
+				}
+			}
+		})
+	}
 }
 
 func TestNamespaceAwareStore_ReaderAt(t *testing.T) {
@@ -375,9 +535,15 @@ func TestNamespaceAwareStore_ListStatuses(t *testing.T) {
 	t.Run("lists active writers", func(t *testing.T) {
 		ctx := t.Context()
 
-		w1, _ := store.Writer(ctx, content.WithRef("list-ref-1"))
-		w2, _ := store.Writer(ctx, content.WithRef("list-ref-2"))
+		w1, err := store.Writer(ctx, content.WithRef("list-ref-1"))
+		if err != nil {
+			t.Fatalf("Writer failed: %v", err)
+		}
 		defer w1.Close()
+		w2, err := store.Writer(ctx, content.WithRef("list-ref-2"))
+		if err != nil {
+			t.Fatalf("Writer failed: %v", err)
+		}
 		defer w2.Close()
 
 		statuses, err := store.ListStatuses(ctx)

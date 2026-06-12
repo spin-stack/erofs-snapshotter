@@ -25,15 +25,47 @@
 // The commit process reads files from either block mode or overlay mode.
 // Mode detection happens in [getCommitUpperDir].
 //
-// BLOCK MODE (extract snapshots):
-//   - Condition: rwlayer.img exists in snapshot directory
-//   - Used when: EROFS differ writes to host-mounted ext4
-//   - Source: {snapshotDir}/rw/upper/ (inside mounted ext4)
+// BLOCK MODE (rwlayer.img exists in the snapshot directory):
+//   - Extract snapshots: Prepare() mounted the ext4 at rw/, the EROFS differ
+//     wrote into it, and the commit source is {snapshotDir}/rw/upper/.
+//   - Runtime snapshots (the "nerdctl/ctr commit" flow): the ext4 is not
+//     mounted on the host; Commit mounts it read-only to read the upper the
+//     guest wrote. Block mode NEVER falls back to fs/ - fs/ is always empty
+//     in block mode and converting it would silently commit an empty layer.
 //
-// OVERLAY MODE (regular snapshots):
-//   - Condition: rwlayer.img does NOT exist
+// OVERLAY MODE (rwlayer.img does NOT exist):
 //   - Used when: VM handles overlay internally
 //   - Source: {snapshotDir}/fs/
+//
+// # Committing a Container (Quiesce Contract)
+//
+// A container's changes live inside rwlayer.img (ext4), written by the guest
+// VM through its overlay mount. To turn them into an image layer, the host
+// must read that ext4 (diff.Compare for the layer tar, or Commit's fallback
+// conversion). This is only safe when the guest is not writing to it:
+//
+//   - The container MUST be stopped (not merely paused) before commit.
+//     Pausing only stops vCPUs; dirty data may remain in the guest page
+//     cache and the ext4 journal may be mid-transaction.
+//   - Enforcement: mountutils.MountExt4 takes a flock plus a whole-file OFD
+//     lock on rwlayer.img before mounting and holds both until unmount. QEMU
+//     locks its disk images with OFD locks, so a running VM makes the mount
+//     fail with errdefs.ErrFailedPrecondition ("container is still running").
+//     Holding the lock for the mount's lifetime also prevents a VM from
+//     starting while the host reads the image.
+//   - The host mounts the ext4 read-only; journal recovery is permitted so a
+//     crashed guest still yields a consistent view.
+//
+// GUEST LAYOUT CONTRACT: the VM runtime (qemubox) must build its overlay
+// with upper/ and work/ at the root of the ext4 - the same layout
+// mountBlockRwLayer prepares for extract snapshots. The differ and Commit
+// read {ext4root}/upper as the layer content; anything written outside
+// upper/ is invisible to commit.
+//
+// FUTURE: hot commit (container running) would require cooperation from
+// qemubox - guest fsfreeze/sync plus flushing virtio-blk - before the host
+// may read the image. Until such a protocol exists, commit of a running
+// container fails loudly by design.
 //
 // # Mount Types Returned
 //

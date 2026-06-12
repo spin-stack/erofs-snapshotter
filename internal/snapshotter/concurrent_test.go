@@ -86,9 +86,11 @@ func TestConcurrentPrepare(t *testing.T) {
 }
 
 // TestConcurrentView verifies concurrent View calls on the same parent don't race.
-// This tests the fsmeta generation coordination (placeholder file).
+// This tests the fsmeta generation coordination (lock file): after all views and
+// background generations finish, no lock or temp artifacts may remain and the
+// fsmeta/VMDK pair must be consistent.
 func TestConcurrentView(t *testing.T) {
-	s := newTestSnapshotter(t)
+	s := newTestSnapshotterInternal(t)
 	ctx := t.Context()
 
 	// Create a base snapshot to use as parent
@@ -124,6 +126,30 @@ func TestConcurrentView(t *testing.T) {
 
 	for err := range errors {
 		t.Errorf("unexpected error: %v", err)
+	}
+
+	// All View calls have returned, so every background fsmeta generation has
+	// already been registered with bgWg; wait for them to finish and verify
+	// the coordination left no lock or temp artifacts behind.
+	s.bgWg.Wait()
+
+	parentID := snapshotIDForKey(t, s, ctx, "committed-base")
+	for _, path := range []string{
+		s.fsMetaPath(parentID) + ".lock",
+		s.fsMetaPath(parentID) + ".tmp",
+		s.vmdkPath(parentID) + ".tmp",
+	} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("expected no residual fsmeta artifact %s, got err=%v", path, err)
+		}
+	}
+
+	// fsmeta and VMDK must be consistent: either both were generated or neither
+	// (generation may legitimately fail, but must not leave a partial pair).
+	_, metaErr := os.Stat(s.fsMetaPath(parentID))
+	_, vmdkErr := os.Stat(s.vmdkPath(parentID))
+	if os.IsNotExist(metaErr) != os.IsNotExist(vmdkErr) {
+		t.Errorf("inconsistent fsmeta/vmdk pair: fsmeta err=%v, vmdk err=%v", metaErr, vmdkErr)
 	}
 }
 
@@ -178,11 +204,12 @@ func TestConcurrentRemove(t *testing.T) {
 	}
 }
 
-// TestFsmetaLockFileRace verifies that concurrent fsmeta generation
-// uses the lock file correctly (only one wins).
+// TestFsmetaLockFileRace verifies that concurrent fsmeta lock acquisition
+// via tryAcquireFsmetaLock (the coordination used by generateFsMeta) admits
+// exactly one winner.
 func TestFsmetaLockFileRace(t *testing.T) {
 	root := t.TempDir()
-	s := newTestSnapshotterWithRoot(t, root)
+	s := &snapshotter{root: root}
 
 	// Create snapshot directory
 	snapshotDir := filepath.Join(root, "snapshots", "test-parent")
@@ -190,29 +217,38 @@ func TestFsmetaLockFileRace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Run multiple goroutines trying to acquire the lock file
+	// Run multiple goroutines racing to acquire the fsmeta lock
 	const numGoroutines = 20
 	var wg sync.WaitGroup
+	start := make(chan struct{})
 	winners := make(chan int, numGoroutines)
-
-	lockFile := s.fsMetaPath("test-parent") + ".lock"
+	errs := make(chan error, numGoroutines)
 
 	for i := range numGoroutines {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			// Try to create lock file atomically (same pattern as generateFsMeta)
-			f, err := os.OpenFile(lockFile, os.O_CREATE|os.O_EXCL, 0o600)
-			if err == nil {
-				winners <- id
-				f.Close()
+			<-start
+			locked, err := s.tryAcquireFsmetaLock(context.Background(), "test-parent")
+			if err != nil {
+				errs <- fmt.Errorf("goroutine %d: %w", id, err)
+				return
 			}
-			// Others get os.ErrExist - that's expected
+			if locked {
+				winners <- id
+			}
+			// Losers see the fresh lock held by the winner - that's expected
 		}(i)
 	}
 
+	close(start)
 	wg.Wait()
 	close(winners)
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("unexpected error: %v", err)
+	}
 
 	// Exactly one goroutine should win
 	winnerCount := 0
@@ -221,10 +257,11 @@ func TestFsmetaLockFileRace(t *testing.T) {
 	}
 
 	if winnerCount != 1 {
-		t.Errorf("expected exactly 1 winner for lock file creation, got %d", winnerCount)
+		t.Errorf("expected exactly 1 goroutine to acquire the fsmeta lock, got %d", winnerCount)
 	}
 
-	// Verify lock file exists
+	// The winner still holds the lock, so the lock file must exist
+	lockFile := s.fsMetaPath("test-parent") + ".lock"
 	if _, err := os.Stat(lockFile); err != nil {
 		t.Errorf("lock file should exist: %v", err)
 	}
@@ -336,52 +373,109 @@ func TestCleanupFsmetaArtifactsRemovesStartupArtifacts(t *testing.T) {
 	}
 }
 
-// TestFsmetaAtomicRename verifies the atomic rename pattern for fsmeta generation.
-func TestFsmetaAtomicRename(t *testing.T) {
-	root := t.TempDir()
-	s := newTestSnapshotterWithRoot(t, root)
+// writeFakeErofsBlob writes a minimal file that passes erofs.GetBlockSize:
+// the EROFS magic at the superblock offset (1024) and blkszbits=12, i.e. a
+// 4096-byte block size compatible with fsmeta merge.
+func writeFakeErofsBlob(t *testing.T, path string) {
+	t.Helper()
+	buf := make([]byte, 1024+16)
+	// EROFS magic 0xE0F5E1E2, little-endian
+	buf[1024] = 0xE2
+	buf[1025] = 0xE1
+	buf[1026] = 0xF5
+	buf[1027] = 0xE0
+	// blkszbits at superblock offset +12: 1<<12 = 4096
+	buf[1036] = 12
+	if err := os.WriteFile(path, buf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 
-	// Create snapshot directory
-	snapshotDir := filepath.Join(root, "snapshots", "test-parent")
+// installFakeMkfsErofs prepends a fake mkfs.erofs to PATH that understands the
+// argument shape used by generateFsMeta (--quiet --vmdk-desc=<vmdk> <out> <blobs...>)
+// and writes both output files, embedding the temp output path in the VMDK so
+// the fixVmdkPaths rewrite is observable.
+func installFakeMkfsErofs(t *testing.T) {
+	t.Helper()
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+vmdk=""
+out=""
+for a in "$@"; do
+	case "$a" in
+	--quiet) ;;
+	--vmdk-desc=*) vmdk="${a#--vmdk-desc=}" ;;
+	*)
+		if [ -z "$out" ]; then
+			out="$a"
+		fi
+		;;
+	esac
+done
+printf 'fsmeta' > "$out"
+printf 'RW 8 FLAT "%s" 0\n' "$out" > "$vmdk"
+`
+	if err := os.WriteFile(filepath.Join(binDir, "mkfs.erofs"), []byte(script), 0o755); err != nil { //nolint:gosec // test helper needs an executable script
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestFsmetaAtomicRename verifies that generateFsMeta produces the final
+// fsmeta/VMDK pair via atomic rename, rewrites the VMDK to reference the final
+// fsmeta path, writes the layer manifest, and leaves no temp or lock files.
+func TestFsmetaAtomicRename(t *testing.T) {
+	installFakeMkfsErofs(t)
+
+	root := t.TempDir()
+	s := &snapshotter{root: root}
+
+	// Create the parent snapshot directory with a digest-named layer blob
+	// that passes the fsmeta block-size compatibility check.
+	parentID := "test-parent"
+	snapshotDir := filepath.Join(root, "snapshots", parentID)
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	blobDigest := strings.Repeat("ab", 32)
+	writeFakeErofsBlob(t, filepath.Join(snapshotDir, "sha256-"+blobDigest+".erofs"))
 
-	fsmetaPath := s.fsMetaPath("test-parent")
-	vmdkPath := s.vmdkPath("test-parent")
-	tmpMeta := fsmetaPath + ".tmp"
-	tmpVmdk := vmdkPath + ".tmp"
+	s.generateFsMeta(context.Background(), []string{parentID})
 
-	// Simulate successful generation: create temp files
-	if err := os.WriteFile(tmpMeta, []byte("fsmeta content"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(tmpVmdk, []byte("vmdk content"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Atomic rename (same order as generateFsMeta)
-	if err := os.Rename(tmpMeta, fsmetaPath); err != nil {
-		t.Fatalf("rename fsmeta: %v", err)
-	}
-	if err := os.Rename(tmpVmdk, vmdkPath); err != nil {
-		t.Fatalf("rename vmdk: %v", err)
-	}
+	fsmetaPath := s.fsMetaPath(parentID)
+	vmdkPath := s.vmdkPath(parentID)
 
 	// Verify final files exist
 	if _, err := os.Stat(fsmetaPath); err != nil {
 		t.Errorf("fsmeta should exist: %v", err)
 	}
-	if _, err := os.Stat(vmdkPath); err != nil {
-		t.Errorf("vmdk should exist: %v", err)
+	vmdkContent, err := os.ReadFile(vmdkPath)
+	if err != nil {
+		t.Fatalf("vmdk should exist: %v", err)
 	}
 
-	// Verify temp files are gone
-	if _, err := os.Stat(tmpMeta); !os.IsNotExist(err) {
-		t.Error("temp fsmeta should not exist after rename")
+	// fixVmdkPaths must have rewritten the temp fsmeta path to the final one
+	if strings.Contains(string(vmdkContent), ".tmp") {
+		t.Errorf("vmdk should not reference temp paths, got: %s", vmdkContent)
 	}
-	if _, err := os.Stat(tmpVmdk); !os.IsNotExist(err) {
-		t.Error("temp vmdk should not exist after rename")
+	if !strings.Contains(string(vmdkContent), fsmetaPath) {
+		t.Errorf("vmdk should reference final fsmeta path %s, got: %s", fsmetaPath, vmdkContent)
+	}
+
+	// Verify temp and lock files are gone
+	for _, path := range []string{fsmetaPath + ".tmp", vmdkPath + ".tmp", fsmetaPath + ".lock"} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("expected %s to be removed after generation, got err=%v", path, err)
+		}
+	}
+
+	// Layer manifest must record the blob digest
+	manifest, err := os.ReadFile(s.manifestPath(parentID))
+	if err != nil {
+		t.Fatalf("layer manifest should exist: %v", err)
+	}
+	if got, want := strings.TrimSpace(string(manifest)), "sha256:"+blobDigest; got != want {
+		t.Errorf("layer manifest = %q, want %q", got, want)
 	}
 }
 

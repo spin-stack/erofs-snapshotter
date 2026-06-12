@@ -57,7 +57,7 @@ ddb.adapterType = "ide"
 	if layers[0].Digest != "" {
 		t.Errorf("fsmeta layer should have empty digest, got %q", layers[0].Digest)
 	}
-	if !filepath.IsAbs(layers[0].Path) || !contains(layers[0].Path, "fsmeta.erofs") {
+	if !filepath.IsAbs(layers[0].Path) || filepath.Base(layers[0].Path) != "fsmeta.erofs" {
 		t.Errorf("first layer should be fsmeta.erofs, got %q", layers[0].Path)
 	}
 
@@ -186,15 +186,10 @@ ddb.virtualHWVersion = "4"
 		digest.Digest("sha256:" + layer3Digest),
 	}
 
+	// VMDK order matches OCI manifest order directly (no reversal needed):
+	// both use oldest-first ordering.
 	if !reflect.DeepEqual(digests, expectedVMDKOrder) {
 		t.Errorf("VMDK layer order = %v, want %v", digests, expectedVMDKOrder)
-	}
-
-	// VMDK order now matches OCI manifest order directly (no reversal needed)
-	// Both use oldest-first ordering
-	manifestOrder := expectedVMDKOrder
-	if !reflect.DeepEqual(digests, manifestOrder) {
-		t.Errorf("VMDK order = %v, want OCI manifest order %v", digests, manifestOrder)
 	}
 }
 
@@ -203,8 +198,4 @@ func TestParseVMDK_NotFound(t *testing.T) {
 	if err == nil {
 		t.Error("ParseVMDK should fail for nonexistent file")
 	}
-}
-
-func contains(s, substr string) bool {
-	return filepath.Base(s) == substr || filepath.Base(s) == filepath.Base(substr)
 }

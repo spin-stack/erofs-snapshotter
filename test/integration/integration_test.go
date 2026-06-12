@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/cio"
@@ -366,9 +367,13 @@ type Environment struct {
 	containerdSocket  string
 	snapshotterSocket string
 
-	// Process management
-	containerdPID  int
-	snapshotterPID int
+	// Process management. The exited channels are closed by a monitoring
+	// goroutine when the corresponding process is reaped, allowing startup
+	// to fail fast if a process dies before its socket appears.
+	containerdCmd     *exec.Cmd
+	snapshotterCmd    *exec.Cmd
+	containerdExited  chan struct{}
+	snapshotterExited chan struct{}
 
 	// Log files (closed on Stop)
 	containerdLog  *os.File
@@ -579,12 +584,19 @@ func (e *Environment) startSnapshotter() error {
 		return fmt.Errorf("start snapshotter: %w", err)
 	}
 
-	e.snapshotterPID = cmd.Process.Pid
-	e.snapshotterLog = logFile
-	e.t.Logf("snapshotter started (PID: %d)", e.snapshotterPID)
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
 
-	// Wait for socket
-	if err := waitForSocket(e.snapshotterSocket, serviceStartTimeout); err != nil {
+	e.snapshotterCmd = cmd
+	e.snapshotterExited = exited
+	e.snapshotterLog = logFile
+	e.t.Logf("snapshotter started (PID: %d)", cmd.Process.Pid)
+
+	// Wait for socket, failing fast if the process dies during startup
+	if err := waitForSocketOrExit(e.snapshotterSocket, exited, cmd, serviceStartTimeout); err != nil {
 		e.dumpLogs("snapshotter")
 		return fmt.Errorf("wait for snapshotter socket: %w", err)
 	}
@@ -614,12 +626,19 @@ func (e *Environment) startContainerd() error {
 		return fmt.Errorf("start containerd: %w", err)
 	}
 
-	e.containerdPID = cmd.Process.Pid
-	e.containerdLog = logFile
-	e.t.Logf("containerd started (PID: %d)", e.containerdPID)
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
 
-	// Wait for socket
-	if err := waitForSocket(e.containerdSocket, serviceStartTimeout); err != nil {
+	e.containerdCmd = cmd
+	e.containerdExited = exited
+	e.containerdLog = logFile
+	e.t.Logf("containerd started (PID: %d)", cmd.Process.Pid)
+
+	// Wait for socket, failing fast if the process dies during startup
+	if err := waitForSocketOrExit(e.containerdSocket, exited, cmd, serviceStartTimeout); err != nil {
 		e.dumpLogs("containerd")
 		return fmt.Errorf("wait for containerd socket: %w", err)
 	}
@@ -654,42 +673,35 @@ func (e *Environment) connect() error {
 	}
 }
 
-// stopProcess gracefully stops a process by PID with a timeout.
-func stopProcess(pid *int, timeout time.Duration) {
-	if *pid == 0 {
+// stopProcess gracefully stops a process with a timeout, waiting for the
+// monitoring goroutine started alongside cmd.Start to confirm the process
+// has been reaped.
+func stopProcess(cmd *exec.Cmd, exited <-chan struct{}, timeout time.Duration) {
+	if cmd == nil || cmd.Process == nil {
 		return
 	}
 
-	proc, err := os.FindProcess(*pid)
-	if err != nil {
-		*pid = 0
-		return
-	}
-
-	_ = proc.Signal(syscall.SIGTERM)
-	done := make(chan struct{})
-	go func() {
-		_, _ = proc.Wait()
-		close(done)
-	}()
+	_ = cmd.Process.Signal(syscall.SIGTERM)
 
 	select {
-	case <-done:
+	case <-exited:
 	case <-time.After(timeout):
-		_ = proc.Kill()
+		_ = cmd.Process.Kill()
+		// Confirm the process was reaped after Kill
+		<-exited
 	}
-
-	*pid = 0
 }
 
 // stopContainerd stops the containerd process.
 func (e *Environment) stopContainerd() {
-	stopProcess(&e.containerdPID, 5*time.Second)
+	stopProcess(e.containerdCmd, e.containerdExited, 5*time.Second)
+	e.containerdCmd = nil
 }
 
 // stopSnapshotter stops the snapshotter process.
 func (e *Environment) stopSnapshotter() {
-	stopProcess(&e.snapshotterPID, 5*time.Second)
+	stopProcess(e.snapshotterCmd, e.snapshotterExited, 5*time.Second)
+	e.snapshotterCmd = nil
 }
 
 // dumpLogs prints the last N lines of a service log.
@@ -736,12 +748,22 @@ func findBinary(name string) (string, error) {
 	return "", fmt.Errorf("binary not found: %s", name)
 }
 
-// waitForSocket waits for a Unix socket to become available.
-func waitForSocket(path string, timeout time.Duration) error {
-	return waitFor(func() bool {
-		_, err := os.Stat(path)
-		return err == nil
-	}, timeout, fmt.Sprintf("socket not available: %s", path))
+// waitForSocketOrExit waits for a Unix socket to become available, failing
+// fast if the owning process exits before the socket appears.
+func waitForSocketOrExit(path string, exited <-chan struct{}, cmd *exec.Cmd, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-exited:
+			return fmt.Errorf("process exited before socket %s was ready: %v", path, cmd.ProcessState)
+		default:
+		}
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("socket not available: %s", path)
 }
 
 // waitFor polls a condition function until it returns true or timeout.
@@ -756,24 +778,33 @@ func waitFor(condition func() bool, timeout time.Duration, errMsg string) error 
 	return errors.New(errMsg)
 }
 
-// pullImage pulls an image with retry logic.
+// pullImage pulls an image with retry logic. Each attempt gets its own
+// timeout so a slow first attempt does not starve the retries, and the
+// loop aborts early if the parent context is canceled.
 func pullImage(ctx context.Context, c *client.Client, ref string) error {
-	ctx, cancel := context.WithTimeout(ctx, imagePullTimeout)
-	defer cancel()
-
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		_, err := c.Pull(ctx, ref,
+		attemptCtx, cancel := context.WithTimeout(ctx, imagePullTimeout)
+		_, err := c.Pull(attemptCtx, ref,
 			client.WithPlatform("linux/amd64"),
 			client.WithPullUnpack,
 			client.WithPullSnapshotter(snapshotterName),
 		)
+		cancel()
 		if err == nil {
 			return nil
 		}
 		lastErr = err
+		if ctx.Err() != nil {
+			// Parent context canceled or expired: retrying is pointless.
+			return fmt.Errorf("pull image: %w", errors.Join(ctx.Err(), lastErr))
+		}
 		if attempt < 3 {
-			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("pull image: %w", errors.Join(ctx.Err(), lastErr))
+			case <-time.After(time.Duration(attempt) * 2 * time.Second):
+			}
 		}
 	}
 	return fmt.Errorf("pull image after 3 attempts: %w", lastErr)
@@ -1223,7 +1254,7 @@ func testRwlayerCreation(t *testing.T, env *Environment) {
 	parentKey := assert.FindCommittedSnapshot(ctx)
 
 	snapKey := fmt.Sprintf("test-rwlayer-%d", time.Now().UnixNano())
-	_, err := ss.Prepare(ctx, snapKey, parentKey)
+	mounts, err := ss.Prepare(ctx, snapKey, parentKey)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
@@ -1231,10 +1262,20 @@ func testRwlayerCreation(t *testing.T, env *Environment) {
 		ss.Remove(ctx, snapKey) //nolint:errcheck
 	})
 
-	// Verify rwlayer.img was created
-	snapshotsDir := filepath.Join(env.SnapshotterRoot(), "snapshots")
-	rwlayers := assert.DirContains(snapshotsDir, "rwlayer.img")
-	t.Logf("found %d rwlayer.img files", len(rwlayers))
+	// Verify rwlayer.img was created for this specific snapshot: Prepare must
+	// return an ext4 mount whose source (the snapshot's rwlayer.img) exists.
+	var rwlayerPath string
+	for _, m := range mounts {
+		if m.Type == "ext4" {
+			rwlayerPath = m.Source
+			break
+		}
+	}
+	if rwlayerPath == "" {
+		t.Fatal("no ext4 mount returned - Prepare() should return ext4 writable layer")
+	}
+	assert.FileExists(rwlayerPath)
+	t.Logf("rwlayer created: %s", rwlayerPath)
 }
 
 // testCommit verifies snapshot commit creates EROFS layers.
@@ -1252,6 +1293,12 @@ func testCommit(t *testing.T, env *Environment) {
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
+	// Remove the active snapshot if Commit fails so it does not leak into
+	// later subtests; after a successful Commit the key no longer exists
+	// and Remove just returns an error that is ignored.
+	t.Cleanup(func() {
+		ss.Remove(ctx, extractKey) //nolint:errcheck
+	})
 
 	// Commit it
 	commitKey := fmt.Sprintf("committed-test-%d", ts)
@@ -1320,13 +1367,20 @@ func testMultiLayer(t *testing.T, env *Environment) {
 
 	// Create a view to trigger VMDK generation
 	viewKey := fmt.Sprintf("test-multi-view-%d", time.Now().UnixNano())
-	_, err := ss.View(ctx, viewKey, topSnap)
+	viewMounts, err := ss.View(ctx, viewKey, topSnap)
 	if err != nil {
 		t.Fatalf("create view: %v", err)
 	}
 	t.Cleanup(func() {
 		ss.Remove(ctx, viewKey) //nolint:errcheck
 	})
+
+	// VM-only contract: the snapshotter must never return overlay mounts.
+	for _, m := range viewMounts {
+		if m.Type == "overlay" {
+			t.Errorf("view returned forbidden overlay mount (source=%s)", m.Source)
+		}
+	}
 
 	// Wait for a multi-layer VMDK to be generated (fsmeta generation is async).
 	// The single-layer alpine image may already have a VMDK, so we need to wait
@@ -1346,6 +1400,58 @@ func testMultiLayer(t *testing.T, env *Environment) {
 	}
 
 	t.Logf("found multi-layer VMDK: %s (%d layers)", multiLayerVMDK, layerCount)
+
+	// fsmeta generation is async: once it completes, Mounts() on the
+	// multi-layer view must honor the format/erofs multi-device contract.
+	err = waitFor(func() bool {
+		viewMounts, err = ss.Mounts(ctx, viewKey)
+		if err != nil {
+			return false
+		}
+		return len(viewMounts) == 1 && viewMounts[0].Type == "format/erofs"
+	}, 15*time.Second, "waiting for format/erofs view mounts")
+	if err != nil {
+		t.Fatalf("multi-layer view never returned a format/erofs mount (last mounts: %+v)", viewMounts)
+	}
+
+	verifyFsMetaViewMount(t, viewMounts[0])
+}
+
+// verifyFsMetaViewMount asserts the mount contract for multi-layer views
+// (see CLAUDE.md): a single format/erofs mount on fsmeta.erofs with one
+// device= option per layer in oldest-first order matching layers.manifest.
+func verifyFsMetaViewMount(t *testing.T, m mount.Mount) {
+	t.Helper()
+
+	if m.Type != "format/erofs" {
+		t.Fatalf("multi-layer view mount type = %q, want %q", m.Type, "format/erofs")
+	}
+	if filepath.Base(m.Source) != fsmetaFile {
+		t.Errorf("multi-layer view mount source = %s, want %s", m.Source, fsmetaFile)
+	}
+
+	var deviceDigests []string
+	for _, opt := range m.Options {
+		if strings.HasPrefix(opt, "device=") {
+			deviceDigests = append(deviceDigests, extractDigest(opt))
+		}
+	}
+	if len(deviceDigests) < 2 {
+		t.Fatalf("expected at least 2 device= options for multi-layer view, got %d (options: %v)",
+			len(deviceDigests), m.Options)
+	}
+
+	// device= options must be in oldest-first order, matching layers.manifest.
+	manifestPath := filepath.Join(filepath.Dir(m.Source), "layers.manifest")
+	manifestDigests, err := readLayersManifest(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest %s: %v", manifestPath, err)
+	}
+	if err := compareLayerOrder(t, deviceDigests, manifestDigests); err != nil {
+		t.Errorf("device= options do not match manifest order: %v", err)
+	}
+
+	t.Logf("verified: format/erofs mount with %d device= options in manifest order", len(deviceDigests))
 }
 
 // testVMDKFormat verifies VMDK descriptor format is valid.
@@ -1415,7 +1521,8 @@ func testVMDKLayerOrder(t *testing.T, env *Environment) {
 	for i := 0; i < len(vmdkDigests) && i < len(manifestDigests); i++ {
 		if vmdkDigests[i] != manifestDigests[i] {
 			t.Errorf("layer order mismatch at position %d: VMDK=%s, manifest=%s",
-				i, vmdkDigests[i][:12], manifestDigests[i][:12])
+				i, vmdkDigests[i][:min(12, len(vmdkDigests[i]))],
+				manifestDigests[i][:min(12, len(manifestDigests[i]))])
 		}
 	}
 
@@ -1506,24 +1613,33 @@ func testCommitLifecycle(t *testing.T, env *Environment) {
 	if err := mountExt4(rwlayerPath, mountPoint); err != nil {
 		t.Fatalf("mount ext4: %v", err)
 	}
+	// Ensure the loop mount is released even if the test fails before the
+	// explicit unmount; unmounting an already-unmounted path just returns
+	// an ignorable error.
+	t.Cleanup(func() {
+		unmountExt4(mountPoint) //nolint:errcheck
+	})
 
 	// Write test data
 	upperDir := filepath.Join(mountPoint, "upper")
 	if err := os.MkdirAll(upperDir, 0o755); err != nil {
-		unmountExt4(mountPoint) //nolint:errcheck
 		t.Fatalf("create upper dir: %v", err)
 	}
 
 	testFile := filepath.Join(upperDir, "lifecycle-test.bin")
 	testData := bytes.Repeat([]byte("x"), 1024*1024) // 1MB
 	if err := os.WriteFile(testFile, testData, 0o644); err != nil {
-		unmountExt4(mountPoint) //nolint:errcheck
 		t.Fatalf("write test file: %v", err)
 	}
 
 	if err := unmountExt4(mountPoint); err != nil {
 		t.Fatalf("unmount ext4: %v", err)
 	}
+
+	// Record existing layer blobs so the blob produced by this commit can
+	// be identified afterwards.
+	snapshotsDir := filepath.Join(env.SnapshotterRoot(), "snapshots")
+	blobsBefore := listLayerBlobs(t, snapshotsDir)
 
 	// Commit
 	commitKey := fmt.Sprintf("lifecycle-commit-%d", ts)
@@ -1536,7 +1652,53 @@ func testCommitLifecycle(t *testing.T, env *Environment) {
 
 	// Verify committed snapshot
 	assert.SnapshotExists(ctx, commitKey, snapshots.KindCommitted)
+
+	// Verify the written data actually reached the committed layer: the
+	// commit must have produced a new EROFS blob with valid magic that is
+	// at least as large as the 1MB we wrote (commit layers are uncompressed).
+	var newBlobs []string
+	for blob := range listLayerBlobs(t, snapshotsDir) {
+		if !blobsBefore[blob] {
+			newBlobs = append(newBlobs, blob)
+		}
+	}
+	if len(newBlobs) == 0 {
+		t.Fatal("commit did not create a new EROFS layer blob")
+	}
+	var largeEnough bool
+	for _, blob := range newBlobs {
+		assert.ErofsValid(blob)
+		if info := assert.FileExists(blob); info.Size() >= int64(len(testData)) {
+			largeEnough = true
+		}
+	}
+	if !largeEnough {
+		t.Errorf("no committed EROFS blob is large enough to contain the %d bytes written (blobs: %v)",
+			len(testData), newBlobs)
+	}
+
 	t.Log("commit lifecycle test passed")
+}
+
+// listLayerBlobs returns the set of EROFS layer blob files under dir,
+// excluding fsmeta.erofs (which is generated asynchronously and not the
+// product of a commit).
+func listLayerBlobs(t *testing.T, dir string) map[string]bool {
+	t.Helper()
+
+	blobs := make(map[string]bool)
+	if err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil //nolint:nilerr // skip inaccessible files
+		}
+		if !info.IsDir() && strings.HasSuffix(path, ".erofs") && filepath.Base(path) != fsmetaFile {
+			blobs[path] = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk %q: %v", dir, err)
+	}
+	return blobs
 }
 
 // mountExt4 mounts an ext4 image at the given path.
@@ -1573,21 +1735,27 @@ func testFullCleanup(t *testing.T, env *Environment) {
 	}
 
 	for _, img := range imgs {
-		if err := imgService.Delete(ctx, img.Name); err != nil {
+		// SynchronousDelete makes containerd wait for garbage collection,
+		// so snapshot cleanup is not racing against the checks below.
+		if err := imgService.Delete(ctx, img.Name, images.SynchronousDelete()); err != nil {
 			t.Logf("delete image %s: %v", img.Name, err)
 		}
 	}
 
 	// Wait for containerd to clean up snapshots automatically
 	var remaining []snapshots.Info
+	var walkErr error
 	_ = waitFor(func() bool {
 		remaining = nil
-		ss.Walk(ctx, func(_ context.Context, info snapshots.Info) error { //nolint:errcheck
+		walkErr = ss.Walk(ctx, func(_ context.Context, info snapshots.Info) error {
 			remaining = append(remaining, info)
 			return nil
 		})
-		return len(remaining) == 0
+		return walkErr == nil && len(remaining) == 0
 	}, 5*time.Second, "snapshots not cleaned up")
+	if walkErr != nil {
+		t.Fatalf("walk snapshots: %v", walkErr)
+	}
 
 	// Report any leaked snapshots (don't try to remove them - that would mask bugs)
 	if len(remaining) > 0 {
@@ -1600,7 +1768,10 @@ func testFullCleanup(t *testing.T, env *Environment) {
 	// Check for leaked files
 	snapshotsDir := filepath.Join(env.SnapshotterRoot(), "snapshots")
 	if info, err := os.Stat(snapshotsDir); err == nil && info.IsDir() {
-		entries, _ := os.ReadDir(snapshotsDir)
+		entries, err := os.ReadDir(snapshotsDir)
+		if err != nil {
+			t.Fatalf("read snapshots dir %s: %v", snapshotsDir, err)
+		}
 		if len(entries) > 0 {
 			t.Errorf("%d leaked files in snapshots directory: %s", len(entries), snapshotsDir)
 			for _, e := range entries {

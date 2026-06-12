@@ -19,6 +19,7 @@ package snapshotter
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -298,6 +299,14 @@ func TestMountFsMetaDeviceOrder(t *testing.T) {
 	// Expected device order after backward iteration: [parent1, parent2, parent3] (oldest to newest)
 	parentIDs := []string{"parent3", "parent2", "parent1"}
 
+	// Layer blobs use real digest-based names (sha256-<64 hex chars>.erofs),
+	// matching what the EROFS differ writes.
+	digests := map[string]string{
+		"parent1": strings.Repeat("a1", 32),
+		"parent2": strings.Repeat("b2", 32),
+		"parent3": strings.Repeat("c3", 32),
+	}
+
 	// Create layer blobs for each parent
 	layerPaths := make(map[string]string)
 	for _, pid := range parentIDs {
@@ -305,8 +314,7 @@ func TestMountFsMetaDeviceOrder(t *testing.T) {
 		if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		// Use digest-based layer names (64 hex chars required)
-		layerPath := filepath.Join(snapshotDir, "sha256-"+pid+pid+pid+pid+pid+pid+pid+pid+".erofs")
+		layerPath := filepath.Join(snapshotDir, "sha256-"+digests[pid]+".erofs")
 		if err := os.WriteFile(layerPath, []byte("fake"), 0o644); err != nil {
 			t.Fatal(err)
 		}
