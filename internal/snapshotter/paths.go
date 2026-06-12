@@ -112,6 +112,13 @@ func (s *snapshotter) fsMetaPath(id string) string {
 	return filepath.Join(s.root, snapshotsDirName, id, fsmetaFilename)
 }
 
+// fsmetaIncompatPath returns the path of the marker recording that the chain
+// rooted at this snapshot is permanently incompatible with fsmeta merge
+// (block sizes never change), so generation isn't retried on every Prepare.
+func (s *snapshotter) fsmetaIncompatPath(id string) string {
+	return filepath.Join(s.root, snapshotsDirName, id, fsmetaFilename+".incompat")
+}
+
 // vmdkPath returns the path to the VMDK descriptor file.
 func (s *snapshotter) vmdkPath(id string) string {
 	return filepath.Join(s.root, snapshotsDirName, id, vmdkFilename)

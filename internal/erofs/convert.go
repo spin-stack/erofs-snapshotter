@@ -140,8 +140,10 @@ func ConvertTarErofs(ctx context.Context, r io.Reader, layerPath, uuid string, m
 // for the tar content. The resulting file structure is:
 // [Tar index][Original tar content]
 func GenerateTarIndexAndAppendTar(ctx context.Context, r io.Reader, layerPath string, mkfsExtraOpts []string) error {
-	// Create a temporary file for storing the tar content
-	tarFile, err := os.CreateTemp("", "erofs-tar-*")
+	// Buffer the tar next to the layer (not os.TempDir, which is often a
+	// size-limited tmpfs): the whole tar is staged here and image layers can
+	// be multiple GiB.
+	tarFile, err := os.CreateTemp(filepath.Dir(layerPath), "erofs-tar-*")
 	if err != nil {
 		return fmt.Errorf("create temporary tar file: %w", err)
 	}

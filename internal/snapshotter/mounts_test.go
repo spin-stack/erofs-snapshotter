@@ -383,21 +383,29 @@ func TestWaitForFsmeta(t *testing.T) {
 		}
 	})
 
-	t.Run("times out when fsmeta never appears", func(t *testing.T) {
+	t.Run("returns quickly when no generation is running", func(t *testing.T) {
 		s := newSnap(t)
-		if s.waitForFsmeta("parent", 300*time.Millisecond) {
+		start := time.Now()
+		if s.waitForFsmeta("parent", 5*time.Second) {
 			t.Fatal("waitForFsmeta = true, want false when fsmeta never appears")
+		}
+		// Without a lock holder the miss is permanent: it must not burn the
+		// full timeout.
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("waitForFsmeta took %v, expected early exit with no generation in flight", elapsed)
 		}
 	})
 
-	t.Run("waits while generation lock present then times out", func(t *testing.T) {
+	t.Run("waits while generation lock is held then times out", func(t *testing.T) {
 		s := newSnap(t)
-		if err := os.WriteFile(s.fsMetaPath("parent")+".lock", nil, 0o644); err != nil {
-			t.Fatal(err)
+		lock, err := s.acquireFsmetaLock("parent")
+		if err != nil || lock == nil {
+			t.Fatalf("acquireFsmetaLock: lock=%v err=%v", lock, err)
 		}
+		defer lock.release()
 		start := time.Now()
 		if s.waitForFsmeta("parent", 300*time.Millisecond) {
-			t.Fatal("waitForFsmeta = true, want false (lock present, fsmeta never written)")
+			t.Fatal("waitForFsmeta = true, want false (lock held, fsmeta never written)")
 		}
 		if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
 			t.Fatalf("waitForFsmeta returned after %v, expected it to wait for the timeout", elapsed)
@@ -406,9 +414,14 @@ func TestWaitForFsmeta(t *testing.T) {
 
 	t.Run("picks up fsmeta written mid-wait", func(t *testing.T) {
 		s := newSnap(t)
+		lock, err := s.acquireFsmetaLock("parent")
+		if err != nil || lock == nil {
+			t.Fatalf("acquireFsmetaLock: lock=%v err=%v", lock, err)
+		}
 		go func() {
 			time.Sleep(150 * time.Millisecond)
 			_ = os.WriteFile(s.fsMetaPath("parent"), []byte("fsmeta"), 0o644)
+			lock.release()
 		}()
 		if !s.waitForFsmeta("parent", 5*time.Second) {
 			t.Fatal("waitForFsmeta = false, want true once fsmeta appears")

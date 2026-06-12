@@ -69,7 +69,11 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 		}, nil
 	}
 
-	// Handle EROFS multi-device mount
+	// Handle EROFS multi-device mount. It must be the only mount: silently
+	// ignoring siblings would mount a subset of what the caller asked for.
+	if len(mounts) > 1 {
+		return nopCleanup, fmt.Errorf("EROFS multi-device mount must be the only mount, got %d mounts", len(mounts))
+	}
 	erofsMount := mounts[erofsIdx]
 
 	// Separate device= options from other options

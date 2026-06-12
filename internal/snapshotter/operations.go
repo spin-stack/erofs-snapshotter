@@ -153,18 +153,35 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 }
 
 // spawnFsmetaGeneration starts background fsmeta/VMDK generation for the
-// given parent chain (newest-first). Concurrency is bounded by bgSem and the
-// goroutine derives from the service-lifetime context (not the request
-// context) so generation survives request cancellation but is aborted on
-// Close.
+// given parent chain (newest-first). The fsmeta flock is acquired
+// SYNCHRONOUSLY (a cheap non-blocking open+flock) so that by the time this
+// returns, fsmetaGenerationInProgress already reports true - mount
+// resolution can rely on it without racing the goroutine spawn. Concurrency
+// is bounded by bgSem and the goroutine derives from the service-lifetime
+// context (not the request context) so generation survives request
+// cancellation but is aborted on Close.
 func (s *snapshotter) spawnFsmetaGeneration(parentIDs []string) {
+	// Skip chains known to be permanently incompatible with fsmeta merge:
+	// re-checking on every Prepare would re-read every blob superblock and
+	// re-emit the same warning forever.
+	if _, err := os.Stat(s.fsmetaIncompatPath(parentIDs[0])); err == nil {
+		return
+	}
+
+	lock, err := s.acquireFsmetaLock(parentIDs[0])
+	if err != nil {
+		log.L.WithError(err).WithField("parent", parentIDs[0]).Warn("fsmeta generation skipped: cannot acquire lock")
+		return
+	}
+	if lock == nil {
+		// Already generated, or another generation is in flight.
+		return
+	}
+
 	s.bgWg.Add(1)
 	go func(ids []string) {
 		defer s.bgWg.Done()
-		// Skip cheaply if another generation already produced the fsmeta.
-		if _, err := os.Stat(s.fsMetaPath(ids[0])); err == nil {
-			return
-		}
+		defer lock.release()
 		// Bound concurrent mkfs.erofs runs; bail out if the snapshotter is
 		// shutting down while we wait for a slot.
 		select {
@@ -300,6 +317,14 @@ func (s *snapshotter) cleanupAfterRemove(ctx context.Context, id string, removal
 	}
 
 	for _, dir := range removals {
+		// Orphaned directories may carry stale rw mounts and immutable
+		// blobs of their own; handle both like Cleanup does, otherwise
+		// RemoveAll fails with EPERM/EBUSY and the directory leaks.
+		if err := unmountAll(filepath.Join(dir, rwDirName)); err != nil {
+			log.G(ctx).WithError(err).WithField("path", dir).Debug("failed to cleanup block rw mount")
+		}
+		clearImmutableFlags(ctx, dir)
+
 		if err := os.RemoveAll(dir); err != nil {
 			log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to remove directory")
 		}

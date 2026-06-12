@@ -22,48 +22,25 @@ const fsmetaWaitTimeout = 30 * time.Second
 
 // waitForFsmeta polls for the merged fsmeta of the chain rooted at parentID,
 // returning true once fsmeta.erofs exists. It keeps waiting while a
-// generation appears to be running and gives up early once it is clear none
-// is. The grace period covers the window between createSnapshot spawning the
-// generation goroutine and the goroutine creating the lock file.
+// generation holds the fsmeta lock (spawnFsmetaGeneration acquires it
+// synchronously before createSnapshot returns, so there is no spawn window)
+// and gives up immediately once no generation is running: that miss is
+// permanent (e.g. incompatible layers) and waiting longer cannot help.
 func (s *snapshotter) waitForFsmeta(parentID string, timeout time.Duration) bool {
-	const (
-		pollInterval = 100 * time.Millisecond
-		spawnGrace   = 2 * time.Second
-	)
+	const pollInterval = 100 * time.Millisecond
 	deadline := time.Now().Add(timeout)
-	graceEnd := time.Now().Add(spawnGrace)
 	for {
 		if _, err := os.Stat(s.fsMetaPath(parentID)); err == nil {
 			return true
 		}
-		now := time.Now()
-		if now.After(deadline) {
+		if time.Now().After(deadline) {
 			return false
 		}
-		if now.After(graceEnd) && !s.fsmetaGenerationInProgress(parentID) {
-			// No generation running and none about to start: the miss is
-			// permanent (e.g. incompatible layers), so don't burn the rest
-			// of the timeout.
+		if !s.fsmetaGenerationInProgress(parentID) {
 			return false
 		}
 		time.Sleep(pollInterval)
 	}
-}
-
-// fsmetaGenerationInProgress reports whether async fsmeta generation is still
-// running (or crashed mid-write) for the given parent snapshot. The lock and
-// .tmp files are written by generateFsMeta in commit.go.
-func (s *snapshotter) fsmetaGenerationInProgress(parentID string) bool {
-	fsmetaFile := s.fsMetaPath(parentID)
-	for _, suffix := range []string{".lock", ".tmp"} {
-		if _, err := os.Stat(fsmetaFile + suffix); err == nil {
-			return true
-		}
-	}
-	if _, err := os.Stat(s.vmdkPath(parentID) + ".tmp"); err == nil {
-		return true
-	}
-	return false
 }
 
 // mountFsMeta returns a mount for merged fsmeta.erofs if VMDK exists.
