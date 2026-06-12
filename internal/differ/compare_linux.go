@@ -190,28 +190,17 @@ func (s *ErofsDiff) writeAndCommitDiff(ctx context.Context, config diff.Config, 
 		}
 	}
 
-	if compressionType != compression.Uncompressed {
-		uncompressedDigest, werr := writeCompressedDiff(ctx, cw, config, compressionType, writeFn)
-		if werr != nil {
-			errOpen = werr
-			return ocispec.Descriptor{}, werr
-		}
-		if config.Labels == nil {
-			config.Labels = map[string]string{}
-		}
-		config.Labels[labels.LabelUncompressed] = uncompressedDigest
-	} else {
-		if errOpen = writeFn(ctx, cw); errOpen != nil {
-			return ocispec.Descriptor{}, fmt.Errorf("failed to write diff: %w", errOpen)
-		}
+	if errOpen = writeDiffPayload(ctx, cw, &config, compressionType, writeFn); errOpen != nil {
+		return ocispec.Descriptor{}, errOpen
 	}
+
+	dgst := cw.Digest()
 
 	var commitopts []content.Opt
 	if config.Labels != nil {
 		commitopts = append(commitopts, content.WithLabels(config.Labels))
 	}
 
-	dgst := cw.Digest()
 	if errOpen = cw.Commit(ctx, 0, dgst, commitopts...); errOpen != nil {
 		if !errdefs.IsAlreadyExists(errOpen) {
 			return ocispec.Descriptor{}, fmt.Errorf("failed to commit: %w", errOpen)
@@ -236,6 +225,35 @@ func (s *ErofsDiff) writeAndCommitDiff(ctx context.Context, config diff.Config, 
 		Size:      info.Size,
 		Digest:    info.Digest,
 	}, nil
+}
+
+// writeDiffPayload streams the diff through cw (compressing when requested)
+// and records the uncompressed digest (the layer's diff ID) in
+// config.Labels: the compressed path digests the plain stream on the fly,
+// while for uncompressed layers the blob digest IS the diff ID. Consumers
+// (e.g. image commit flows) read the diff ID from this label uniformly
+// regardless of compression.
+func writeDiffPayload(ctx context.Context, cw content.Writer, config *diff.Config, compressionType compression.Compression, writeFn diffWriteFunc) error {
+	if config.Labels == nil {
+		config.Labels = map[string]string{}
+	}
+
+	if compressionType != compression.Uncompressed {
+		uncompressedDigest, err := writeCompressedDiff(ctx, cw, *config, compressionType, writeFn)
+		if err != nil {
+			return err
+		}
+		config.Labels[labels.LabelUncompressed] = uncompressedDigest
+		return nil
+	}
+
+	if err := writeFn(ctx, cw); err != nil {
+		return fmt.Errorf("failed to write diff: %w", err)
+	}
+	if config.Labels[labels.LabelUncompressed] == "" {
+		config.Labels[labels.LabelUncompressed] = cw.Digest().String()
+	}
+	return nil
 }
 
 // withLowerMount resolves lower mounts and calls f with the resulting root path.
@@ -299,6 +317,13 @@ func withUpperMount(ctx context.Context, upper []mount.Mount, mm mount.Manager, 
 	// Handle active snapshot mounts (EROFS + ext4) - create overlay on host
 	if mountutils.HasActiveSnapshotMounts(upper) {
 		return withActiveSnapshotMount(ctx, upper, f)
+	}
+
+	// A 0-parent active snapshot is a bare ext4 writable layer. The diff
+	// root is the guest's upper/ inside it - never the raw ext4 root, which
+	// contains lost+found/ and work/ as literal entries.
+	if len(upper) == 1 && mountutils.TypeSuffix(upper[0].Type) == "ext4" {
+		return withExt4UpperMount(ctx, &upper[0], f)
 	}
 
 	// Multiple individual EROFS layers (fsmeta not ready yet): mount each in
@@ -461,6 +486,81 @@ func withStackedErofsTempMount(ctx context.Context, mounts []mount.Mount, f func
 	return f(overlayDir)
 }
 
+// warnUnexpectedExt4Entries logs entries at the ext4 root that fall outside
+// the guest overlay contract (upper/, work/, lost+found): anything written
+// there is invisible to diff/commit, which is almost certainly a bug in the
+// guest setup.
+func warnUnexpectedExt4Entries(ctx context.Context, ext4Root string) {
+	entries, err := os.ReadDir(ext4Root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		switch e.Name() {
+		case "upper", "work", "lost+found":
+		default:
+			log.G(ctx).WithField("entry", e.Name()).Warn("unexpected entry at ext4 root: content outside upper/ is invisible to diff/commit")
+		}
+	}
+}
+
+// withExt4UpperMount handles an active snapshot with no parents: a bare ext4
+// writable layer. The ext4 is mounted read-only (image lock held until
+// cleanup) and f receives its upper/ directory - the guest overlay contract
+// puts all changes there. When upper/ does not exist the container made no
+// changes and f receives an empty directory.
+func withExt4UpperMount(ctx context.Context, ext4Mount *mount.Mount, f func(root string) error) error {
+	tempBase, err := os.MkdirTemp("", "erofs-ext4-upper-")
+	if err != nil {
+		return fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	// Remove the temp tree only if the unmount succeeded (see
+	// withActiveSnapshotMount).
+	unmountFailed := false
+	defer func() {
+		if unmountFailed {
+			log.G(ctx).WithField("dir", tempBase).Warn("leaving temp dir in place: unmount failed and removal could destroy mounted snapshot data")
+			return
+		}
+		if rerr := os.RemoveAll(tempBase); rerr != nil {
+			log.G(ctx).WithError(rerr).WithField("dir", tempBase).Warn("failed to remove temp dir")
+		}
+	}()
+
+	ext4Dir := filepath.Join(tempBase, "ext4")
+	if err := os.MkdirAll(ext4Dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create dir %s: %w", ext4Dir, err)
+	}
+
+	ext4Cleanup, err := mountutils.MountExt4(ext4Mount.Source, ext4Dir)
+	if err != nil {
+		return fmt.Errorf("failed to mount ext4: %w", err)
+	}
+	defer func() {
+		if cerr := ext4Cleanup(); cerr != nil {
+			unmountFailed = true
+			log.G(ctx).WithError(cerr).Warn("failed to cleanup ext4 mount")
+		}
+	}()
+
+	warnUnexpectedExt4Entries(ctx, ext4Dir)
+
+	upperDir := filepath.Join(ext4Dir, "upper")
+	if _, err := os.Stat(upperDir); err != nil {
+		// No upper/ layout: the container made no changes. Diff against an
+		// empty directory (the ext4 is read-only, so it cannot be created
+		// in place).
+		log.G(ctx).Debug("ext4 upper directory doesn't exist, using empty diff root")
+		emptyDir := filepath.Join(tempBase, "empty")
+		if err := os.MkdirAll(emptyDir, 0o755); err != nil {
+			return fmt.Errorf("failed to create empty dir: %w", err)
+		}
+		return f(emptyDir)
+	}
+
+	return f(upperDir)
+}
+
 // withActiveSnapshotMount handles active snapshot mounts (EROFS + ext4) by
 // creating a read-only overlay on the host: the guest's upper directory inside
 // the ext4 is stacked as the top lower layer over the EROFS layers, so its
@@ -536,6 +636,8 @@ func withActiveSnapshotMount(ctx context.Context, mounts []mount.Mount, f func(r
 			log.G(ctx).WithError(cerr).Warn("failed to cleanup ext4 mount")
 		}
 	}()
+
+	warnUnexpectedExt4Entries(ctx, ext4Dir)
 
 	// The guest creates /upper and /work at the ext4 root (same layout that
 	// mountBlockRwLayer prepares for extract snapshots).
