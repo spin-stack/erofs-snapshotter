@@ -2,10 +2,12 @@
 package loop
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -76,7 +78,10 @@ func Setup(backingFile string, cfg Config) (*Device, error) {
 		unix.Close(loopFd)
 
 		if errno == unix.EBUSY && attempt < maxRetries-1 {
-			// Device was grabbed by another process, try again
+			// Device was grabbed by another process. Back off briefly
+			// before retrying: under loop-device contention an immediate
+			// LOOP_CTL_GET_FREE tends to return the same contended device.
+			time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 			continue
 		}
 
@@ -137,7 +142,9 @@ func (d *Device) GetSerial() string {
 	if err != nil {
 		return ""
 	}
-	return string(data)
+	// sysfs attributes end with a newline; FindBySerial already strips it,
+	// so GetSerial must too or the two never compare equal.
+	return strings.TrimSuffix(string(data), "\n")
 }
 
 // GetInfo retrieves the current status of the loop device.
@@ -323,7 +330,9 @@ func FindBySerialPrefix(prefix string) ([]*Device, error) {
 }
 
 // CleanupBySerialPrefix detaches all loop devices with serial numbers matching the given prefix.
-// Returns the number of devices detached and any error encountered.
+// Returns the number of devices detached and any errors encountered. A failed
+// detach does not stop the sweep: remaining devices are still detached and
+// the failures are reported joined.
 // This is useful for cleaning up orphaned test devices.
 func CleanupBySerialPrefix(prefix string) (int, error) {
 	devices, err := FindBySerialPrefix(prefix)
@@ -332,12 +341,14 @@ func CleanupBySerialPrefix(prefix string) (int, error) {
 	}
 
 	detached := 0
+	var errs []error
 	for _, dev := range devices {
 		if err := dev.Detach(); err != nil {
-			return detached, fmt.Errorf("failed to detach %s: %w", dev.Path, err)
+			errs = append(errs, fmt.Errorf("failed to detach %s: %w", dev.Path, err))
+			continue
 		}
 		detached++
 	}
 
-	return detached, nil
+	return detached, errors.Join(errs...)
 }
