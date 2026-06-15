@@ -1568,7 +1568,13 @@ func parseVMDKLayers(path string) ([]string, error) {
 	return layers, scanner.Err()
 }
 
-// readLayersManifest reads digests from a layers.manifest file.
+// readLayersManifest reads the content digests from a layers.manifest file.
+//
+// The manifest has one line per layer in oldest-first order: "sha256:<hex>"
+// for content-addressed layers and "blob:<basename>" for fallback layers that
+// have no content digest. This reader returns only the sha256 digests; the
+// "blob:" placeholder lines exist so the file stays positionally 1:1 with the
+// device= options and are intentionally skipped here.
 func readLayersManifest(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
