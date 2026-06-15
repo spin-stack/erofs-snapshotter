@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
@@ -897,13 +898,25 @@ func populateExt4(t *testing.T, img string, fill func(root string)) {
 // the given backing files after the with*Mount helpers returned.
 func checkNoLoopDevice(t *testing.T, backingFiles ...string) {
 	t.Helper()
+	// The kernel releases loop devices asynchronously after LOOP_CLR_FD /
+	// autoclear, so a backing file may still resolve to a device for a short
+	// window after cleanup returns. Poll with a deadline, matching
+	// mountutils.verifyNoLoopDevice and loop.verifyDetached.
 	for _, f := range backingFiles {
-		dev, err := loop.FindByBackingFile(f)
-		if err != nil {
-			t.Fatalf("failed to look up loop device for %s: %v", f, err)
-		}
-		if dev != nil {
-			t.Errorf("loop device %s still attached to %s", dev.Path, f)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			dev, err := loop.FindByBackingFile(f)
+			if err != nil {
+				t.Fatalf("failed to look up loop device for %s: %v", f, err)
+			}
+			if dev == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("loop device %s still attached to %s", dev.Path, f)
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
