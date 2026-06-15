@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -12,7 +13,6 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/log"
-	"github.com/opencontainers/go-digest"
 
 	"github.com/spin-stack/erofs-snapshotter/internal/erofs"
 	"github.com/spin-stack/erofs-snapshotter/internal/mountutils"
@@ -315,30 +315,77 @@ func fixVmdkPaths(vmdkFile, oldPath, newPath string) error {
 	return nil
 }
 
-// writeLayerManifest writes layer digests to a manifest file in VMDK/OCI order.
-// Format: one digest per line (sha256:hex...), oldest/base layer first.
-// This is the authoritative source for VMDK layer order verification.
+// writeLayerManifest writes the layer manifest in VMDK/OCI order (oldest/base
+// layer first). This is the authoritative source for VMDK layer-order
+// verification, so it must be positionally 1:1 with the device= options the
+// mount returns (mountFsMeta): one line per layer blob, in the same order,
+// never dropping an entry.
+//
+// Format (one line per layer):
+//   - "sha256:<hex>" for content-addressed blobs (sha256-<hex>.erofs)
+//   - "blob:<basename>" for fallback blobs (snapshot-<id>.erofs) which have no
+//     content digest. Emitting a placeholder keeps the line count equal to the
+//     device= count so consumers can detect a desync or a truncated file
+//     instead of silently misaligning every layer after the fallback.
+//
+// The file is written atomically (temp + fsync + rename) so a crash mid-write
+// never leaves a truncated manifest, matching the fsmeta/VMDK write path.
 func (s *snapshotter) writeLayerManifest(manifestFile string, blobs []string) error {
-	var digests []digest.Digest
+	if len(blobs) == 0 {
+		return nil // Nothing to write
+	}
+
+	var b strings.Builder
 	for _, blob := range blobs {
-		d := erofs.DigestFromLayerBlobPath(blob)
-		if d != "" {
-			digests = append(digests, d)
+		if d := erofs.DigestFromLayerBlobPath(blob); d != "" {
+			b.WriteString(d.String())
+		} else {
+			// Fallback blob (no content digest): record its identity so the
+			// entry is present and the line count stays aligned with device=.
+			b.WriteString("blob:")
+			b.WriteString(filepath.Base(blob))
 		}
-		// Skip non-digest-based blobs (e.g., snapshot-xxx.erofs fallback)
+		b.WriteByte('\n')
 	}
 
-	if len(digests) == 0 {
-		return nil // No digests to write
-	}
+	return atomicWriteFile(manifestFile, []byte(b.String()), 0o644)
+}
 
-	var lines []string
-	for _, d := range digests {
-		lines = append(lines, d.String())
+// atomicWriteFile writes data to path atomically: it writes to a temporary file
+// in the same directory, fsyncs it, and renames it into place. A crash at any
+// point leaves either the old file or the new file, never a truncated one.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) (retErr error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(path)+"-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
 	}
+	tmpName := tmp.Name()
+	// Remove the temp file on any error path; a no-op once the rename succeeds.
+	defer func() {
+		if retErr != nil {
+			_ = os.Remove(tmpName)
+		}
+	}()
 
-	content := strings.Join(lines, "\n") + "\n"
-	return os.WriteFile(manifestFile, []byte(content), 0o644)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename temp file: %w", err)
+	}
+	return nil
 }
 
 // Commit finalizes an active snapshot, converting it to EROFS format.

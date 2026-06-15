@@ -4,8 +4,153 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestWriteLayerManifest(t *testing.T) {
+	const (
+		digestA = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		digestB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	blobA := "/snapshots/1/" + strings.Replace(digestA, ":", "-", 1) + ".erofs"
+	blobB := "/snapshots/2/" + strings.Replace(digestB, ":", "-", 1) + ".erofs"
+	fallback := "/snapshots/3/snapshot-3.erofs"
+
+	tests := []struct {
+		name  string
+		blobs []string
+		want  string // empty means: file must not be created
+	}{
+		{
+			name:  "no blobs writes nothing",
+			blobs: nil,
+			want:  "",
+		},
+		{
+			name:  "digest blobs only",
+			blobs: []string{blobA, blobB},
+			want:  digestA + "\n" + digestB + "\n",
+		},
+		{
+			// A fallback blob (no content digest) must still produce a line so
+			// the manifest stays 1:1 with the device= options. Order preserved.
+			name:  "fallback blob keeps positional alignment",
+			blobs: []string{blobA, fallback, blobB},
+			want:  digestA + "\n" + "blob:snapshot-3.erofs\n" + digestB + "\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			s := newTestSnapshotterWithRoot(t, root) //nolint:contextcheck // startup cleanup uses background context
+			manifestFile := filepath.Join(root, "layers.manifest")
+
+			if err := s.writeLayerManifest(manifestFile, tc.blobs); err != nil {
+				t.Fatalf("writeLayerManifest: %v", err)
+			}
+
+			data, err := os.ReadFile(manifestFile)
+			switch {
+			case tc.want == "":
+				if err == nil {
+					t.Fatalf("expected no manifest file, got content %q", data)
+				}
+				if !os.IsNotExist(err) {
+					t.Fatalf("unexpected error reading manifest: %v", err)
+				}
+				return
+			case err != nil:
+				t.Fatalf("read manifest: %v", err)
+			}
+
+			if string(data) != tc.want {
+				t.Errorf("manifest content = %q, want %q", data, tc.want)
+			}
+
+			// One line per blob: the manifest must be positionally 1:1 with
+			// the layers (and thus the device= options).
+			gotLines := strings.Count(string(data), "\n")
+			if gotLines != len(tc.blobs) {
+				t.Errorf("manifest line count = %d, want %d (one per layer)", gotLines, len(tc.blobs))
+			}
+
+			// No leftover temp files from the atomic write.
+			entries, err := os.ReadDir(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range entries {
+				if strings.HasPrefix(e.Name(), ".tmp-") {
+					t.Errorf("leftover temp file after atomic write: %s", e.Name())
+				}
+			}
+		})
+	}
+}
+
+func TestAtomicWriteFile(t *testing.T) {
+	t.Run("writes content and applies perm", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "out.txt")
+
+		if err := atomicWriteFile(path, []byte("hello"), 0o600); err != nil {
+			t.Fatalf("atomicWriteFile: %v", err)
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if string(data) != "hello" {
+			t.Errorf("content = %q, want %q", data, "hello")
+		}
+
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Errorf("perm = %o, want 600", info.Mode().Perm())
+		}
+	})
+
+	t.Run("overwrites existing file atomically and leaves no temp", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "out.txt")
+		if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := atomicWriteFile(path, []byte("new content"), 0o644); err != nil {
+			t.Fatalf("atomicWriteFile: %v", err)
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != "new content" {
+			t.Errorf("content = %q, want %q", data, "new content")
+		}
+
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Errorf("expected only the target file, got %d entries: %v", len(entries), entries)
+		}
+	})
+
+	t.Run("error when directory does not exist", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "missing-subdir", "out.txt")
+		if err := atomicWriteFile(path, []byte("x"), 0o644); err == nil {
+			t.Fatal("expected error for nonexistent directory")
+		}
+	})
+}
 
 func TestGetCommitUpperDir(t *testing.T) {
 	// This test verifies that getCommitUpperDir correctly determines
