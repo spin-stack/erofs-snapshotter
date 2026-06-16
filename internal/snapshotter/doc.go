@@ -62,10 +62,15 @@
 // read {ext4root}/upper as the layer content; anything written outside
 // upper/ is invisible to commit.
 //
-// FUTURE: hot commit (container running) would require cooperation from
-// qemubox - guest fsfreeze/sync plus flushing virtio-blk - before the host
-// may read the image. Until such a protocol exists, commit of a running
-// container fails loudly by design.
+// HOT COMMIT (container paused + frozen): a cooperating runtime that has
+// paused the VM AND frozen its filesystems (FIFREEZE) - so the on-disk ext4
+// is consistent - may set the "containerd.io/snapshot/erofs.quiesced" label on
+// the Commit call. The snapshotter then mounts the rwlayer read-only WITHOUT
+// the exclusive lock gate (a paused QEMU still holds its own image lock, which
+// the gate cannot distinguish from a running one) and with norecovery (no
+// journal replay against an image the VM still holds open). Setting the label
+// without an actual freeze risks a torn read; the runtime owns that contract.
+// Without the label, commit of a held image still fails loudly by design.
 //
 // # Mount Types Returned
 //

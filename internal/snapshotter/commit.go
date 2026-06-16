@@ -34,7 +34,11 @@ import (
 // converting it would silently commit an empty layer and lose the container's
 // changes. If the ext4 cannot be mounted (e.g. the VM is still running and
 // holds the image lock), an error is returned instead.
-func (s *snapshotter) getCommitUpperDir(ctx context.Context, id string) (upperDir string, cleanup func(), prune bool, err error) {
+//
+// When quiesced is true the caller asserts the VM is paused and its
+// filesystems are frozen, so the ext4 is mounted without the exclusive image
+// lock (which a paused VM still holds); see [quiescedLabel].
+func (s *snapshotter) getCommitUpperDir(ctx context.Context, id string, quiesced bool) (upperDir string, cleanup func(), prune bool, err error) {
 	nop := func() {}
 	rwLayer := s.writablePath(id)
 
@@ -55,14 +59,18 @@ func (s *snapshotter) getCommitUpperDir(ctx context.Context, id string) (upperDi
 	}
 
 	// The ext4 is not mounted (runtime snapshot commit, or the mount was lost
-	// across a restart). Mount it read-only to read the guest's upper. This
-	// also acts as the "container must be stopped" gate: MountExt4 fails if
-	// the VM still holds the image.
+	// across a restart). Mount it read-only to read the guest's upper. Without
+	// quiesced this also acts as the "container must be stopped" gate:
+	// MountExt4 fails if the VM still holds the image lock.
 	rwMount := s.blockRwMountPath(id)
 	if err := os.MkdirAll(rwMount, 0o755); err != nil {
 		return "", nop, false, fmt.Errorf("create rw mount point: %w", err)
 	}
-	unmount, err := mountutils.MountExt4(rwLayer, rwMount)
+	var mountOpts []mountutils.Ext4Opt
+	if quiesced {
+		mountOpts = append(mountOpts, mountutils.WithoutImageLock())
+	}
+	unmount, err := mountutils.MountExt4(rwLayer, rwMount, mountOpts...)
 	if err != nil {
 		return "", nop, false, fmt.Errorf("mount writable layer for commit: %w", err)
 	}
@@ -84,8 +92,8 @@ func (s *snapshotter) getCommitUpperDir(ctx context.Context, id string) (upperDi
 
 // commitBlock handles the conversion of a writable layer to EROFS.
 // It determines the appropriate source (block or overlay) and performs conversion.
-func (s *snapshotter) commitBlock(ctx context.Context, layerBlob string, id string) error {
-	upperDir, cleanup, prune, err := s.getCommitUpperDir(ctx, id)
+func (s *snapshotter) commitBlock(ctx context.Context, layerBlob string, id string, quiesced bool) error {
+	upperDir, cleanup, prune, err := s.getCommitUpperDir(ctx, id, quiesced)
 	if err != nil {
 		return err
 	}
@@ -388,6 +396,19 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) (retErr error) 
 	return nil
 }
 
+// commitOptsQuiesced reports whether the commit opts carry the quiesced
+// label. The opts are applied to a throwaway Info so the label can be read
+// without disturbing the real CommitActive call.
+func commitOptsQuiesced(opts []snapshots.Opt) (bool, error) {
+	var info snapshots.Info
+	for _, o := range opts {
+		if err := o(&info); err != nil {
+			return false, fmt.Errorf("apply commit opt: %w", err)
+		}
+	}
+	return info.Labels[quiescedLabel] == "true", nil
+}
+
 // Commit finalizes an active snapshot, converting it to EROFS format.
 //
 // The commit process:
@@ -402,8 +423,18 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 	var layerBlob string
 	var id string
 
+	// A cooperating runtime sets the quiesced label to assert the VM is
+	// paused and its filesystems frozen, allowing the fallback conversion to
+	// read the rwlayer without the exclusive image lock. Read it from the
+	// commit opts (applied to a throwaway Info; the opts are applied for real
+	// by CommitActive below).
+	quiesced, err := commitOptsQuiesced(opts)
+	if err != nil {
+		return err
+	}
+
 	// Get snapshot ID in a read transaction (conversion can be slow)
-	err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+	err = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		sid, _, _, err := storage.GetInfo(ctx, key)
 		if err != nil {
 			return fmt.Errorf("get snapshot info for %q: %w", key, err)
@@ -429,7 +460,7 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		log.G(ctx).WithField("id", id).Debug("layer blob not found, using fallback conversion")
 
 		layerBlob = s.fallbackLayerBlobPath(id)
-		if cerr := s.commitBlock(ctx, layerBlob, id); cerr != nil {
+		if cerr := s.commitBlock(ctx, layerBlob, id, quiesced); cerr != nil {
 			return fmt.Errorf("fallback conversion failed: %w", cerr)
 		}
 	} else if _, verr := erofs.GetBlockSize(layerBlob); verr != nil {
