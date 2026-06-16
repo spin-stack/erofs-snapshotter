@@ -46,7 +46,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.local/erofs-utils
-          key: erofs-utils-1.8.10-amd64-v1
+          key: erofs-utils-1.9.1-amd64-v1
 
       - name: Build erofs-utils in Docker
         if: steps.cache-erofs.outputs.cache-hit != 'true'

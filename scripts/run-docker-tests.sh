@@ -1,6 +1,6 @@
 #!/bin/bash
 # Run tests in Docker with erofs-utils built from source
-# This ensures we use the same erofs-utils version (v1.8.10) as specified in build-erofs-utils.sh
+# This ensures we use the same erofs-utils version (v1.9.1) as specified in build-erofs-utils.sh
 #
 # Usage:
 #   ./scripts/run-docker-tests.sh [options] [-- go test args]

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build erofs-utils from source
-# This script downloads, compiles, and installs erofs-utils v1.8.10
+# This script downloads, compiles, and installs erofs-utils v1.9.1
 # with static linking for portability.
 #
 # Usage:
@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-EROFS_VERSION="${EROFS_VERSION:-1.8.10}"
+EROFS_VERSION="${EROFS_VERSION:-1.9.1}"
 EROFS_URL="https://github.com/erofs/erofs-utils/archive/refs/tags/v${EROFS_VERSION}.tar.gz"
 INSTALL_PREFIX="${1:-/usr/local}"
 BUILD_DIR="${BUILD_DIR:-$(mktemp -d)}"
