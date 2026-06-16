@@ -41,12 +41,31 @@ import (
 	"github.com/spin-stack/erofs-snapshotter/internal/mountutils"
 )
 
+// quiescedLabel, when set on the Compare opts (diff.WithLabels), asserts that
+// the active snapshot's VM is paused and its filesystems frozen, so the
+// writable ext4 may be read without the exclusive image lock (a paused QEMU
+// still holds its own lock). This is the diff/CreateDiff counterpart of the
+// snapshotter's commit-time quiesced label; see internal/snapshotter
+// (quiescedLabel) and mountutils.WithoutImageLock. The label is consumed here
+// and never persisted on the produced layer blob.
+const quiescedLabel = "containerd.io/snapshot/erofs.quiesced"
+
+// ext4LockOpts returns the MountExt4 options for the requested quiesced mode:
+// when quiesced, the exclusive image-lock gate is skipped (the caller asserts
+// the VM is paused and frozen).
+func ext4LockOpts(quiesced bool) []mountutils.Ext4Opt {
+	if quiesced {
+		return []mountutils.Ext4Opt{mountutils.WithoutImageLock()}
+	}
+	return nil
+}
+
 // diffWriteFunc is a function that writes diff content to the provided writer.
 type diffWriteFunc func(ctx context.Context, w io.Writer) error
 
-func writeDiffFromMounts(ctx context.Context, w io.Writer, lower, upper []mount.Mount, mm mount.Manager) error {
+func writeDiffFromMounts(ctx context.Context, w io.Writer, lower, upper []mount.Mount, mm mount.Manager, quiesced bool) error {
 	return withLowerMount(ctx, lower, mm, func(lowerRoot string) error {
-		return withUpperMount(ctx, upper, mm, func(upperRoot string) error {
+		return withUpperMount(ctx, upper, mm, quiesced, func(upperRoot string) error {
 			if err := archive.WriteDiff(ctx, w, lowerRoot, upperRoot); err != nil {
 				return fmt.Errorf("failed to write diff: %w", err)
 			}
@@ -88,12 +107,20 @@ func (s *ErofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opt
 		config.MediaType = ocispec.MediaTypeImageLayerGzip
 	}
 
+	// The quiesced label is an operational signal for THIS Compare, not
+	// metadata for the produced layer: consume it and drop it so it is not
+	// persisted on the committed blob.
+	quiesced := config.Labels[quiescedLabel] == "true"
+	if quiesced {
+		delete(config.Labels, quiescedLabel)
+	}
+
 	// Resolve mount manager lazily - this allows initialization before
 	// the mount manager plugin is available
 	mm := s.mountManager()
 
 	return s.writeAndCommitDiff(ctx, config, func(ctx context.Context, w io.Writer) error {
-		return writeDiffFromMounts(ctx, w, lower, upper, mm)
+		return writeDiffFromMounts(ctx, w, lower, upper, mm, quiesced)
 	})
 }
 
@@ -313,17 +340,21 @@ func withLowerMount(ctx context.Context, lower []mount.Mount, mm mount.Manager, 
 // withUpperMount resolves upper mounts and calls f with the resulting root path.
 // If mounts require the mount manager (formatted mounts, templates, or EROFS),
 // it activates them through the mount manager first.
-func withUpperMount(ctx context.Context, upper []mount.Mount, mm mount.Manager, f func(root string) error) error {
+//
+// quiesced is propagated to the ext4 mount paths: when set, the writable layer
+// is read without the exclusive image lock (the caller asserts the VM is
+// paused and frozen).
+func withUpperMount(ctx context.Context, upper []mount.Mount, mm mount.Manager, quiesced bool, f func(root string) error) error {
 	// Handle active snapshot mounts (EROFS + ext4) - create overlay on host
 	if mountutils.HasActiveSnapshotMounts(upper) {
-		return withActiveSnapshotMount(ctx, upper, f)
+		return withActiveSnapshotMount(ctx, upper, quiesced, f)
 	}
 
 	// A 0-parent active snapshot is a bare ext4 writable layer. The diff
 	// root is the guest's upper/ inside it - never the raw ext4 root, which
 	// contains lost+found/ and work/ as literal entries.
 	if len(upper) == 1 && mountutils.TypeSuffix(upper[0].Type) == "ext4" {
-		return withExt4UpperMount(ctx, &upper[0], f)
+		return withExt4UpperMount(ctx, &upper[0], quiesced, f)
 	}
 
 	// Multiple individual EROFS layers (fsmeta not ready yet): mount each in
@@ -506,10 +537,10 @@ func warnUnexpectedExt4Entries(ctx context.Context, ext4Root string) {
 
 // withExt4UpperMount handles an active snapshot with no parents: a bare ext4
 // writable layer. The ext4 is mounted read-only (image lock held until
-// cleanup) and f receives its upper/ directory - the guest overlay contract
-// puts all changes there. When upper/ does not exist the container made no
-// changes and f receives an empty directory.
-func withExt4UpperMount(ctx context.Context, ext4Mount *mount.Mount, f func(root string) error) error {
+// cleanup, unless quiesced) and f receives its upper/ directory - the guest
+// overlay contract puts all changes there. When upper/ does not exist the
+// container made no changes and f receives an empty directory.
+func withExt4UpperMount(ctx context.Context, ext4Mount *mount.Mount, quiesced bool, f func(root string) error) error {
 	tempBase, err := os.MkdirTemp("", "erofs-ext4-upper-")
 	if err != nil {
 		return fmt.Errorf("failed to create temp dir: %w", err)
@@ -532,7 +563,7 @@ func withExt4UpperMount(ctx context.Context, ext4Mount *mount.Mount, f func(root
 		return fmt.Errorf("failed to create dir %s: %w", ext4Dir, err)
 	}
 
-	ext4Cleanup, err := mountutils.MountExt4(ext4Mount.Source, ext4Dir)
+	ext4Cleanup, err := mountutils.MountExt4(ext4Mount.Source, ext4Dir, ext4LockOpts(quiesced)...)
 	if err != nil {
 		return fmt.Errorf("failed to mount ext4: %w", err)
 	}
@@ -567,7 +598,7 @@ func withExt4UpperMount(ctx context.Context, ext4Mount *mount.Mount, f func(root
 // whiteouts are honored without requiring a writable upperdir/workdir. This
 // allows Compare to see the changes made in the container without mutating
 // the snapshot.
-func withActiveSnapshotMount(ctx context.Context, mounts []mount.Mount, f func(root string) error) error {
+func withActiveSnapshotMount(ctx context.Context, mounts []mount.Mount, quiesced bool, f func(root string) error) error {
 	// Separate EROFS and ext4 mounts
 	var erofsMounts []mount.Mount
 	var ext4Mount *mount.Mount
@@ -625,8 +656,9 @@ func withActiveSnapshotMount(ctx context.Context, mounts []mount.Mount, f func(r
 		}
 	}()
 
-	// Mount ext4 writable layer (read-only, image lock held until cleanup)
-	ext4Cleanup, err := mountutils.MountExt4(ext4Mount.Source, ext4Dir)
+	// Mount ext4 writable layer (read-only; image lock held until cleanup
+	// unless quiesced).
+	ext4Cleanup, err := mountutils.MountExt4(ext4Mount.Source, ext4Dir, ext4LockOpts(quiesced)...)
 	if err != nil {
 		return fmt.Errorf("failed to mount ext4: %w", err)
 	}
