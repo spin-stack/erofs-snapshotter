@@ -168,7 +168,7 @@ func TestGetCommitUpperDir(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		upperDir, cleanup, prune, err := s.getCommitUpperDir(ctx, "test-id")
+		upperDir, cleanup, prune, err := s.getCommitUpperDir(ctx, "test-id", false)
 		if err != nil {
 			t.Fatalf("getCommitUpperDir: %v", err)
 		}
@@ -201,7 +201,7 @@ func TestGetCommitUpperDir(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		result, cleanup, prune, err := s.getCommitUpperDir(ctx, "test-id")
+		result, cleanup, prune, err := s.getCommitUpperDir(ctx, "test-id", false)
 		if err != nil {
 			t.Fatalf("getCommitUpperDir: %v", err)
 		}
@@ -268,7 +268,7 @@ func TestGetCommitUpperDir(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			result, cleanup, _, err := s.getCommitUpperDir(ctx, "test-id")
+			result, cleanup, _, err := s.getCommitUpperDir(ctx, "test-id", false)
 			if err == nil {
 				cleanup()
 				t.Fatalf("getCommitUpperDir = %q, want error (no silent fallback to fs/)", result)

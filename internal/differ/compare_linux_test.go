@@ -24,6 +24,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/containerd/v2/pkg/testutil"
 	"github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sys/unix"
@@ -777,7 +778,7 @@ func TestWithUpperMountManagerActivation(t *testing.T) {
 	upper := formattedErofsMount()
 
 	t.Run("fails without mount manager", func(t *testing.T) {
-		err := withUpperMount(ctx, upper, nil, func(string) error { return nil })
+		err := withUpperMount(ctx, upper, nil, false, func(string) error { return nil })
 		if err == nil || !strings.Contains(err.Error(), "mount manager is required") {
 			t.Fatalf("expected mount manager required error, got: %v", err)
 		}
@@ -790,7 +791,7 @@ func TestWithUpperMountManagerActivation(t *testing.T) {
 		}}
 
 		var gotRoot string
-		if err := withUpperMount(ctx, upper, mm, func(root string) error {
+		if err := withUpperMount(ctx, upper, mm, false, func(root string) error {
 			gotRoot = root
 			return nil
 		}); err != nil {
@@ -1034,7 +1035,7 @@ func TestWithExt4UpperMount(t *testing.T) {
 		mounts := []mount.Mount{{Type: "ext4", Source: img, Options: []string{"rw", "loop"}}}
 
 		var gotRoot string
-		err := withUpperMount(ctx, mounts, nil, func(root string) error {
+		err := withUpperMount(ctx, mounts, nil, false, func(root string) error {
 			gotRoot = root
 			if got := readFileString(t, filepath.Join(root, "hello.txt")); got != "hello from upper" {
 				t.Errorf("hello.txt = %q, want %q", got, "hello from upper")
@@ -1070,7 +1071,7 @@ func TestWithExt4UpperMount(t *testing.T) {
 		mounts := []mount.Mount{{Type: "ext4", Source: img, Options: []string{"rw", "loop"}}}
 
 		called := false
-		err := withUpperMount(ctx, mounts, nil, func(root string) error {
+		err := withUpperMount(ctx, mounts, nil, false, func(root string) error {
 			called = true
 			entries, err := os.ReadDir(root)
 			if err != nil {
@@ -1126,7 +1127,7 @@ func TestWithActiveSnapshotMountOverlay(t *testing.T) {
 	}
 
 	called := false
-	err := withUpperMount(ctx, mounts, nil, func(root string) error {
+	err := withUpperMount(ctx, mounts, nil, false, func(root string) error {
 		called = true
 		// File added by the guest is visible.
 		if got := readFileString(t, filepath.Join(root, "added.txt")); got != "added in container" {
@@ -1286,11 +1287,112 @@ func TestWithActiveSnapshotMountMissingExt4(t *testing.T) {
 	// is missing instead of silently diffing only the EROFS layers.
 	err := withActiveSnapshotMount(context.Background(), []mount.Mount{
 		{Type: "erofs", Source: "/snapshots/1/layer.erofs", Options: []string{"ro", "loop"}},
-	}, func(string) error {
+	}, false, func(string) error {
 		t.Fatal("callback should not be called")
 		return nil
 	})
 	if err == nil || !strings.Contains(err.Error(), "missing ext4 writable layer") {
 		t.Fatalf("expected missing ext4 error, got: %v", err)
+	}
+}
+
+// holdOFDWriteLock takes a whole-file OFD write lock on path (the lock family
+// QEMU holds on its images, even while paused) and returns the open file;
+// closing it releases the lock.
+func holdOFDWriteLock(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open %s for locking: %v", path, err)
+	}
+	flk := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0, Len: 0}
+	if err := unix.FcntlFlock(f.Fd(), unix.F_OFD_SETLK, &flk); err != nil {
+		_ = f.Close()
+		t.Fatalf("take OFD write lock on %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+}
+
+// TestWithUpperMountQuiescedSkipsLock is the diff/CreateDiff counterpart of the
+// snapshotter commit gate: a held image lock (a paused VM still holds it)
+// blocks the diff by default, but the quiesced flag lets Compare read the
+// frozen rwlayer read-only.
+func TestWithUpperMountQuiescedSkipsLock(t *testing.T) {
+	requireRootAndTools(t, "mkfs.ext4")
+	ctx := context.Background()
+
+	img := createExt4Image(t, 8)
+	populateExt4(t, img, func(root string) {
+		for _, dir := range []string{"upper", "work"} {
+			if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+				t.Fatalf("failed to create %s: %v", dir, err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(root, "upper", "hot.txt"), []byte("frozen content"), 0o644); err != nil {
+			t.Fatalf("failed to write upper file: %v", err)
+		}
+	})
+
+	// Simulate the paused VM still holding the image lock.
+	holdOFDWriteLock(t, img)
+
+	mounts := []mount.Mount{{Type: "ext4", Source: img, Options: []string{"rw", "loop"}}}
+
+	// Without quiesced, the held lock blocks the diff.
+	err := withUpperMount(ctx, mounts, nil, false, func(string) error {
+		t.Fatal("callback must not run while the image is locked")
+		return nil
+	})
+	if !errors.Is(err, errdefs.ErrFailedPrecondition) {
+		t.Fatalf("withUpperMount(quiesced=false) error = %v, want ErrFailedPrecondition", err)
+	}
+
+	// With quiesced, the lock gate is skipped and the upper is readable.
+	called := false
+	err = withUpperMount(ctx, mounts, nil, true, func(root string) error {
+		called = true
+		if got := readFileString(t, filepath.Join(root, "hot.txt")); got != "frozen content" {
+			t.Errorf("hot.txt = %q, want %q", got, "frozen content")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withUpperMount(quiesced=true) failed: %v", err)
+	}
+	if !called {
+		t.Fatal("quiesced callback was not called")
+	}
+
+	checkNoLoopDevice(t, img)
+}
+
+// TestCompareConsumesQuiescedLabel verifies the quiesced label is read from the
+// diff opts and stripped so it does not persist on the produced layer blob.
+func TestCompareConsumesQuiescedLabel(t *testing.T) {
+	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
+		t.Skip("mkfs.erofs not installed")
+	}
+	ctx := context.Background()
+	store := newTestContentStore(t)
+	d := NewErofsDiffer(store)
+
+	// Empty lower/upper: the diff is empty, but Compare still runs the label
+	// plumbing and commits a blob.
+	desc, err := d.Compare(ctx, []mount.Mount{}, []mount.Mount{},
+		diff.WithMediaType(ocispec.MediaTypeImageLayer),
+		diff.WithLabels(map[string]string{quiescedLabel: "true", "keep": "yes"}))
+	if err != nil {
+		t.Fatalf("Compare: %v", err)
+	}
+
+	info, err := store.Info(ctx, desc.Digest)
+	if err != nil {
+		t.Fatalf("blob info: %v", err)
+	}
+	if _, ok := info.Labels[quiescedLabel]; ok {
+		t.Errorf("quiesced label must not persist on the layer blob, got labels %v", info.Labels)
+	}
+	if info.Labels["keep"] != "yes" {
+		t.Errorf("unrelated label was dropped: got %v", info.Labels)
 	}
 }

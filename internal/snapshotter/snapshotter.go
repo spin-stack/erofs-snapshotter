@@ -96,6 +96,18 @@ func isMounted(target string) bool {
 // avoiding TOCTOU race conditions that would occur with filesystem markers.
 const extractLabel = "containerd.io/snapshot/erofs.extract"
 
+// quiescedLabel is set by a cooperating VM runtime (qemubox) on a Commit call
+// to assert that the container's writable layer is already quiesced - the VM
+// is paused and its filesystems are frozen (FIFREEZE) - so commit may read the
+// rwlayer image directly without taking the exclusive image lock.
+//
+// QEMU keeps its own image lock held even while paused, so the default lock
+// gate cannot distinguish a frozen VM from a running one and rejects the
+// commit ("rwlayer.img is locked by the VM"). This label is how the runtime
+// signals "it is safe to read now". Setting it without an actual freeze risks
+// a torn read of a live filesystem; see mountutils.WithoutImageLock.
+const quiescedLabel = "containerd.io/snapshot/erofs.quiesced"
+
 // NewSnapshotter returns a Snapshotter which uses EROFS+OverlayFS. The layers
 // are stored under the provided root. A metadata file is stored under the root.
 func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {

@@ -31,7 +31,20 @@ func MountAll(_ []mount.Mount, _ string) (cleanup func() error, err error) {
 	return func() error { return nil }, fmt.Errorf("EROFS mounts not supported on %s", runtime.GOOS)
 }
 
+// ext4MountConfig holds options for MountExt4.
+type ext4MountConfig struct {
+	skipLock bool
+}
+
+// Ext4Opt configures MountExt4.
+type Ext4Opt func(*ext4MountConfig)
+
+// WithoutImageLock skips the exclusive image-lock gate (no-op stub).
+func WithoutImageLock() Ext4Opt {
+	return func(c *ext4MountConfig) { c.skipLock = true }
+}
+
 // MountExt4 mounts an ext4 filesystem image to the target directory.
-func MountExt4(_, _ string) (cleanup func() error, err error) {
+func MountExt4(_, _ string, _ ...Ext4Opt) (cleanup func() error, err error) {
 	return func() error { return nil }, fmt.Errorf("ext4 mounts not supported on %s", runtime.GOOS)
 }

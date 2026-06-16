@@ -147,29 +147,65 @@ func MountAll(mounts []mount.Mount, target string) (cleanup func() error, err er
 	}, nil
 }
 
+// ext4MountConfig holds options for MountExt4.
+type ext4MountConfig struct {
+	skipLock bool
+}
+
+// Ext4Opt configures MountExt4.
+type Ext4Opt func(*ext4MountConfig)
+
+// WithoutImageLock skips the exclusive image-lock gate and mounts the ext4
+// without journal recovery (ro,norecovery).
+//
+// SAFETY CONTRACT: the caller asserts the image is already quiesced - the VM
+// is paused AND its filesystems are frozen (FIFREEZE), so the on-disk ext4 is
+// consistent and will not change while it is read. QEMU keeps its own image
+// lock held even when paused, so the default lock gate cannot tell a frozen
+// VM from a running one and would reject the commit; this option is how a
+// cooperating runtime (qemubox) signals "it is safe to read now". Using it
+// without an actual freeze risks a torn read of a live filesystem.
+func WithoutImageLock() Ext4Opt {
+	return func(c *ext4MountConfig) { c.skipLock = true }
+}
+
 // MountExt4 mounts an ext4 filesystem image read-only on the target directory
 // using a loop device. Returns a cleanup function that unmounts, detaches the
 // loop device and releases the image lock.
 //
-// The image is locked (flock + OFD fcntl lock) before mounting and the lock is
-// held until cleanup runs. QEMU protects its disk images with OFD locks, so
-// this both detects a running VM and prevents one from starting while the
-// image is mounted on the host - releasing the lock before mounting would
-// leave a window for the guest to attach the image concurrently.
+// By default the image is locked (flock + OFD fcntl lock) before mounting and
+// the lock is held until cleanup runs. QEMU protects its disk images with OFD
+// locks, so this both detects a running VM and prevents one from starting
+// while the image is mounted on the host - releasing the lock before mounting
+// would leave a window for the guest to attach the image concurrently. The
+// loop device stays writable so ext4 can replay a dirty journal and present a
+// consistent view.
 //
-// The mount is read-only: committing/diffing must never mutate the snapshot.
-// The loop device stays writable so ext4 can replay a dirty journal (e.g.
-// after a guest crash) and present a consistent view.
-func MountExt4(source, target string) (cleanup func() error, err error) {
-	lockFile, err := lockImageFile(source)
-	if err != nil {
-		return nopCleanup, err
+// With WithoutImageLock the lock gate is skipped (see its contract) and the
+// ext4 is mounted ro,norecovery: the image is held open by the paused VM, so
+// no journal replay (a write) must be attempted - the freeze already flushed
+// it.
+//
+// Either way the mount is read-only: committing/diffing must never mutate the
+// snapshot.
+func MountExt4(source, target string, opts ...Ext4Opt) (cleanup func() error, err error) {
+	var cfg ext4MountConfig
+	for _, o := range opts {
+		o(&cfg)
 	}
-	defer func() {
+
+	var lockFile *os.File
+	if !cfg.skipLock {
+		lockFile, err = lockImageFile(source)
 		if err != nil {
-			_ = lockFile.Close()
+			return nopCleanup, err
 		}
-	}()
+		defer func() {
+			if err != nil {
+				_ = lockFile.Close()
+			}
+		}()
+	}
 
 	// Set up loop device for the ext4 image
 	loopDev, err := loop.Setup(source, loop.Config{ReadOnly: false})
@@ -177,8 +213,13 @@ func MountExt4(source, target string) (cleanup func() error, err error) {
 		return nopCleanup, fmt.Errorf("failed to setup loop device for ext4 %s: %w", source, err)
 	}
 
-	// Mount the loop device
-	cmd := exec.Command("mount", "-t", "ext4", "-o", "ro", loopDev.Path, target)
+	// Mount the loop device. A quiesced image must not trigger journal
+	// recovery (a write) since the VM still holds it open.
+	mountOpts := "ro"
+	if cfg.skipLock {
+		mountOpts = "ro,norecovery"
+	}
+	cmd := exec.Command("mount", "-t", "ext4", "-o", mountOpts, loopDev.Path, target)
 	if out, merr := cmd.CombinedOutput(); merr != nil {
 		_ = loopDev.Detach()
 		err = fmt.Errorf("failed to mount ext4: %w: %s", merr, out)
@@ -194,7 +235,10 @@ func MountExt4(source, target string) (cleanup func() error, err error) {
 		if err := loopDev.Detach(); err != nil {
 			return fmt.Errorf("failed to detach loop device: %w", err)
 		}
-		return lockFile.Close()
+		if lockFile != nil {
+			return lockFile.Close()
+		}
+		return nil
 	}, nil
 }
 
