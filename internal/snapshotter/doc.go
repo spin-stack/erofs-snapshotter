@@ -1,7 +1,7 @@
 // Package snapshotter implements the spin-erofs containerd snapshotter.
 //
 // This is a VM-only EROFS snapshotter for containerd, designed exclusively
-// for use with qemubox and similar VM runtimes. It does NOT mount filesystems
+// for use with spinbox and similar VM runtimes. It does NOT mount filesystems
 // on the host - it returns raw file paths that VM runtimes pass to guests as
 // virtio-blk devices.
 //
@@ -56,7 +56,7 @@
 //   - The host mounts the ext4 read-only; journal recovery is permitted so a
 //     crashed guest still yields a consistent view.
 //
-// GUEST LAYOUT CONTRACT: the VM runtime (qemubox) must build its overlay
+// GUEST LAYOUT CONTRACT: the VM runtime (spinbox) must build its overlay
 // with upper/ and work/ at the root of the ext4 - the same layout
 // mountBlockRwLayer prepares for extract snapshots. The differ and Commit
 // read {ext4root}/upper as the layer content; anything written outside
@@ -84,7 +84,7 @@
 // The "format/erofs" type signals VM-only mounts. Containerd's standard
 // mount manager will reject it with "unsupported mount type" rather than
 // the cryptic EINVAL that occurs when trying to mount EROFS with file
-// paths in device= options. VM runtimes like qemubox handle this correctly.
+// paths in device= options. VM runtimes like spinbox handle this correctly.
 //
 // # Fsmeta/VMDK Generation
 //

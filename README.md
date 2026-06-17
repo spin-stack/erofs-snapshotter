@@ -47,7 +47,7 @@ A containerd snapshotter that converts OCI image layers to EROFS and returns raw
 
 | Aspect | containerd EROFS | erofs |
 |--------|------------------|-------------|
-| Target runtime | runc, crun (host containers) | qemubox (VM containers) |
+| Target runtime | runc, crun (host containers) | spinbox (VM containers) |
 | Layer source | Requires pre-converted EROFS | Converts tar→EROFS on pull |
 | Multi-layer | Host overlayfs stacking | VMDK descriptor (single block device) |
 | Returns | Mounted paths | Raw file paths |
@@ -136,8 +136,9 @@ When running a container, the snapshotter returns raw file paths with mount opti
 ```go
 // View (read-only) with VMDK - single fsmeta mount with device= options
 // VM runtime detects merged.vmdk in same directory and uses it for QEMU
+// Multi-device EROFS uses format/erofs (the VM-only signal; see CLAUDE.md)
 []mount.Mount{{
-    Type:   "erofs",
+    Type:   "format/erofs",
     Source: "/var/lib/erofs/snapshots/123/fsmeta.erofs",
     Options: []string{"ro", "loop", "device=/path/to/layer1.erofs", "device=/path/to/layer2.erofs"},
 }}
@@ -157,13 +158,14 @@ When running a container, the snapshotter returns raw file paths with mount opti
 }
 
 // Active (with writable layer) - EROFS lower + ext4 upper
+// fsmeta with device= options is multi-device, so format/erofs
 []mount.Mount{
-    {Type: "erofs", Source: "/path/to/fsmeta.erofs", Options: []string{"ro", "loop", "device=..."}},
-    {Type: "ext4",  Source: "/path/to/rwlayer.img",  Options: []string{"rw", "loop"}},
+    {Type: "format/erofs", Source: "/path/to/fsmeta.erofs", Options: []string{"ro", "loop", "device=..."}},
+    {Type: "ext4",         Source: "/path/to/rwlayer.img",  Options: []string{"rw", "loop"}},
 }
 ```
 
-The VM runtime (qemubox) passes these as virtio-blk devices. The guest VM mounts them and creates an overlay.
+The VM runtime (spinbox) passes these as virtio-blk devices. The guest VM mounts them and creates an overlay.
 
 **Fallback behavior:** When fsmeta/VMDK generation fails (e.g., `mkfs.erofs` lacks `--aufs` support, or layers have incompatible block sizes from `--tar=i` mode), the snapshotter returns individual EROFS mounts. The consumer must handle stacking these layers.
 

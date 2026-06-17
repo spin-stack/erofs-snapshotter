@@ -163,7 +163,7 @@ type Ext4Opt func(*ext4MountConfig)
 // consistent and will not change while it is read. QEMU keeps its own image
 // lock held even when paused, so the default lock gate cannot tell a frozen
 // VM from a running one and would reject the commit; this option is how a
-// cooperating runtime (qemubox) signals "it is safe to read now". Using it
+// cooperating runtime (spinbox) signals "it is safe to read now". Using it
 // without an actual freeze risks a torn read of a live filesystem.
 func WithoutImageLock() Ext4Opt {
 	return func(c *ext4MountConfig) { c.skipLock = true }

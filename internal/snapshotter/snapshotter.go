@@ -96,7 +96,7 @@ func isMounted(target string) bool {
 // avoiding TOCTOU race conditions that would occur with filesystem markers.
 const extractLabel = "containerd.io/snapshot/erofs.extract"
 
-// quiescedLabel is set by a cooperating VM runtime (qemubox) on a Commit call
+// quiescedLabel is set by a cooperating VM runtime (spinbox) on a Commit call
 // to assert that the container's writable layer is already quiesced - the VM
 // is paused and its filesystems are frozen (FIFREEZE) - so commit may read the
 // rwlayer image directly without taking the exclusive image lock.

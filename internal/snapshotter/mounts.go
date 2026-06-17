@@ -50,7 +50,7 @@ func (s *snapshotter) waitForFsmeta(parentID string, timeout time.Duration) bool
 // VM-only mount requiring special handling. Containerd's standard mount manager
 // will reject "format/erofs" with a clear "unsupported mount type" error, rather
 // than the cryptic EINVAL that occurs when it tries to mount EROFS with file paths
-// in device= options. VM runtimes (like qemubox) and the custom mountutils.MountAll()
+// in device= options. VM runtimes (like spinbox) and the custom mountutils.MountAll()
 // understand this type and handle it correctly.
 func (s *snapshotter) mountFsMeta(snap storage.Snapshot) (mount.Mount, bool) {
 	if len(snap.ParentIDs) == 0 {
