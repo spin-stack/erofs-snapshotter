@@ -22,7 +22,7 @@ package snapshotter
 // and shared helper functions used by other test files.
 //
 // NOTE: Most tests in this file are SKIPPED because the EROFS snapshotter
-// is designed exclusively for VM runtimes (like qemubox). The snapshotter
+// is designed exclusively for VM runtimes (like spinbox). The snapshotter
 // returns raw file paths (EROFS blobs, ext4 images) that are passed to VMs
 // as virtio-blk devices, NOT mounted on the host.
 //

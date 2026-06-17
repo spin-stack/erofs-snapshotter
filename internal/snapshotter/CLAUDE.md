@@ -9,7 +9,7 @@
 ## Quick Overview
 
 **What this package does**:
-Implements the containerd snapshotter interface for VM-only EROFS containers. Returns file paths (not mounted directories) that VM runtimes like qemubox pass to guests as virtio-blk devices.
+Implements the containerd snapshotter interface for VM-only EROFS containers. Returns file paths (not mounted directories) that VM runtimes like spinbox pass to guests as virtio-blk devices.
 
 **Key responsibilities**:
 - Snapshot lifecycle management (Prepare, View, Commit, Remove)

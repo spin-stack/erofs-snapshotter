@@ -30,7 +30,7 @@ This CLAUDE.md is the **authoritative source** for development guidelines. It is
 
 ## Critical Design Constraint: VM-Only Snapshotter
 
-**This is a VM-only EROFS snapshotter** for containerd, designed exclusively for use with qemubox (and similar VM runtimes). It does **NOT** mount filesystems on the host - it returns raw file paths that VM runtimes pass to guests as virtio-blk devices.
+**This is a VM-only EROFS snapshotter** for containerd, designed exclusively for use with spinbox (and similar VM runtimes). It does **NOT** mount filesystems on the host - it returns raw file paths that VM runtimes pass to guests as virtio-blk devices.
 
 ### What This Means
 
@@ -39,7 +39,7 @@ This CLAUDE.md is the **authoritative source** for development guidelines. It is
 | Mounts filesystems on host | Returns file paths only |
 | Returns mounted directory paths | Returns `.erofs` and `.img` file paths |
 | Host kernel handles overlay | Guest VM handles overlay |
-| Works with any runtime | Works only with VM runtimes (qemubox) |
+| Works with any runtime | Works only with VM runtimes (spinbox) |
 
 ### Key Design Decisions
 
@@ -55,8 +55,8 @@ The snapshotter returns file paths, not mounted filesystems:
 VMDK descriptors are **always** generated for multi-layer images. There is NO threshold configuration.
 
 **DO NOT add `--fs-merge-threshold` or similar flags** - they were removed because:
-- This snapshotter is exclusively for qemubox
-- qemubox always needs VMDK for efficient multi-layer handling
+- This snapshotter is exclusively for spinbox
+- spinbox always needs VMDK for efficient multi-layer handling
 - A threshold adds complexity without benefit
 
 #### 3. No Overlay Returns [CRITICAL]
@@ -531,7 +531,7 @@ For full testing:
 
 - Tests requiring host mounting should use `skipIfVMOnly(t)`
 - Mount paths must be real file paths, not mounted directories
-- The consumer (qemubox) detects `merged.vmdk` in the same directory as `fsmeta.erofs`
+- The consumer (spinbox) detects `merged.vmdk` in the same directory as `fsmeta.erofs`
 - Platform-specific code needs parity between `*_linux.go` and `*_other.go`
 
 ---

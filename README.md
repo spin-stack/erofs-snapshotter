@@ -47,7 +47,7 @@ A containerd snapshotter that converts OCI image layers to EROFS and returns raw
 
 | Aspect | containerd EROFS | erofs |
 |--------|------------------|-------------|
-| Target runtime | runc, crun (host containers) | qemubox (VM containers) |
+| Target runtime | runc, crun (host containers) | spinbox (VM containers) |
 | Layer source | Requires pre-converted EROFS | Converts tar→EROFS on pull |
 | Multi-layer | Host overlayfs stacking | VMDK descriptor (single block device) |
 | Returns | Mounted paths | Raw file paths |
@@ -165,7 +165,7 @@ When running a container, the snapshotter returns raw file paths with mount opti
 }
 ```
 
-The VM runtime (qemubox) passes these as virtio-blk devices. The guest VM mounts them and creates an overlay.
+The VM runtime (spinbox) passes these as virtio-blk devices. The guest VM mounts them and creates an overlay.
 
 **Fallback behavior:** When fsmeta/VMDK generation fails (e.g., `mkfs.erofs` lacks `--aufs` support, or layers have incompatible block sizes from `--tar=i` mode), the snapshotter returns individual EROFS mounts. The consumer must handle stacking these layers.
 
