@@ -136,8 +136,9 @@ When running a container, the snapshotter returns raw file paths with mount opti
 ```go
 // View (read-only) with VMDK - single fsmeta mount with device= options
 // VM runtime detects merged.vmdk in same directory and uses it for QEMU
+// Multi-device EROFS uses format/erofs (the VM-only signal; see CLAUDE.md)
 []mount.Mount{{
-    Type:   "erofs",
+    Type:   "format/erofs",
     Source: "/var/lib/erofs/snapshots/123/fsmeta.erofs",
     Options: []string{"ro", "loop", "device=/path/to/layer1.erofs", "device=/path/to/layer2.erofs"},
 }}
@@ -157,9 +158,10 @@ When running a container, the snapshotter returns raw file paths with mount opti
 }
 
 // Active (with writable layer) - EROFS lower + ext4 upper
+// fsmeta with device= options is multi-device, so format/erofs
 []mount.Mount{
-    {Type: "erofs", Source: "/path/to/fsmeta.erofs", Options: []string{"ro", "loop", "device=..."}},
-    {Type: "ext4",  Source: "/path/to/rwlayer.img",  Options: []string{"rw", "loop"}},
+    {Type: "format/erofs", Source: "/path/to/fsmeta.erofs", Options: []string{"ro", "loop", "device=..."}},
+    {Type: "ext4",         Source: "/path/to/rwlayer.img",  Options: []string{"rw", "loop"}},
 }
 ```
 

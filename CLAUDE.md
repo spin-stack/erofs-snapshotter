@@ -301,17 +301,23 @@ silently commit an empty layer).
 
 ### Commit Quiesce Contract [CRITICAL]
 
-- Committing a container requires it to be **stopped** (not paused): the
-  guest's changes live inside `rwlayer.img` and are only consistent once the
-  VM released it.
+- **Cold commit** (default) requires the container **stopped**: the guest's
+  changes live inside `rwlayer.img` and are only consistent once the VM
+  released it.
 - Enforcement: `mountutils.MountExt4` takes flock + a whole-file **OFD lock**
   (the lock family QEMU uses) before mounting and holds it until unmount;
   a running VM yields `errdefs.ErrFailedPrecondition`.
 - Guest layout contract: the VM runtime creates `upper/` and `work/` at the
   ext4 root; commit/diff read `{ext4root}/upper`. Writes outside `upper/`
   are invisible to commit.
-- Hot commit (fsfreeze/sync cooperation) requires a qemubox-side protocol
-  that does not exist yet; until then it fails loudly by design.
+- **Hot commit** (container paused + frozen) **is supported**: a runtime that
+  has paused the VM and frozen its filesystems (FIFREEZE) sets the
+  `containerd.io/snapshot/erofs.quiesced` label on Commit/Compare. The
+  snapshotter then mounts `rwlayer.img` read-only (`norecovery`) **without** the
+  OFD lock gate (a paused QEMU still holds its own image lock, indistinguishable
+  from a running one). The runtime owns the freeze contract — setting the label
+  without a real freeze risks a torn read. Without the label, committing a held
+  image still fails loudly by design.
 
 See `internal/snapshotter/doc.go` ("Committing a Container") for details.
 
